@@ -19,7 +19,6 @@ type LeadDetailPayload = {
   description: string | null
   status: string | null
   source: string | null
-  ownerUserId: string | null
   estimatedValueAmount: number | null
   estimatedValueCurrency: string | null
   companyName: string | null

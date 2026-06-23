@@ -63,7 +63,6 @@ type LeadSnapshot = {
   description: string | null
   status: string
   source: string | null
-  ownerUserId: string | null
   estimatedValueAmount: string | null
   estimatedValueCurrency: string | null
   companyName: string | null
@@ -104,7 +103,6 @@ function serializeLeadSnapshot(lead: CustomerLead): LeadSnapshot {
     description: lead.description ?? null,
     status: lead.status,
     source: lead.source ?? null,
-    ownerUserId: lead.ownerUserId ?? null,
     estimatedValueAmount: lead.estimatedValueAmount ?? null,
     estimatedValueCurrency: lead.estimatedValueCurrency ?? null,
     companyName: lead.companyName ?? null,
@@ -137,7 +135,6 @@ function applyLeadBaseFields(lead: CustomerLead, parsed: Partial<LeadCreateInput
   if (parsed.title !== undefined) lead.title = parsed.title
   if (parsed.description !== undefined) lead.description = normalizeOptionalString(parsed.description)
   if (parsed.source !== undefined) lead.source = normalizeOptionalString(parsed.source)
-  if (parsed.ownerUserId !== undefined) lead.ownerUserId = parsed.ownerUserId ?? null
   if (parsed.estimatedValueAmount !== undefined) lead.estimatedValueAmount = toNumericString(parsed.estimatedValueAmount)
   if (parsed.estimatedValueCurrency !== undefined) lead.estimatedValueCurrency = normalizeOptionalString(parsed.estimatedValueCurrency)
   if (parsed.companyName !== undefined) lead.companyName = normalizeOptionalString(parsed.companyName)
@@ -181,7 +178,6 @@ const createLeadCommand: CommandHandler<LeadCreateInput, { leadId: string }> = {
       description: normalizeOptionalString(parsed.description),
       status: parsed.status ?? 'open',
       source: normalizeOptionalString(parsed.source),
-      ownerUserId: parsed.ownerUserId ?? null,
       estimatedValueAmount: toNumericString(parsed.estimatedValueAmount),
       estimatedValueCurrency: normalizeOptionalString(parsed.estimatedValueCurrency),
       companyName: normalizeOptionalString(parsed.companyName),
@@ -323,7 +319,6 @@ const updateLeadCommand: CommandHandler<LeadUpdateInput, { leadId: string }> = {
         description: before.description,
         status: before.status,
         source: before.source,
-        ownerUserId: before.ownerUserId,
         estimatedValueAmount: before.estimatedValueAmount,
         estimatedValueCurrency: before.estimatedValueCurrency,
         companyName: before.companyName,
@@ -344,7 +339,6 @@ const updateLeadCommand: CommandHandler<LeadUpdateInput, { leadId: string }> = {
       lead.description = before.description
       lead.status = before.status
       lead.source = before.source
-      lead.ownerUserId = before.ownerUserId
       lead.estimatedValueAmount = before.estimatedValueAmount
       lead.estimatedValueCurrency = before.estimatedValueCurrency
       lead.companyName = before.companyName
@@ -542,7 +536,6 @@ const deleteLeadCommand: CommandHandler<{ body?: Record<string, unknown>; query?
         description: before.description,
         status: before.status,
         source: before.source,
-        ownerUserId: before.ownerUserId,
         estimatedValueAmount: before.estimatedValueAmount,
         estimatedValueCurrency: before.estimatedValueCurrency,
         companyName: before.companyName,
@@ -638,7 +631,7 @@ const convertLeadCommand: CommandHandler<LeadConvertInput, ConvertResult> = {
           kind: 'company',
           displayName: companyName,
           description: null,
-          ownerUserId: lead.ownerUserId ?? null,
+          ownerUserId: null,
           primaryEmail: null,
           primaryPhone: null,
           status: null,
@@ -685,7 +678,7 @@ const convertLeadCommand: CommandHandler<LeadConvertInput, ConvertResult> = {
           kind: 'person',
           displayName,
           description: null,
-          ownerUserId: lead.ownerUserId ?? null,
+          ownerUserId: null,
           primaryEmail: normalizeEmail(lead.contactEmail),
           primaryPhone: normalizeOptionalString(lead.contactPhone),
           status: null,
@@ -734,7 +727,7 @@ const convertLeadCommand: CommandHandler<LeadConvertInput, ConvertResult> = {
           valueCurrency: normalizeOptionalString(parsed.deal?.valueCurrency ?? lead.estimatedValueCurrency),
           probability: null,
           expectedCloseAt: null,
-          ownerUserId: lead.ownerUserId ?? null,
+          ownerUserId: null,
           source: normalizeOptionalString(lead.source),
         })
         trx.persist(deal)

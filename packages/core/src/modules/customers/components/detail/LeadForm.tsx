@@ -4,13 +4,13 @@ import * as React from 'react'
 import { z } from 'zod'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
 import { CrudForm, type CrudField, type CrudFormGroup } from '@open-mercato/ui/backend/CrudForm'
+import { useOrganizationScopeVersion } from '@open-mercato/shared/lib/frontend/useOrganizationScope'
 import { E } from '#generated/entities.ids.generated'
 
 export type LeadFormBaseValues = {
   title: string
   description?: string | null
   source?: string | null
-  ownerUserId?: string | null
   estimatedValueAmount?: number | null
   estimatedValueCurrency?: string | null
   status?: string | null
@@ -54,7 +54,6 @@ const schema = z.object({
     .max(200, 'customers.leads.form.titleTooLong'),
   description: z.string().max(4000, 'customers.leads.form.descriptionTooLong').optional(),
   source: z.string().max(150, 'customers.leads.form.sourceTooLong').optional(),
-  ownerUserId: z.string().uuid('customers.leads.form.ownerInvalid').optional().nullable(),
   estimatedValueAmount: z
     .preprocess((value) => {
       if (value === '' || value === null || value === undefined) return undefined
@@ -117,6 +116,7 @@ export function LeadForm({
   isConverted,
 }: LeadFormProps) {
   const t = useT()
+  const scopeVersion = useOrganizationScopeVersion()
 
   const fields: CrudField[] = React.useMemo(
     () => [
@@ -278,7 +278,6 @@ export function LeadForm({
         title: typeof values.title === 'string' ? values.title.trim() : '',
         description: typeof values.description === 'string' ? values.description.trim() : undefined,
         source: typeof values.source === 'string' ? values.source.trim() : undefined,
-        ownerUserId: typeof values.ownerUserId === 'string' && values.ownerUserId ? values.ownerUserId : undefined,
         estimatedValueAmount:
           typeof values.estimatedValueAmount === 'number'
             ? values.estimatedValueAmount
@@ -323,10 +322,10 @@ export function LeadForm({
       title={title}
       backHref={backHref ?? '/backend/customers/leads'}
       embedded={embedded}
-      isSubmitting={isSubmitting}
       entityId={E.customers.customer_lead}
       entityIds={LEAD_ENTITY_IDS}
       readOnly={isConverted === true}
+      deleteVisible={mode === 'edit'}
     />
   )
 }

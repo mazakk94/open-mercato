@@ -162,7 +162,13 @@ export async function GET(req: Request) {
     where.tenantId = auth.tenantId
   }
   if (organizationId) where.organizationId = organizationId
-  if (search) where.email = { $ilike: `%${escapeLikePattern(search)}%` } as any
+  if (search) {
+    const pattern = `%${escapeLikePattern(search)}%`
+    where.$or = [
+      { email: { $ilike: pattern } as any },
+      { name: { $ilike: pattern } as any },
+    ]
+  }
   let idFilter: Set<string> | null = id ? new Set([id]) : null
   if (Array.isArray(roleIds) && roleIds.length > 0) {
     const uniqueRoleIds = Array.from(new Set(roleIds))
@@ -271,6 +277,7 @@ export async function GET(req: Request) {
     return {
       id: uid,
       email: String(u.email),
+      name: typeof u.name === 'string' ? u.name : null,
       organizationId: orgId,
       organizationName: orgId ? orgMap[orgId] ?? orgId : null,
       tenantId: u.tenantId ? String(u.tenantId) : null,

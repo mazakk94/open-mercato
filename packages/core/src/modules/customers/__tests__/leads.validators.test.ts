@@ -7,7 +7,6 @@ import {
 const VALID_ORG_ID = '00000000-0000-1000-8000-000000000001'
 const VALID_TENANT_ID = '00000000-0000-1000-8000-000000000002'
 const VALID_LEAD_ID = '00000000-0000-1000-8000-000000000003'
-const VALID_OWNER_ID = '00000000-0000-1000-8000-000000000004'
 
 describe('lead validators', () => {
   describe('leadCreateSchema', () => {
@@ -27,7 +26,6 @@ describe('lead validators', () => {
         title: 'Enterprise Lead',
         description: 'A promising lead',
         source: 'website',
-        ownerUserId: VALID_OWNER_ID,
         estimatedValueAmount: 5000,
         estimatedValueCurrency: 'EUR',
         companyName: 'Acme Inc',

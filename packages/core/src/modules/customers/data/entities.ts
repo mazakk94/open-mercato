@@ -826,7 +826,6 @@ export type CustomerLeadStatus = 'open' | 'in_progress' | 'qualified' | 'rejecte
 
 @Entity({ tableName: 'customer_leads' })
 @Index({ name: 'customer_leads_org_tenant_status_created_idx', properties: ['organizationId', 'tenantId', 'status', 'createdAt'] })
-@Index({ name: 'customer_leads_org_tenant_owner_created_idx', properties: ['organizationId', 'tenantId', 'ownerUserId', 'createdAt'] })
 @Index({ name: 'customer_leads_org_tenant_created_idx', properties: ['organizationId', 'tenantId', 'createdAt'] })
 @Index({ name: 'customer_leads_org_tenant_converted_idx', properties: ['organizationId', 'tenantId', 'convertedAt'] })
 export class CustomerLead {
@@ -852,9 +851,6 @@ export class CustomerLead {
 
   @Property({ type: 'text', nullable: true })
   source?: string | null
-
-  @Property({ name: 'owner_user_id', type: 'uuid', nullable: true })
-  ownerUserId?: string | null
 
   @Property({ name: 'estimated_value_amount', type: 'numeric', precision: 14, scale: 2, nullable: true })
   estimatedValueAmount?: string | null

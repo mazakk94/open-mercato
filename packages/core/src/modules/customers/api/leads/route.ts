@@ -29,7 +29,6 @@ const listSchema = z
     search: z.string().optional(),
     status: z.string().optional(),
     source: z.string().optional(),
-    ownerUserId: z.string().uuid().optional(),
     sortField: z.string().optional(),
     sortDir: z.enum(['asc', 'desc']).optional(),
   })
@@ -67,7 +66,6 @@ const crud = makeCrudRoute<unknown, unknown, LeadListQuery>({
       'description',
       'status',
       'source',
-      'owner_user_id',
       'estimated_value_amount',
       'estimated_value_currency',
       'company_name',
@@ -139,9 +137,6 @@ const crud = makeCrudRoute<unknown, unknown, LeadListQuery>({
       if (query.source) {
         filters.source = { $eq: query.source }
       }
-      if (query.ownerUserId) {
-        filters.owner_user_id = { $eq: query.ownerUserId }
-      }
       if (ctx && advancedFilterState) {
         const advancedFilters = mergeAdvancedFilters(
           { ...filters },
@@ -207,7 +202,6 @@ const leadListItemSchema = z
     description: z.string().nullable().optional(),
     status: z.string().nullable().optional(),
     source: z.string().nullable().optional(),
-    owner_user_id: z.string().uuid().nullable().optional(),
     estimated_value_amount: z.number().nullable().optional(),
     estimated_value_currency: z.string().nullable().optional(),
     company_name: z.string().nullable().optional(),

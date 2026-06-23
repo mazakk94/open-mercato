@@ -22,7 +22,6 @@ type LeadRow = {
   title: string
   status: string | null
   source: string | null
-  ownerUserId: string | null
   companyName: string | null
   contactFirstName: string | null
   contactLastName: string | null
@@ -74,9 +73,6 @@ function mapLead(item: Record<string, unknown>): LeadRow | null {
   const title = typeof item.title === 'string' ? item.title : ''
   const status = typeof item.status === 'string' ? item.status : null
   const source = typeof item.source === 'string' ? item.source : null
-  const ownerUserId =
-    typeof item.ownerUserId === 'string' ? item.ownerUserId :
-    typeof item.owner_user_id === 'string' ? item.owner_user_id : null
   const companyName =
     typeof item.companyName === 'string' ? item.companyName :
     typeof item.company_name === 'string' ? item.company_name : null
@@ -107,7 +103,6 @@ function mapLead(item: Record<string, unknown>): LeadRow | null {
     title,
     status,
     source,
-    ownerUserId,
     companyName,
     contactFirstName,
     contactLastName,

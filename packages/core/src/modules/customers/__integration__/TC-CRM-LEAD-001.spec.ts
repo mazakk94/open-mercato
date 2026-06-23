@@ -32,7 +32,6 @@ type LeadPayload = {
   title: string;
   description?: string;
   source?: string;
-  ownerUserId?: string;
   estimatedValueAmount?: number;
   estimatedValueCurrency?: string;
   companyName?: string;

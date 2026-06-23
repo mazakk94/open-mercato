@@ -136,7 +136,6 @@ const leadBaseSchema = {
   title: z.string().trim().min(1).max(200),
   description: z.string().trim().max(4000).optional(),
   source: z.string().trim().max(150).optional(),
-  ownerUserId: uuid().optional(),
   estimatedValueAmount: z.coerce.number().min(0).optional(),
   estimatedValueCurrency: z.string().trim().min(3).max(3).optional(),
   companyName: z.string().trim().max(200).optional(),

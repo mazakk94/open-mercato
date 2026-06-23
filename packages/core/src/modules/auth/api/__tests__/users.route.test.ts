@@ -131,7 +131,10 @@ describe('GET /api/auth/users', () => {
       expect.objectContaining({
         deletedAt: null,
         tenantId,
-        email: { $ilike: '%alice%' },
+        $or: [
+          { email: { $ilike: '%alice%' } },
+          { name: { $ilike: '%alice%' } },
+        ],
       }),
       expect.objectContaining({
         limit: 50,

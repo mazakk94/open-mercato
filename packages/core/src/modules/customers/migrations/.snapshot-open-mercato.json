@@ -2955,22 +2955,6 @@
           "enumItems": [],
           "mappedType": "text"
         },
-        "owner_user_id": {
-          "name": "owner_user_id",
-          "type": "uuid",
-          "unsigned": false,
-          "autoincrement": false,
-          "primary": false,
-          "nullable": true,
-          "unique": false,
-          "length": null,
-          "precision": null,
-          "scale": null,
-          "default": null,
-          "comment": null,
-          "enumItems": [],
-          "mappedType": "uuid"
-        },
         "estimated_value_amount": {
           "name": "estimated_value_amount",
           "type": "numeric(14,2)",
@@ -3248,19 +3232,6 @@
           "columnNames": [
             "organization_id",
             "tenant_id",
-            "created_at"
-          ],
-          "composite": true,
-          "constraint": false,
-          "primary": false,
-          "unique": false
-        },
-        {
-          "keyName": "customer_leads_org_tenant_owner_created_idx",
-          "columnNames": [
-            "organization_id",
-            "tenant_id",
-            "owner_user_id",
             "created_at"
           ],
           "composite": true,
