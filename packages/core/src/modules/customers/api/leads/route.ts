@@ -90,10 +90,10 @@ const crud = makeCrudRoute<unknown, unknown, LeadListQuery>({
       title: 'title',
       status: 'status',
     },
-    buildFilters: async (query: any, ctx) => {
+    buildFilters: async (query, ctx) => {
       const advancedQuery = { ...query }
       const advancedFilterState = consumeAdvancedFilterState(query)
-      const filters: Record<string, any> = {}
+      const filters: Record<string, unknown> = {}
       if (query.search) {
         const matchingIds = ctx
           ? await findMatchingEntityIdsBySearchTokensAcrossSources({

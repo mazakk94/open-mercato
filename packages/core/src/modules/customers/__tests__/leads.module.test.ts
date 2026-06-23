@@ -1,7 +1,7 @@
 import { features as aclFeatures } from '../acl'
 import { eventsConfig } from '../events'
 import entities from '../ce'
-import { DEFAULT_ENCRYPTION_MAPS } from '../../entities/lib/encryptionDefaults'
+import { defaultEncryptionMaps as DEFAULT_ENCRYPTION_MAPS } from '../encryption'
 
 describe('customers leads module configuration', () => {
   describe('ACL features', () => {
