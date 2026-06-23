@@ -1,11 +1,12 @@
 /** @jest-environment node */
 
 import { describe, test, expect, beforeEach, jest } from '@jest/globals'
-import { createAuthMock, createMockContainer, createMockEntityManager } from './test-helpers'
+import { createAuthMock, createMockCache, createMockContainer, createMockEntityManager } from './test-helpers'
 
 const mockGetAuthFromRequest = createAuthMock()
 const mockEm = createMockEntityManager()
-const mockContainer = createMockContainer(mockEm)
+const mockCache = createMockCache()
+const mockContainer = createMockContainer(mockEm, mockCache)
 
 jest.mock('@open-mercato/shared/lib/di/container', () => ({
   createRequestContainer: jest.fn(async () => mockContainer),
@@ -30,6 +31,7 @@ describe('Business Rules API - Execute Endpoint', () => {
   const validOrgId = '223e4567-e89b-12d3-a456-426614174000'
 
   beforeEach(() => {
+    mockCache.clearAll()
     jest.clearAllMocks()
     mockGetAuthFromRequest.mockResolvedValue({
       sub: 'user-1',
@@ -112,7 +114,7 @@ describe('Business Rules API - Execute Endpoint', () => {
 
       mockEm.find.mockResolvedValue([mockRule])
       mockEm.create.mockReturnValue({})
-      mockEm.persistAndFlush.mockResolvedValue(undefined)
+      mockEm.flush.mockResolvedValue(undefined)
 
       const request = new Request('http://localhost:3000/api/business_rules/execute', {
         method: 'POST',
@@ -169,7 +171,7 @@ describe('Business Rules API - Execute Endpoint', () => {
       const body = await response.json()
       expect(body.allowed).toBeDefined()
       expect(body.executedRules).toBeDefined()
-      expect(mockEm.persistAndFlush).not.toHaveBeenCalled()
+      expect(mockEm.flush).not.toHaveBeenCalled()
     })
 
     test('should handle execution with multiple rules', async () => {
@@ -212,7 +214,7 @@ describe('Business Rules API - Execute Endpoint', () => {
 
       mockEm.find.mockResolvedValue(mockRules)
       mockEm.create.mockReturnValue({})
-      mockEm.persistAndFlush.mockResolvedValue(undefined)
+      mockEm.flush.mockResolvedValue(undefined)
 
       const request = new Request('http://localhost:3000/api/business_rules/execute', {
         method: 'POST',
@@ -286,7 +288,7 @@ describe('Business Rules API - Execute Endpoint', () => {
 
       mockEm.find.mockResolvedValue([mockRule])
       mockEm.create.mockReturnValue({})
-      mockEm.persistAndFlush.mockResolvedValue(undefined)
+      mockEm.flush.mockResolvedValue(undefined)
 
       const request = new Request('http://localhost:3000/api/business_rules/execute', {
         method: 'POST',

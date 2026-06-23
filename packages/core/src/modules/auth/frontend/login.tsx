@@ -6,14 +6,17 @@ import Link from 'next/link'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { Card, CardContent, CardHeader, CardDescription } from '@open-mercato/ui/primitives/card'
 import { Input } from '@open-mercato/ui/primitives/input'
+import { EmailInput } from '@open-mercato/ui/primitives/email-input'
+import { PasswordInput } from '@open-mercato/ui/primitives/password-input'
 import { Label } from '@open-mercato/ui/primitives/label'
 import { Button } from '@open-mercato/ui/primitives/button'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
 import { translateWithFallback } from '@open-mercato/shared/lib/i18n/translate'
 import { clearAllOperations } from '@open-mercato/ui/backend/operations/store'
+import { notifyAuthIdentityChange } from '@open-mercato/ui/backend/AuthSessionGuard'
 import { apiCall } from '@open-mercato/ui/backend/utils/apiCall'
 import { X } from 'lucide-react'
-import { Notice } from '@open-mercato/ui/primitives/Notice'
+import { Alert, AlertDescription } from '@open-mercato/ui/primitives/alert'
 import { InjectionSpot } from '@open-mercato/ui/backend/injection/InjectionSpot'
 import { useRegisteredComponent } from '@open-mercato/ui/backend/injection/useRegisteredComponent'
 import type { AuthOverride, LoginFormWidgetContext } from './login-injection'
@@ -108,6 +111,7 @@ export default function LoginPage() {
   const [authOverride, setAuthOverride] = useState<AuthOverride | null>(null)
   const [authOverridePending, setAuthOverridePending] = useState(false)
   const [clientReady, setClientReady] = useState(false)
+  const [activeAuthenticatedUser, setActiveAuthenticatedUser] = useState(false)
   const [email, setEmail] = useState('')
   const [tenantId, setTenantId] = useState<string | null>(null)
   const [tenantName, setTenantName] = useState<string | null>(null)
@@ -122,6 +126,51 @@ export default function LoginPage() {
   useEffect(() => {
     setClientReady(true)
   }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    const hasAclChallenge = requiredFeatures.length > 0 || requiredRoles.length > 0
+    void (async () => {
+      try {
+        const res = await apiCall<{ userId?: string }>('/api/auth/feature-check', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ features: [] }),
+          cache: 'no-store',
+        })
+        if (cancelled) return
+        const activeUserId = typeof res.result?.userId === 'string' ? res.result.userId : ''
+        if (!activeUserId) return
+        setActiveAuthenticatedUser(true)
+        // When a feature/role challenge is present in the URL, the user already
+        // failed an ACL check while authenticated. Auto-redirecting back to
+        // `redirect` would re-trigger the same 403 and re-bounce here,
+        // producing an infinite loop (see GH #2070). Stay on the login page so
+        // the access-denied banner is visible.
+        if (hasAclChallenge) return
+        const rawRedirect = searchParams.get('redirect') || ''
+        let destination = '/backend'
+        if (rawRedirect) {
+          try {
+            const resolved = new URL(rawRedirect, window.location.origin)
+            if (
+              resolved.origin === window.location.origin &&
+              resolved.pathname.startsWith('/') &&
+              !resolved.pathname.includes('//')
+            ) {
+              destination = resolved.pathname + resolved.search + resolved.hash
+            }
+          } catch {
+            // fall back to /backend
+          }
+        }
+        router.replace(destination)
+      } catch {
+        // ignore — leave login form usable on network failure
+      }
+    })()
+    return () => { cancelled = true }
+  }, [router, searchParams, requiredFeatures.length, requiredRoles.length])
 
   useEffect(() => {
     const tenantParam = (searchParams.get('tenant') || '').trim()
@@ -205,9 +254,12 @@ export default function LoginPage() {
     try {
       const form = new FormData(e.currentTarget)
       if (requiredRoles.length) form.set('requireRole', requiredRoles.join(','))
+      const redirectParam = searchParams.get('redirect')
+      if (redirectParam) form.set('redirect', redirectParam)
       const res = await fetch('/api/auth/login', { method: 'POST', body: form })
       if (res.redirected) {
         clearAllOperations()
+        notifyAuthIdentityChange()
         // NextResponse.redirect from API
         router.replace(res.url)
         return
@@ -261,6 +313,7 @@ export default function LoginPage() {
       const data = await res.json().catch(() => null) as LoginResponseEventDetail
       emitLoginResponseEvent(data)
       clearAllOperations()
+      notifyAuthIdentityChange()
       if (data && typeof data.redirect === 'string' && data.redirect.length > 0) {
         router.replace(data.redirect)
       }
@@ -299,23 +352,36 @@ export default function LoginPage() {
                 <input type="hidden" name="tenantId" value={tenantId} />
               ) : null}
               {!!translatedRoles.length && (
-                <Notice compact className="text-center">
-                  {translate(
-                    translatedRoles.length > 1 ? 'auth.login.requireRolesMessage' : 'auth.login.requireRoleMessage',
-                    translatedRoles.length > 1
-                      ? 'Access requires one of the following roles: {roles}'
-                      : 'Access requires role: {roles}',
-                    { roles: translatedRoles.join(', ') },
-                  )}
-                </Notice>
+                <Alert variant="info" className="text-center">
+                  <AlertDescription>
+                    {translate(
+                      translatedRoles.length > 1 ? 'auth.login.requireRolesMessage' : 'auth.login.requireRoleMessage',
+                      translatedRoles.length > 1
+                        ? 'Access requires one of the following roles: {roles}'
+                        : 'Access requires role: {roles}',
+                      { roles: translatedRoles.join(', ') },
+                    )}
+                  </AlertDescription>
+                </Alert>
               )}
               {!!translatedFeatures.length && (
-                <Notice compact className="text-center">
-                  {translate('auth.login.featureDenied', "You don't have access to this feature ({feature}). Please contact your administrator.", {
-                    feature: translatedFeatures.join(', '),
-                  })}
-                </Notice>
+                <Alert variant="info" className="text-center">
+                  <AlertDescription>
+                    {translate('auth.login.featureDenied', "You don't have access to this feature ({feature}). Please contact your administrator.", {
+                      feature: translatedFeatures.join(', '),
+                    })}
+                  </AlertDescription>
+                </Alert>
               )}
+              {activeAuthenticatedUser && (translatedRoles.length || translatedFeatures.length) ? (
+                <div className="flex justify-center" data-testid="login-return-dashboard">
+                  <Button asChild type="button" variant="outline" size="sm">
+                    <Link href="/backend">
+                      {translate('auth.accessDenied.dashboard', 'Go to Dashboard')}
+                    </Link>
+                  </Button>
+                </div>
+              ) : null}
               {showTenantInvalid ? (
                 <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-center text-xs text-red-700">
                   <div className="font-medium">{translate('auth.login.errors.tenantInvalid', 'Tenant not found. Clear the tenant selection and try again.')}</div>
@@ -329,7 +395,7 @@ export default function LoginPage() {
                   <div className="font-medium">
                     {tenantLoading
                       ? translate('auth.login.tenantLoading', 'Loading tenant details...')
-                      : translate('auth.login.tenantBanner', "You're logging in to {tenant} tenant.", {
+                      : translate('auth.login.tenantBanner', "You're logging in to {tenant}.", {
                           tenant: tenantName || tenantId,
                         })}
                   </div>
@@ -346,10 +412,9 @@ export default function LoginPage() {
               )}
               <div className="grid gap-1">
                 <Label htmlFor="email">{t('auth.email')}</Label>
-                <Input
+                <EmailInput
                   id="email"
                   name="email"
-                  type="email"
                   required
                   aria-invalid={!!error}
                   onChange={(e) => setEmail(e.target.value)}
@@ -363,7 +428,7 @@ export default function LoginPage() {
               {authOverride?.hidePassword ? null : (
                 <div className="grid gap-1">
                   <Label htmlFor="password">{t('auth.password')}</Label>
-                  <Input id="password" name="password" type="password" required={!authOverride} aria-invalid={!!error} />
+                  <PasswordInput id="password" name="password" required={!authOverride} aria-invalid={!!error} autoComplete="current-password" />
                 </div>
               )}
               {!authOverride?.hideRememberMe && !authOverride?.hidePassword && (

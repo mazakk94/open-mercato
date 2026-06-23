@@ -13,11 +13,20 @@ import {
   DialogTitle,
 } from '@open-mercato/ui/primitives/dialog'
 import { Input } from '@open-mercato/ui/primitives/input'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@open-mercato/ui/primitives/select'
 import { Label } from '@open-mercato/ui/primitives/label'
-import { Switch } from '@open-mercato/ui/primitives/switch'
+import { SwitchField } from '@open-mercato/ui/primitives/switch-field'
 import { CrudForm, type CrudCustomFieldRenderProps, type CrudField } from '@open-mercato/ui/backend/CrudForm'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
-import { apiCall, readApiResultOrThrow } from '@open-mercato/ui/backend/utils/apiCall'
+import { apiCall, readApiResultOrThrow, withScopedApiRequestHeaders } from '@open-mercato/ui/backend/utils/apiCall'
+import { buildOptimisticLockHeader } from '@open-mercato/ui/backend/utils/optimisticLock'
+import { surfaceRecordConflict } from '@open-mercato/ui/backend/conflicts'
 import { raiseCrudError } from '@open-mercato/ui/backend/utils/serverErrors'
 import { useOrganizationScopeVersion } from '@open-mercato/shared/lib/frontend/useOrganizationScope'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
@@ -171,17 +180,21 @@ function FlatRateSettingsEditor(props: {
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
                 <div className="space-y-1">
                   <Label className="text-xs uppercase text-muted-foreground">{translations.metric}</Label>
-                  <select
-                    className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                  <Select
                     value={rate.metric ?? 'item_count'}
-                    onChange={(evt) => updateRate(index, 'metric', evt.target.value)}
+                    onValueChange={(value) => updateRate(index, 'metric', value)}
                   >
-                    {metrics.map((opt) => (
-                      <option key={opt.value} value={opt.value}>
-                        {opt.label}
-                      </option>
-                    ))}
-                  </select>
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {metrics.map((opt) => (
+                        <SelectItem key={opt.value} value={opt.value}>
+                          {opt.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
                 </div>
                 <div className="space-y-1">
                   <Label className="text-xs uppercase text-muted-foreground">{translations.min}</Label>
@@ -239,16 +252,13 @@ function FlatRateSettingsEditor(props: {
           ))
         )}
       </div>
-      <div className="flex items-center gap-2">
-        <Switch
-          id="apply-base-rate"
-          checked={applyBaseRate}
-          onCheckedChange={(checked) => onChange({ ...value, applyBaseRate: checked })}
-        />
-        <Label htmlFor="apply-base-rate" className="text-sm">
-          {translations.applyBaseRate}
-        </Label>
-      </div>
+      <SwitchField
+        id="apply-base-rate"
+        label={translations.applyBaseRate}
+        flip
+        checked={applyBaseRate}
+        onCheckedChange={(checked) => onChange({ ...value, applyBaseRate: checked })}
+      />
     </div>
   )
 }
@@ -541,12 +551,14 @@ export function ShippingMethodsSettings() {
     })
     if (!confirmed) return
     try {
-      const call = await apiCall('/api/sales/shipping-methods', {
+      const headers = buildOptimisticLockHeader(entry.updatedAt)
+      const call = await withScopedApiRequestHeaders(headers, () => apiCall('/api/sales/shipping-methods', {
         method: 'DELETE',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ id: entry.id }),
-      })
+      }))
       if (!call.ok) {
+        if (surfaceRecordConflict({ status: call.status, body: call.result }, t)) return
         await raiseCrudError(call.response, translations.errors.delete)
       }
       flash(translations.messages.deleted, 'success')
@@ -634,12 +646,15 @@ export function ShippingMethodsSettings() {
     const method = dialog.mode === 'create' ? 'POST' : 'PUT'
     if (dialog.mode === 'edit') payload.id = dialog.entry.id
     try {
-      const call = await apiCall(path, {
+      const saveShippingMethod = () => apiCall(path, {
         method,
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(payload),
       })
+      const headers = buildOptimisticLockHeader(dialog.mode === 'edit' ? dialog.entry.updatedAt : null)
+      const call = await withScopedApiRequestHeaders(headers, saveShippingMethod)
       if (!call.ok) {
+        if (surfaceRecordConflict({ status: call.status, body: call.result }, t)) return
         await raiseCrudError(call.response, translations.errors.save)
       }
       flash(translations.messages.saved, 'success')
@@ -762,6 +777,7 @@ export function ShippingMethodsSettings() {
             schema={shippingFormSchema}
             fields={fields}
             initialValues={formValues}
+            optimisticLockUpdatedAt={dialog?.mode === 'edit' ? dialog.entry.updatedAt : null}
             submitLabel={translations.form.save}
             cancelHref={undefined}
             embedded

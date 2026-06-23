@@ -5,7 +5,7 @@ import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
 import type { EntityManager } from '@mikro-orm/core'
 import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
 import { ScheduledJob } from '../../../../data/entities.js'
-import { getRedisUrl, parseRedisUrl } from '@open-mercato/shared/lib/redis/connection'
+import { getRedisUrlOrThrow } from '@open-mercato/shared/lib/redis/connection'
 import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
 
 
@@ -57,10 +57,9 @@ export async function GET(
       return NextResponse.json({ error: translate('scheduler.error.not_found', 'Schedule not found') }, { status: 404 })
     }
 
-    // System-scoped schedules (no tenantId/orgId) require superadmin
-    const isSuperAdmin = Array.isArray(auth.roles) && auth.roles.some(
-      (role) => typeof role === 'string' && role.trim().toLowerCase() === 'superadmin'
-    )
+    // System-scoped schedules (no tenantId/orgId) require super-admin. Use the
+    // immutable `isSuperAdmin` flag — never compare mutable/spoofable role names.
+    const isSuperAdmin = auth.isSuperAdmin === true
     if (!schedule.tenantId && !schedule.organizationId && !isSuperAdmin) {
       return NextResponse.json({ error: translate('scheduler.error.access_denied', 'Access denied') }, { status: 403 })
     }
@@ -77,7 +76,7 @@ export async function GET(
 
     // Fetch jobs from BullMQ scheduler-execution queue
     const { Queue } = await import('bullmq')
-    const queue = new Queue('scheduler-execution', { connection: parseRedisUrl(getRedisUrl('QUEUE')) })
+    const queue = new Queue('scheduler-execution', { connection: { url: getRedisUrlOrThrow('QUEUE') } })
 
     try {
       // Validate query params with Zod schema

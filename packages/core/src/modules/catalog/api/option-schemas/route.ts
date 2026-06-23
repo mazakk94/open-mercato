@@ -62,7 +62,6 @@ export async function buildOptionSchemaFilters(
   }
   const active = parseBooleanFlag(query.isActive)
   if (active !== undefined) filters.is_active = active
-  if (!query.withDeleted) filters.deleted_at = null
   const tenantId = ctx.auth?.tenantId ?? null
   if (tenantId) {
     try {
@@ -90,6 +89,7 @@ const crud = makeCrudRoute({
     tenantField: 'tenantId',
     softDeleteField: 'deletedAt',
   },
+  indexer: { entityType: E.catalog.catalog_option_schema_template },
   list: {
     schema: listSchema,
     entityId: E.catalog.catalog_option_schema_template,

@@ -1,3 +1,5 @@
+import { parseDecryptedFieldValue } from '@open-mercato/shared/lib/encryption/tenantDataEncryptionService'
+import { sanitizeRichTextHref } from '@open-mercato/shared/lib/html/sanitizeRichText'
 import type { Message, MessageAction, MessageActionData, MessageObject } from '../data/entities'
 import { getMessageObjectType } from './message-objects-registry'
 import { getMessageType } from './message-types-registry'
@@ -20,6 +22,34 @@ export type MessageActionResolutionContext = {
   tenantId: string
   organizationId?: string | null
   userId: string
+}
+
+function isRecordValue(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+}
+
+export function resolveMessageActionData(message: Pick<Message, 'actionData'>): MessageActionData | null {
+  const rawActionData = message.actionData as unknown
+  const parsedActionData = typeof rawActionData === 'string'
+    ? parseDecryptedFieldValue(rawActionData)
+    : rawActionData
+  if (!isRecordValue(parsedActionData)) return null
+
+  const actions = Array.isArray(parsedActionData.actions)
+    ? parsedActionData.actions.filter(isRecordValue) as MessageAction[]
+    : []
+  const primaryActionId = typeof parsedActionData.primaryActionId === 'string'
+    ? parsedActionData.primaryActionId
+    : undefined
+  const expiresAt = typeof parsedActionData.expiresAt === 'string'
+    ? parsedActionData.expiresAt
+    : undefined
+
+  return {
+    actions,
+    ...(primaryActionId ? { primaryActionId } : {}),
+    ...(expiresAt ? { expiresAt } : {}),
+  }
 }
 
 function normalizeActionLabel(
@@ -49,7 +79,8 @@ export function buildMessageObjectActionId(objectId: string, actionId: string): 
 }
 
 function readActionDataExpiry(message: Message): string | undefined {
-  if (message.actionData?.expiresAt) return message.actionData.expiresAt
+  const actionData = resolveMessageActionData(message)
+  if (actionData?.expiresAt) return actionData.expiresAt
   const messageType = getMessageType(message.type)
   if (!messageType?.actionsExpireAfterHours || !message.sentAt) return undefined
   return new Date(
@@ -63,6 +94,7 @@ export function buildResolvedMessageActions(
 ): MessageActionData | null {
   const resolved: ResolvedMessageAction[] = []
   const usedIds = new Set<string>()
+  const actionData = resolveMessageActionData(message)
 
   const pushAction = (
     action: MessageAction,
@@ -83,7 +115,7 @@ export function buildResolvedMessageActions(
     })
   }
 
-  for (const action of message.actionData?.actions ?? []) {
+  for (const action of actionData?.actions ?? []) {
     pushAction(action, 'message')
   }
 
@@ -128,7 +160,7 @@ export function buildResolvedMessageActions(
     return null
   }
 
-  const configuredPrimaryActionId = message.actionData?.primaryActionId
+  const configuredPrimaryActionId = actionData?.primaryActionId
   const primaryActionId = configuredPrimaryActionId && resolved.some((entry) => entry.id === configuredPrimaryActionId)
     ? configuredPrimaryActionId
     : resolved[0]?.id
@@ -172,11 +204,15 @@ function buildTemplateContext(
   }
 }
 
-function resolveTemplateString(template: string, context: Record<string, unknown>): string {
+function resolveTemplateString(
+  template: string,
+  context: Record<string, unknown>,
+  encodeValue: (value: string) => string = (value) => value,
+): string {
   return template.replace(/\{([a-zA-Z0-9_]+)\}/g, (fullMatch, key: string) => {
     const value = context[key]
     if (value == null) return fullMatch
-    return String(value)
+    return encodeValue(String(value))
   })
 }
 
@@ -187,7 +223,8 @@ export function resolveActionHref(
 ): string | null {
   if (!action.href) return null
   const context = buildTemplateContext(message, resolutionContext, action.objectRef)
-  return resolveTemplateString(action.href, context)
+  const resolved = resolveTemplateString(action.href, context, encodeURIComponent)
+  return sanitizeRichTextHref(resolved)
 }
 
 export function resolveActionCommandInput(

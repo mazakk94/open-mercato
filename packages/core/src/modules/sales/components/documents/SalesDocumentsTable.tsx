@@ -9,7 +9,8 @@ import { DataTable, type DataTableExportFormat, withDataTableNamespaces } from '
 import type { FilterDef, FilterValues } from '@open-mercato/ui/backend/FilterBar'
 import { RowActions } from '@open-mercato/ui/backend/RowActions'
 import { Button } from '@open-mercato/ui/primitives/button'
-import { apiCall } from '@open-mercato/ui/backend/utils/apiCall'
+import { apiCall, withScopedApiRequestHeaders } from '@open-mercato/ui/backend/utils/apiCall'
+import { buildOptimisticLockHeader } from '@open-mercato/ui/backend/utils/optimisticLock'
 import { buildCrudExportUrl, deleteCrud } from '@open-mercato/ui/backend/utils/crud'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
 import { useOrganizationScopeVersion } from '@open-mercato/shared/lib/frontend/useOrganizationScope'
@@ -22,10 +23,11 @@ import {
   createDictionaryMap,
   normalizeDictionaryEntries,
 } from '@open-mercato/core/modules/dictionaries/components/dictionaryAppearance'
+import { SALES_DOCUMENT_NUMBER_COLUMN_META } from './salesDocumentsColumns'
 
 type SalesDocumentKind = 'order' | 'quote'
 
-type FilterOption = { value: string; label: string }
+type FilterOption = { value: string; label: string; description?: string | null }
 
 type CustomerSnapshot = {
   customer?: {
@@ -76,6 +78,7 @@ type SalesDocumentRow = {
   totalGross?: number | null
   currency?: string | null
   date?: string | null
+  updatedAt?: string | null
 }
 
 const PAGE_SIZE = 20
@@ -200,7 +203,8 @@ export function SalesDocumentsTable({ kind }: { kind: SalesDocumentKind }) {
           const id = typeof item?.id === 'string' ? item.id : null
           const label = typeof item?.label === 'string' ? item.label : null
           if (!id || !label) return null
-          return { value: id, label }
+          const description = typeof item?.description === 'string' ? item.description : null
+          return { value: id, label, description }
         })
         .filter((opt): opt is FilterOption => opt !== null)
     } catch {
@@ -250,7 +254,7 @@ export function SalesDocumentsTable({ kind }: { kind: SalesDocumentKind }) {
         undefined,
         { fallback: { items: [] } }
       )
-      const entries = normalizeDictionaryEntries(response.result?.items ?? [])
+      const entries = normalizeDictionaryEntries(response.result?.items ?? [], { sort: false })
       setStatusMap(createDictionaryMap(entries))
     } catch (err) {
       console.error('sales.documents.statuses.load', err)
@@ -353,8 +357,10 @@ export function SalesDocumentsTable({ kind }: { kind: SalesDocumentKind }) {
       type: 'tags',
       options: tagOptions,
       loadOptions: loadTagOptions,
+      formatValue: (val: string) => tagOptions.find((o) => o.value === val)?.label ?? val,
+      formatDescription: (val: string) => tagOptions.find((o) => o.value === val)?.description ?? null,
     },
-  ], [channelOptions, loadChannelOptions, loadTagOptions, tagOptions, t])
+  ], [channelOptions, loadChannelOptions, customerOptions, loadCustomerOptions, loadTagOptions, tagOptions, t])
 
   const queryParams = React.useMemo(() => {
     const params = new URLSearchParams()
@@ -461,6 +467,7 @@ export function SalesDocumentsTable({ kind }: { kind: SalesDocumentKind }) {
         totalGross,
         currency: doc.currencyCode ?? null,
         date,
+        updatedAt: doc.updatedAt ?? null,
       }, item)
     },
     [kind]
@@ -537,9 +544,13 @@ export function SalesDocumentsTable({ kind }: { kind: SalesDocumentKind }) {
       })
       if (!confirmed) return
       try {
-        const result = await deleteCrud(`sales/${resource}`, row.id, {
-          errorMessage: t('sales.documents.list.table.deleteError', 'Failed to delete document.'),
-        })
+        const result = await withScopedApiRequestHeaders(
+          buildOptimisticLockHeader(row.updatedAt),
+          () =>
+            deleteCrud(`sales/${resource}`, row.id, {
+              errorMessage: t('sales.documents.list.table.deleteError', 'Failed to delete document.'),
+            }),
+        )
         if (result.ok) {
           flash(
             kind === 'order'
@@ -584,7 +595,7 @@ export function SalesDocumentsTable({ kind }: { kind: SalesDocumentKind }) {
           ) : null}
         </div>
       ),
-      meta: { sticky: true },
+      meta: SALES_DOCUMENT_NUMBER_COLUMN_META,
     },
     {
       accessorKey: 'customerName',
@@ -657,6 +668,7 @@ export function SalesDocumentsTable({ kind }: { kind: SalesDocumentKind }) {
     <Page>
       <PageBody>
         <DataTable<SalesDocumentRow>
+          stickyActionsColumn
           title={(
             <div className="flex flex-col">
               <span>{title}</span>

@@ -6,13 +6,13 @@ import { FormHeader } from '@open-mercato/ui/backend/forms'
 import { Card, CardHeader, CardTitle, CardContent } from '@open-mercato/ui/primitives/card'
 import { Badge } from '@open-mercato/ui/primitives/badge'
 import { Button } from '@open-mercato/ui/primitives/button'
+import { LogList, type LogListEntry } from '@open-mercato/ui/backend/LogList'
 import { Progress } from '@open-mercato/ui/primitives/progress'
 import { Spinner } from '@open-mercato/ui/primitives/spinner'
 import { apiCall } from '@open-mercato/ui/backend/utils/apiCall'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
-import { LoadingMessage } from '@open-mercato/ui/backend/detail'
-import { ErrorMessage } from '@open-mercato/ui/backend/detail'
+import { LoadingMessage, ErrorMessage, RecordNotFoundState } from '@open-mercato/ui/backend/detail'
 import { useAppEvent } from '@open-mercato/ui/backend/injection/useAppEvent'
 import { RotateCcw, XCircle } from 'lucide-react'
 
@@ -78,12 +78,6 @@ const STATUS_STYLES: Record<string, string> = {
   paused: 'bg-orange-100 text-orange-800',
 }
 
-const LOG_LEVEL_STYLES: Record<string, string> = {
-  info: 'bg-blue-100 text-blue-800',
-  warn: 'bg-yellow-100 text-yellow-800',
-  error: 'bg-red-100 text-red-800',
-}
-
 type SyncRunDetailPageProps = {
   params?: {
     id?: string | string[]
@@ -111,9 +105,9 @@ export default function SyncRunDetailPage({ params }: SyncRunDetailPageProps) {
   const [run, setRun] = React.useState<SyncRunDetail | null>(null)
   const [isLoading, setIsLoading] = React.useState(true)
   const [error, setError] = React.useState<string | null>(null)
+  const [isNotFound, setIsNotFound] = React.useState(false)
   const [logs, setLogs] = React.useState<LogEntry[]>([])
   const [isLoadingLogs, setIsLoadingLogs] = React.useState(false)
-  const [expandedLogId, setExpandedLogId] = React.useState<string | null>(null)
 
   const resolveCurrentRunId = React.useCallback(() => {
     return runId ?? (
@@ -130,13 +124,18 @@ export default function SyncRunDetailPage({ params }: SyncRunDetailPageProps) {
       setIsLoading(false)
       return
     }
+    setIsNotFound(false)
     const call = await apiCall<SyncRunDetail>(
       `/api/data_sync/runs/${encodeURIComponent(currentRunId)}`,
       undefined,
       { fallback: null },
     )
     if (!call.ok || !call.result) {
-      setError(t('data_sync.runs.detail.loadError'))
+      if (call.status === 404) {
+        setIsNotFound(true)
+      } else {
+        setError(t('data_sync.runs.detail.loadError'))
+      }
       setIsLoading(false)
       return
     }
@@ -249,6 +248,19 @@ export default function SyncRunDetailPage({ params }: SyncRunDetailPageProps) {
   }, [resolveCurrentRunId, router, t])
 
   if (isLoading) return <Page><PageBody><LoadingMessage label={t('data_sync.runs.detail.title')} /></PageBody></Page>
+  if (isNotFound) {
+    return (
+      <Page>
+        <PageBody>
+          <RecordNotFoundState
+            label={t('data_sync.runs.detail.notFound', 'Sync run not found.')}
+            backHref="/backend/data-sync"
+            backLabel={t('data_sync.runs.detail.back')}
+          />
+        </PageBody>
+      </Page>
+    )
+  }
   if (error || !run) return <Page><PageBody><ErrorMessage label={error ?? t('data_sync.runs.detail.loadError')} /></PageBody></Page>
 
   const totalProcessed = run.createdCount + run.updatedCount + run.skippedCount + run.failedCount
@@ -323,7 +335,7 @@ export default function SyncRunDetailPage({ params }: SyncRunDetailPageProps) {
             ) : (
               <div className="relative h-3 w-full overflow-hidden rounded-full bg-secondary">
                 <div className="absolute inset-y-0 left-0 w-1/2 animate-pulse rounded-full bg-primary/80" />
-                <div className="absolute inset-y-0 right-0 w-1/3 rounded-full bg-primary/40" />
+                <div className="absolute inset-y-0 right-0 w-1/3 rounded-full bg-primary/10" />
               </div>
             )}
             <div className="flex flex-wrap items-center justify-between gap-2 text-sm text-muted-foreground">
@@ -385,54 +397,25 @@ export default function SyncRunDetailPage({ params }: SyncRunDetailPageProps) {
           <CardContent>
             {isLoadingLogs ? (
               <div className="flex justify-center py-4"><Spinner /></div>
-            ) : logs.length === 0 ? (
-              <p className="text-muted-foreground text-sm">{t('data_sync.runs.detail.noLogs')}</p>
             ) : (
-              <div className="rounded-lg border">
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr className="border-b bg-muted/50">
-                      <th className="px-4 py-2 text-left font-medium">{t('data_sync.runs.detail.logs.time')}</th>
-                      <th className="px-4 py-2 text-left font-medium">{t('data_sync.runs.detail.logs.level')}</th>
-                      <th className="px-4 py-2 text-left font-medium">{t('data_sync.runs.detail.logs.message')}</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {logs.map((log) => (
-                      <React.Fragment key={log.id}>
-                        <tr className="border-b last:border-0">
-                          <td className="px-4 py-2 text-muted-foreground whitespace-nowrap">
-                            {new Date(log.createdAt).toLocaleString()}
-                          </td>
-                          <td className="px-4 py-2">
-                            <Badge variant="secondary" className={LOG_LEVEL_STYLES[log.level] ?? ''}>
-                              {log.level}
-                            </Badge>
-                          </td>
-                          <td className="px-4 py-2">
-                            <button
-                              type="button"
-                              className="w-full text-left"
-                              onClick={() => setExpandedLogId((current) => current === log.id ? null : log.id)}
-                            >
-                              {log.message}
-                            </button>
-                          </td>
-                        </tr>
-                        {expandedLogId === log.id && log.payload ? (
-                          <tr className="border-b bg-muted/20 last:border-0">
-                            <td colSpan={3} className="px-4 py-4">
-                              <pre className="overflow-x-auto whitespace-pre-wrap rounded-md border bg-card p-3 text-xs">
-                                {JSON.stringify(log.payload, null, 2)}
-                              </pre>
-                            </td>
-                          </tr>
-                        ) : null}
-                      </React.Fragment>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+              <LogList
+                entries={logs.map<LogListEntry>((log) => ({
+                  id: log.id,
+                  time: new Date(log.createdAt).toLocaleString(),
+                  level: log.level,
+                  message: log.message,
+                  body: log.payload ? (
+                    <pre className="overflow-x-auto whitespace-pre-wrap rounded-md border bg-card p-3 text-xs">
+                      {JSON.stringify(log.payload, null, 2)}
+                    </pre>
+                  ) : (
+                    <p className="text-sm text-muted-foreground">
+                      {t('data_sync.runs.detail.logs.noPayload', 'No payload recorded for this log entry.')}
+                    </p>
+                  ),
+                }))}
+                emptyMessage={t('data_sync.runs.detail.noLogs')}
+              />
             )}
           </CardContent>
         </Card>

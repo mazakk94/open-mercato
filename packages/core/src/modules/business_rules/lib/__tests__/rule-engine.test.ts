@@ -11,8 +11,29 @@ import type { BusinessRule } from '../../data/entities'
 jest.mock('../rule-evaluator')
 jest.mock('../action-executor')
 
+function createMockRuleDiscoveryCache() {
+  const entries = new Map<string, { value: unknown; tags: string[] }>()
+  return {
+    get: jest.fn(async (key: string) => entries.get(key)?.value ?? null),
+    set: jest.fn(async (key: string, value: unknown, options?: { tags?: string[] }) => {
+      entries.set(key, { value, tags: options?.tags ?? [] })
+    }),
+    deleteByTags: jest.fn(async (tags: string[]) => {
+      let deleted = 0
+      for (const [key, entry] of entries.entries()) {
+        if (entry.tags.some((tag) => tags.includes(tag))) {
+          entries.delete(key)
+          deleted++
+        }
+      }
+      return deleted
+    }),
+  }
+}
+
 describe('Rule Engine (Unit Tests)', () => {
   let mockEm: jest.Mocked<EntityManager>
+  let mockCache: ReturnType<typeof createMockRuleDiscoveryCache>
 
   const testTenantId = '00000000-0000-4000-8000-000000000001'
   const testOrgId = '00000000-0000-4000-8000-000000000002'
@@ -43,12 +64,15 @@ describe('Rule Engine (Unit Tests)', () => {
   }
 
   beforeEach(() => {
+    mockCache = createMockRuleDiscoveryCache()
+
     // Create mock EntityManager
     mockEm = {
       find: jest.fn(),
       findOne: jest.fn(),
       create: jest.fn(),
-      persistAndFlush: jest.fn(),
+      persist: jest.fn(function persist(this: any) { return this }),
+      flush: jest.fn(),
       nativeDelete: jest.fn(),
     } as any
 
@@ -131,6 +155,100 @@ describe('Rule Engine (Unit Tests)', () => {
       })
 
       expect(rules).toHaveLength(0)
+    })
+
+    test('should cache empty discovery results for repeated wildcard subscriber events', async () => {
+      mockEm.find.mockResolvedValue([])
+
+      const options = {
+        entityType: 'WorkOrder',
+        eventType: 'created',
+        tenantId: testTenantId,
+        organizationId: testOrgId,
+      }
+
+      await ruleEngine.findApplicableRules(mockEm, options, { cache: mockCache })
+      await ruleEngine.findApplicableRules(mockEm, options, { cache: mockCache })
+
+      expect(mockEm.find).toHaveBeenCalledTimes(1)
+    })
+
+    test('should cache rule identifiers and refetch rules with the current entity manager', async () => {
+      const originalRule: Partial<BusinessRule> = {
+        id: 'rule-1',
+        ruleId: 'TEST-001',
+        ruleName: 'Cached Rule',
+        ruleType: 'GUARD',
+        priority: 100,
+        entityType: 'WorkOrder',
+        enabled: true,
+        tenantId: testTenantId,
+        organizationId: testOrgId,
+      }
+      const refetchedRule: Partial<BusinessRule> = {
+        ...originalRule,
+        ruleName: 'Refetched Rule',
+      }
+      const options = {
+        entityType: 'WorkOrder',
+        eventType: 'created',
+        tenantId: testTenantId,
+        organizationId: testOrgId,
+      }
+
+      mockEm.find
+        .mockResolvedValueOnce([originalRule as BusinessRule])
+        .mockResolvedValueOnce([refetchedRule as BusinessRule])
+
+      await ruleEngine.findApplicableRules(mockEm, options, { cache: mockCache })
+      const rules = await ruleEngine.findApplicableRules(mockEm, options, { cache: mockCache })
+
+      expect(rules).toHaveLength(1)
+      expect(rules[0].ruleName).toBe('Refetched Rule')
+      expect(mockEm.find).toHaveBeenCalledTimes(2)
+      expect(mockCache.set).toHaveBeenCalledWith(
+        expect.any(String),
+        { ruleIds: ['rule-1'] },
+        expect.objectContaining({
+          tags: expect.arrayContaining(['business_rules:discovery']),
+        }),
+      )
+    })
+
+    test('should keep discovery cache scoped by entity and event type', async () => {
+      mockEm.find.mockResolvedValue([])
+
+      await ruleEngine.findApplicableRules(mockEm, {
+        entityType: 'WorkOrder',
+        eventType: 'created',
+        tenantId: testTenantId,
+        organizationId: testOrgId,
+      }, { cache: mockCache })
+      await ruleEngine.findApplicableRules(mockEm, {
+        entityType: 'WorkOrder',
+        eventType: 'updated',
+        tenantId: testTenantId,
+        organizationId: testOrgId,
+      }, { cache: mockCache })
+
+      expect(mockEm.find).toHaveBeenCalledTimes(2)
+    })
+
+    test('should invalidate cached discovery results for a tenant organization', async () => {
+      mockEm.find.mockResolvedValue([])
+
+      const options = {
+        entityType: 'WorkOrder',
+        eventType: 'created',
+        tenantId: testTenantId,
+        organizationId: testOrgId,
+      }
+
+      await ruleEngine.findApplicableRules(mockEm, options, { cache: mockCache })
+      await ruleEngine.invalidateBusinessRuleDiscoveryCache(mockCache, testTenantId, testOrgId)
+      await ruleEngine.findApplicableRules(mockEm, options, { cache: mockCache })
+
+      expect(mockEm.find).toHaveBeenCalledTimes(2)
     })
 
     test('should sort rules by priority descending', async () => {
@@ -670,7 +788,7 @@ describe('Rule Engine (Unit Tests)', () => {
 
       mockEm.find.mockResolvedValue([mockRule as BusinessRule])
       mockEm.create.mockReturnValue({ id: 'log-1' } as any)
-      mockEm.persistAndFlush.mockResolvedValue(undefined)
+      mockEm.flush.mockResolvedValue(undefined)
 
       jest.mocked(ruleEvaluator.evaluateSingleRule).mockResolvedValue({
         rule: mockRule as BusinessRule,
@@ -734,7 +852,7 @@ describe('Rule Engine (Unit Tests)', () => {
       }
 
       mockEm.create.mockReturnValue(mockLog as any)
-      mockEm.persistAndFlush.mockResolvedValue(undefined)
+      mockEm.flush.mockResolvedValue(undefined)
 
       const logId = await ruleEngine.logRuleExecution(mockEm, {
         rule: mockRule as BusinessRule,
@@ -752,7 +870,7 @@ describe('Rule Engine (Unit Tests)', () => {
           executionTimeMs: 42,
         })
       )
-      expect(mockEm.persistAndFlush).toHaveBeenCalled()
+      expect(mockEm.flush).toHaveBeenCalled()
     })
 
     test('should create execution log with error result', async () => {
@@ -781,7 +899,7 @@ describe('Rule Engine (Unit Tests)', () => {
       }
 
       mockEm.create.mockReturnValue(mockLog as any)
-      mockEm.persistAndFlush.mockResolvedValue(undefined)
+      mockEm.flush.mockResolvedValue(undefined)
 
       const logId = await ruleEngine.logRuleExecution(mockEm, {
         rule: mockRule as BusinessRule,

@@ -9,6 +9,15 @@ import { CustomerUser, CustomerUserRole, CustomerRole } from '@open-mercato/core
 import type { EntityManager } from '@mikro-orm/postgresql'
 import { adminCreateUserSchema } from '@open-mercato/core/modules/customer_accounts/data/validators'
 import { emitCustomerAccountsEvent } from '@open-mercato/core/modules/customer_accounts/events'
+import { findAndCountWithDecryption, findWithDecryption, findOneWithDecryption } from '@open-mercato/shared/lib/encryption/find'
+import { isOwnedCompanyEntity } from '@open-mercato/core/modules/customer_accounts/lib/customerEntityOwnership'
+import { lookupHashCandidates } from '@open-mercato/shared/lib/encryption/aes'
+import { E } from '#generated/entities.ids.generated'
+import { resolveSearchConfig } from '@open-mercato/shared/lib/search/config'
+import { tokenizeText } from '@open-mercato/shared/lib/search/tokenize'
+import { sql } from 'kysely'
+
+const EMAIL_LIKE_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 
 export const metadata = {}
 
@@ -60,25 +69,71 @@ export async function GET(req: Request) {
   }
 
   if (search) {
-    const escapedSearch = search.replace(/[%_\\]/g, '\\$&')
-    const searchFilter = [
-      { email: { $ilike: `%${escapedSearch}%` } },
-      { displayName: { $ilike: `%${escapedSearch}%` } },
-    ]
-    if (where.$or) {
-      where.$and = [{ $or: where.$or }, { $or: searchFilter }]
-      delete where.$or
+    const trimmedSearch = search.trim()
+    // email/displayName are stored encrypted, so SQL ILIKE on the ciphertext
+    // never matches a plaintext search term. Use search_tokens table for partial
+    // matches and emailHash for exact email lookups.
+    const searchFilter: Record<string, unknown>[] = []
+
+    // Search encrypted fields via search_tokens
+    const matchedIds = await findCustomerUserIdsBySearchTokens(em, E.customer_accounts.customer_user, trimmedSearch, auth.tenantId)
+    if (matchedIds && matchedIds.length > 0) {
+      searchFilter.push({ id: { $in: matchedIds } })
+    }
+
+    // Also support exact email lookup via emailHash
+    if (EMAIL_LIKE_PATTERN.test(search)) {
+      searchFilter.push({ emailHash: { $in: lookupHashCandidates(search) } })
+    }
+
+    if (searchFilter.length > 0) {
+      if (where.$or) {
+        where.$and = [{ $or: where.$or }, { $or: searchFilter }]
+        delete where.$or
+      } else {
+        where.$or = searchFilter
+      }
     } else {
-      where.$or = searchFilter
+      // No search results found, return empty
+      return NextResponse.json({
+        ok: true,
+        items: [],
+        total: 0,
+        totalPages: 1,
+        page,
+      })
     }
   }
 
   let userIds: string[] | null = null
   if (roleId) {
-    const roleLinks = await em.find(CustomerUserRole, {
-      role: roleId as any,
-      deletedAt: null,
-    })
+    // Validate the roleId against the scoped CustomerRole set before touching the
+    // junction table. CustomerUserRole carries no tenant/org column of its own,
+    // so an unscoped lookup here is a role-UUID existence oracle and is brittle
+    // against future code that reads the link rows directly (#2693, defence-in-depth).
+    const scopedRole = await findOneWithDecryption(
+      em,
+      CustomerRole,
+      { id: roleId, tenantId: auth.tenantId, organizationId: auth.orgId, deletedAt: null } as any,
+      undefined,
+      { tenantId: auth.tenantId, organizationId: auth.orgId },
+    )
+    if (!scopedRole) {
+      return NextResponse.json({
+        ok: true,
+        items: [],
+        total: 0,
+        totalPages: 1,
+        page,
+      })
+    }
+    const roleLinks = await findWithDecryption(
+      em,
+      CustomerUserRole,
+      { role: roleId as any, deletedAt: null } as any,
+      undefined,
+      { tenantId: auth.tenantId, organizationId: auth.orgId },
+    )
     userIds = roleLinks.map((link) => (link.user as any)?.id || (link.user as unknown as string))
     if (userIds.length === 0) {
       return NextResponse.json({
@@ -93,36 +148,52 @@ export async function GET(req: Request) {
   }
 
   const offset = (page - 1) * pageSize
-  const [users, total] = await em.findAndCount(CustomerUser, where as any, {
-    orderBy: { createdAt: 'DESC' },
-    limit: pageSize,
-    offset,
-  })
+  const [users, total] = await findAndCountWithDecryption(
+    em,
+    CustomerUser,
+    where as any,
+    {
+      orderBy: { createdAt: 'DESC' },
+      limit: pageSize,
+      offset,
+    },
+    { tenantId: auth.tenantId, organizationId: auth.orgId },
+  )
 
-  const items = await Promise.all(users.map(async (user) => {
-    const userRoles = await em.find(CustomerUserRole, {
-      user: user.id as any,
-      deletedAt: null,
-    }, { populate: ['role'] })
-    const roles = userRoles.map((ur) => ({
-      id: (ur.role as any).id,
-      name: (ur.role as any).name,
-      slug: (ur.role as any).slug,
-    }))
+  const pageUserIds = users.map((user) => user.id)
+  const userRoleLinks = pageUserIds.length > 0
+    ? await findWithDecryption(
+        em,
+        CustomerUserRole,
+        { user: { $in: pageUserIds } as any, deletedAt: null } as any,
+        { populate: ['role'] },
+        { tenantId: auth.tenantId, organizationId: auth.orgId },
+      )
+    : []
 
-    return {
-      id: user.id,
-      email: user.email,
-      displayName: user.displayName,
-      emailVerified: !!user.emailVerifiedAt,
-      isActive: user.isActive,
-      lockedUntil: user.lockedUntil || null,
-      lastLoginAt: user.lastLoginAt || null,
-      customerEntityId: user.customerEntityId || null,
-      personEntityId: user.personEntityId || null,
-      createdAt: user.createdAt,
-      roles,
-    }
+  const rolesByUserId = new Map<string, Array<{ id: string; name: string; slug: string }>>()
+  for (const link of userRoleLinks) {
+    const linkUserId = (link.user as any)?.id ?? (link.user as unknown as string)
+    const role = link.role as any
+    const bucket = rolesByUserId.get(linkUserId)
+    const entry = { id: role.id, name: role.name, slug: role.slug }
+    if (bucket) bucket.push(entry)
+    else rolesByUserId.set(linkUserId, [entry])
+  }
+
+  const items = users.map((user) => ({
+    id: user.id,
+    email: user.email,
+    displayName: user.displayName,
+    emailVerified: !!user.emailVerifiedAt,
+    isActive: user.isActive,
+    lockedUntil: user.lockedUntil || null,
+    lastLoginAt: user.lastLoginAt || null,
+    customerEntityId: user.customerEntityId || null,
+    personEntityId: user.personEntityId || null,
+    createdAt: user.createdAt,
+    updatedAt: user.updatedAt || null,
+    roles: rolesByUserId.get(user.id) ?? [],
   }))
 
   const totalPages = Math.max(1, Math.ceil(total / pageSize))
@@ -169,35 +240,75 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: false, error: 'A user with this email already exists' }, { status: 409 })
   }
 
+  // Resolve roles up front, scoped to the caller's tenant AND organization, and
+  // reject the request if any requested role is missing from the scoped set.
+  // CustomerRole is org-scoped, so omitting organizationId here would let an
+  // admin in org A link roles from org B in the same tenant — a cross-org
+  // privilege grant (#2693). Invalid IDs must be rejected, not silently dropped.
+  let resolvedRoles: Array<{ id: string }> = []
+  if (parsed.data.roleIds && parsed.data.roleIds.length > 0) {
+    const requestedRoleIds = parsed.data.roleIds
+    const validRoles = await findWithDecryption(
+      em,
+      CustomerRole,
+      {
+        id: { $in: requestedRoleIds } as any,
+        tenantId: auth.tenantId,
+        organizationId: auth.orgId,
+        deletedAt: null,
+      } as any,
+      undefined,
+      { tenantId: auth.tenantId, organizationId: auth.orgId },
+    )
+    if (validRoles.length !== requestedRoleIds.length) {
+      const foundIds = new Set(validRoles.map((role) => role.id))
+      const missingId = requestedRoleIds.find((roleId) => !foundIds.has(roleId))
+      return NextResponse.json({ ok: false, error: `Role ${missingId} not found` }, { status: 400 })
+    }
+    resolvedRoles = validRoles
+  }
+
+  // Reject a customerEntityId the caller does not own. Without this check a
+  // mislinked company FK persists indefinitely and cross-links the user into
+  // another org/company's portal context (#2693).
+  if (parsed.data.customerEntityId) {
+    const owned = await isOwnedCompanyEntity(em, parsed.data.customerEntityId, {
+      tenantId: auth.tenantId,
+      organizationId: auth.orgId,
+    })
+    if (!owned) {
+      return NextResponse.json({ ok: false, error: 'Company not found' }, { status: 400 })
+    }
+  }
+
   const user = await customerUserService.createUser(
     parsed.data.email,
     parsed.data.password,
     parsed.data.displayName,
     { tenantId: auth.tenantId!, organizationId: auth.orgId! },
   )
-  em.persist(user)
-  await em.flush()
+  user.emailVerifiedAt = new Date()
 
-  if (parsed.data.customerEntityId) {
-    await em.nativeUpdate(CustomerUser, { id: user.id }, { customerEntityId: parsed.data.customerEntityId })
-  }
+  // Persist the user, its company association, and its role links in one
+  // transaction so a flush failure on the role loop cannot leave a roleless
+  // user committed (privilege gap).
+  await em.transactional(async (tx) => {
+    tx.persist(user)
+    await tx.flush()
 
-  if (parsed.data.roleIds && parsed.data.roleIds.length > 0) {
-    const validRoles: InstanceType<typeof CustomerRole>[] = []
-    for (const roleId of parsed.data.roleIds) {
-      const role = await em.findOne(CustomerRole, { id: roleId, tenantId: auth.tenantId, deletedAt: null })
-      if (role) validRoles.push(role)
+    if (parsed.data.customerEntityId) {
+      await tx.nativeUpdate(CustomerUser, { id: user.id }, { customerEntityId: parsed.data.customerEntityId })
     }
-    for (const role of validRoles) {
-      const userRole = em.create(CustomerUserRole, {
+
+    for (const role of resolvedRoles) {
+      const userRole = tx.create(CustomerUserRole, {
         user,
         role,
         createdAt: new Date(),
       } as any)
-      em.persist(userRole)
+      tx.persist(userRole)
     }
-    await em.flush()
-  }
+  })
 
   void emitCustomerAccountsEvent('customer_accounts.user.created', {
     id: user.id,
@@ -225,6 +336,7 @@ const userSchema = z.object({
   customerEntityId: z.string().uuid().nullable(),
   personEntityId: z.string().uuid().nullable(),
   createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime().nullable(),
   roles: z.array(roleSchema),
 })
 
@@ -233,6 +345,40 @@ const successSchema = z.object({
   user: z.object({ id: z.string().uuid(), email: z.string(), displayName: z.string() }),
 })
 const errorSchema = z.object({ ok: z.literal(false), error: z.string() })
+
+async function findCustomerUserIdsBySearchTokens(
+  em: EntityManager,
+  entityType: string,
+  search: string,
+  tenantScope: string | null | undefined,
+  field?: string,
+): Promise<string[] | null> {
+  const trimmed = search.trim()
+  if (!trimmed) return null
+  const searchConfig = resolveSearchConfig()
+  if (!searchConfig.enabled) return []
+  const { hashes } = tokenizeText(trimmed, searchConfig)
+  if (!hashes.length) return []
+
+  const db = (em as any).getKysely() as any
+  let query = db
+    .selectFrom('search_tokens')
+    .select('entity_id')
+    .where('entity_type', '=', entityType)
+    .where('token_hash', 'in', hashes)
+    .groupBy('entity_id')
+    .having(sql<boolean>`count(distinct token_hash) >= ${hashes.length}`)
+  if (field) {
+    query = query.where('field', '=', field)
+  }
+  if (tenantScope !== undefined) {
+    query = query.where(sql<boolean>`tenant_id is not distinct from ${tenantScope}`)
+  }
+  const rows = (await query.execute()) as Array<{ entity_id?: unknown }>
+  return rows
+    .map((row) => (typeof row.entity_id === 'string' ? row.entity_id : null))
+    .filter((id): id is string => typeof id === 'string' && id.length > 0)
+}
 
 const getMethodDoc: OpenApiMethodDoc = {
   summary: 'List customer users (admin)',

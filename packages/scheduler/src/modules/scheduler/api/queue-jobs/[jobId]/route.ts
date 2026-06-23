@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { z } from 'zod'
 import { getAuthFromRequest } from '@open-mercato/shared/lib/auth/server'
 import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
-import { getRedisUrl, parseRedisUrl } from '@open-mercato/shared/lib/redis/connection'
+import { getRedisUrlOrThrow } from '@open-mercato/shared/lib/redis/connection'
 import { getModules } from '@open-mercato/shared/lib/modules/registry'
 import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
 
@@ -69,7 +69,7 @@ export async function GET(
 
     // Fetch job from BullMQ
     const { Queue } = await import('bullmq')
-    const queue = new Queue(queueName, { connection: parseRedisUrl(getRedisUrl('QUEUE')) })
+    const queue = new Queue(queueName, { connection: { url: getRedisUrlOrThrow('QUEUE') } })
 
     const job = await queue.getJob(jobId)
 
@@ -89,10 +89,9 @@ export async function GET(
     const jobTenantId = jobData?.tenantId ?? jobPayload?.tenantId ?? null
     const jobOrgId = jobData?.organizationId ?? jobPayload?.organizationId ?? null
 
-    // System-scoped jobs (no tenantId/orgId) require superadmin
-    const isSuperAdmin = Array.isArray(auth.roles) && auth.roles.some(
-      (role) => typeof role === 'string' && role.trim().toLowerCase() === 'superadmin'
-    )
+    // System-scoped jobs (no tenantId/orgId) require super-admin. Use the
+    // immutable `isSuperAdmin` flag — never compare mutable/spoofable role names.
+    const isSuperAdmin = auth.isSuperAdmin === true
     if (!jobTenantId && !jobOrgId && !isSuperAdmin) {
       await queue.close()
       return NextResponse.json({ error: translate('scheduler.error.forbidden', 'Forbidden') }, { status: 403 })

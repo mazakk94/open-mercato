@@ -29,6 +29,7 @@ export async function GET(_req: Request, ctx: { params?: { id?: string } }) {
 
   const toggle = await em.findOne(FeatureToggle, {
     id: parse.data.id,
+    deletedAt: null,
   })
 
   if (!toggle) {
@@ -65,7 +66,7 @@ export async function GET(_req: Request, ctx: { params?: { id?: string } }) {
 }
 
 const routeMetadata = {
-  GET: { requireAuth: true, requireRoles: ['superadmin'] },
+  GET: { requireAuth: true, requireFeatures: ['feature_toggles.view'] },
 }
 
 export const metadata = routeMetadata

@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import type { PackageResolver } from '../resolver'
-import { enableOfficialModule } from '../module-install'
+import { addOfficialModule, enableOfficialModule } from '../module-install'
 
 function buildPackageFixture(
   packageRoot: string,
@@ -10,15 +10,17 @@ function buildPackageFixture(
   options?: {
     ejectable?: boolean
     extraSourceFiles?: Array<{ relativePath: string; content: string }>
+    packageName?: string
   },
 ): void {
   const ejectable = options?.ejectable ?? false
+  const packageName = options?.packageName ?? '@open-mercato/test-package'
   for (const base of ['src', 'dist']) {
     fs.mkdirSync(path.join(packageRoot, base, 'modules', moduleId), { recursive: true })
   }
   fs.writeFileSync(
     path.join(packageRoot, 'package.json'),
-    JSON.stringify({ name: '@open-mercato/test-package', version: '0.1.0' }),
+    JSON.stringify({ name: packageName, version: '0.1.0' }),
   )
   fs.writeFileSync(
     path.join(packageRoot, 'src', 'modules', moduleId, 'index.ts'),
@@ -218,5 +220,84 @@ describe('enableOfficialModule', () => {
     await expect(
       enableOfficialModule(resolver, '@open-mercato/test-package', undefined, true),
     ).rejects.toThrow('--eject requires open-mercato.ejectable === true')
+  })
+
+  it('rejects unsupported package specs before invoking the package manager', async () => {
+    const packageRoot = path.join(tmpDir, 'node_modules', '@open-mercato', 'test-package')
+    const appDir = path.join(tmpDir, 'app')
+    buildPackageFixture(packageRoot, 'test_package')
+
+    const resolver = buildResolver(
+      appDir,
+      packageRoot,
+      "export const enabledModules = []\n",
+    )
+
+    await expect(
+      addOfficialModule(resolver, '@open-mercato/test-package@npm:evil', false),
+    ).rejects.toThrow('Unsupported package spec suffix')
+  })
+})
+
+describe('third-party module packages', () => {
+  let tmpDir: string
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'module-install-3p-test-'))
+  })
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+  })
+
+  it('rejects adding a non-@open-mercato package without --allow-third-party', async () => {
+    const packageRoot = path.join(tmpDir, 'node_modules', '@fast-white-cat', 'integration-ksef-direct')
+    const appDir = path.join(tmpDir, 'app')
+    buildPackageFixture(packageRoot, 'ksef_direct', {
+      packageName: '@fast-white-cat/integration-ksef-direct',
+    })
+
+    const resolver = buildResolver(appDir, packageRoot, 'export const enabledModules = []\n')
+
+    await expect(
+      addOfficialModule(resolver, '@fast-white-cat/integration-ksef-direct@0.1.0', false),
+    ).rejects.toThrow('Re-run with --allow-third-party')
+  })
+
+  it('rejects enabling a non-@open-mercato package without --allow-third-party', async () => {
+    const packageRoot = path.join(tmpDir, 'node_modules', '@fast-white-cat', 'integration-ksef-direct')
+    const appDir = path.join(tmpDir, 'app')
+    buildPackageFixture(packageRoot, 'ksef_direct', {
+      packageName: '@fast-white-cat/integration-ksef-direct',
+    })
+
+    const resolver = buildResolver(appDir, packageRoot, 'export const enabledModules = []\n')
+
+    await expect(
+      enableOfficialModule(resolver, '@fast-white-cat/integration-ksef-direct'),
+    ).rejects.toThrow('Re-run with --allow-third-party')
+  })
+
+  it('enables a non-@open-mercato package when --allow-third-party is set', async () => {
+    const packageRoot = path.join(tmpDir, 'node_modules', '@fast-white-cat', 'integration-ksef-direct')
+    const appDir = path.join(tmpDir, 'app')
+    buildPackageFixture(packageRoot, 'ksef_direct', {
+      packageName: '@fast-white-cat/integration-ksef-direct',
+    })
+
+    const resolver = buildResolver(appDir, packageRoot, 'export const enabledModules = []\n')
+
+    await expect(
+      enableOfficialModule(resolver, '@fast-white-cat/integration-ksef-direct', undefined, false, true),
+    ).resolves.toEqual({
+      moduleId: 'ksef_direct',
+      packageName: '@fast-white-cat/integration-ksef-direct',
+      from: '@fast-white-cat/integration-ksef-direct',
+      registrationChanged: true,
+    })
+
+    expect(fs.readFileSync(path.join(appDir, 'src', 'modules.ts'), 'utf8')).toContain(
+      "{ id: 'ksef_direct', from: '@fast-white-cat/integration-ksef-direct' }",
+    )
   })
 })

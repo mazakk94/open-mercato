@@ -2,10 +2,11 @@
 
 import * as React from 'react'
 import type { DashboardWidgetComponentProps } from '@open-mercato/shared/modules/dashboard/widgets'
-import { apiCall } from '@open-mercato/ui/backend/utils/apiCall'
+import { useWidgetData, type WidgetDataFetcher } from '@open-mercato/ui/backend/dashboard/widgetData'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
 import { TopNTable, type TopNTableColumn } from '@open-mercato/ui/backend/charts'
 import { DateRangeSelect, type DateRangePreset } from '@open-mercato/ui/backend/date-range'
+import { Input } from '@open-mercato/ui/primitives/input'
 import { DEFAULT_SETTINGS, hydrateSettings, type TopCustomersSettings } from './config'
 import type { WidgetDataResponse } from '../../../services/widgetDataService'
 import { formatCurrencySafe } from '../../../lib/formatters'
@@ -16,7 +17,7 @@ type CustomerRow = {
   revenue: number
 }
 
-async function fetchTopCustomersData(settings: TopCustomersSettings): Promise<WidgetDataResponse> {
+async function fetchTopCustomersData(settings: TopCustomersSettings, fetchWidgetData: WidgetDataFetcher): Promise<WidgetDataResponse> {
   const body = {
     entityType: 'sales:orders',
     metric: {
@@ -34,18 +35,7 @@ async function fetchTopCustomersData(settings: TopCustomersSettings): Promise<Wi
     },
   }
 
-  const call = await apiCall<WidgetDataResponse>('/api/dashboards/widgets/data', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  })
-
-  if (!call.ok) {
-    const errorMsg = (call.result as Record<string, unknown>)?.error
-    throw new Error(typeof errorMsg === 'string' ? errorMsg : 'Failed to fetch top customers data')
-  }
-
-  return call.result as WidgetDataResponse
+  return fetchWidgetData<WidgetDataResponse>(body)
 }
 
 function formatCustomerName(name: string | null, unknownLabel: string): string {
@@ -89,12 +79,13 @@ const TopCustomersWidget: React.FC<DashboardWidgetComponentProps<TopCustomersSet
     [t, unknownLabel],
   )
 
+  const fetchWidgetData = useWidgetData()
   const refresh = React.useCallback(async () => {
     onRefreshStateChange?.(true)
     setLoading(true)
     setError(null)
     try {
-      const result = await fetchTopCustomersData(hydrated)
+      const result = await fetchTopCustomersData(hydrated, fetchWidgetData)
       const tableData: CustomerRow[] = result.data.map((item, index) => ({
         rank: index + 1,
         customerId: item.groupLabel || String(item.groupKey || t('dashboards.analytics.labels.unknown', 'Unknown')),
@@ -108,7 +99,7 @@ const TopCustomersWidget: React.FC<DashboardWidgetComponentProps<TopCustomersSet
       setLoading(false)
       onRefreshStateChange?.(false)
     }
-  }, [hydrated, onRefreshStateChange, t])
+  }, [hydrated, fetchWidgetData, onRefreshStateChange, t])
 
   React.useEffect(() => {
     refresh().catch(() => {})
@@ -130,12 +121,12 @@ const TopCustomersWidget: React.FC<DashboardWidgetComponentProps<TopCustomersSet
           >
             {t('dashboards.analytics.settings.limit', 'Number of items')}
           </label>
-          <input
+          <Input
             id="top-customers-limit"
             type="number"
             min={1}
             max={20}
-            className="w-24 rounded-md border px-2 py-1 text-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+            className="w-24"
             value={hydrated.limit}
             onChange={(e) => {
               const next = Number(e.target.value)

@@ -1,0 +1,63 @@
+{
+  "$schema": "./tiers.schema.json",
+  "default": ["core"],
+  "tiers": {
+    "core": {
+      "description": "Daily-driver skills installed by default.",
+      "skills": [
+        "om-code-review",
+        "om-ds-guardian",
+        "om-backend-ui-design",
+        "om-check-and-commit",
+        "om-spec-writing",
+        "om-implement-spec",
+        "om-pre-implement-spec",
+        "om-integration-tests",
+        "om-smart-test",
+        "om-create-agents-md",
+        "om-skill-creator",
+        "om-fix-specs",
+        "om-migrate-mikro-orm",
+        "om-create-ai-agent",
+        "om-help"
+      ]
+    },
+    "automation": {
+      "description": "PR/issue automation skills. Opt-in; agent-driven workflows.",
+      "skills": [
+        "om-auto-create-pr",
+        "om-auto-continue-pr",
+        "om-auto-create-pr-loop",
+        "om-auto-continue-pr-loop",
+        "om-auto-review-pr",
+        "om-auto-fix-github",
+        "om-auto-verify-and-fix-github",
+        "om-prepare-issue",
+        "om-verify-in-repo",
+        "om-root-cause",
+        "om-fix",
+        "om-open-pr",
+        "om-review-prs",
+        "om-merge-buddy",
+        "om-approve-merge-pr",
+        "om-followup-issue-from-pr",
+        "om-sync-merged-pr-issues",
+        "om-auto-update-changelog",
+        "om-auto-qa-scenarios",
+        "om-auto-verify-pr-ui"
+      ]
+    },
+    "security": {
+      "description": "Security audit skills. Opt-in.",
+      "skills": ["om-auto-sec-report", "om-auto-sec-report-pr"]
+    },
+    "migration": {
+      "description": "One-shot, version-pinned migrations. Install only when needed.",
+      "skills": ["om-auto-upgrade-0.4.10-to-0.5.0"]
+    },
+    "infra": {
+      "description": "Rare, special-case skills.",
+      "skills": ["om-dev-container-maintenance", "om-integration-builder"]
+    }
+  }
+}

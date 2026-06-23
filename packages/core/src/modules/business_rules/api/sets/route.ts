@@ -3,6 +3,8 @@ import { z } from 'zod'
 import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
 import { getAuthFromRequest } from '@open-mercato/shared/lib/auth/server'
 import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
+import { isCrudHttpError } from '@open-mercato/shared/lib/crud/errors'
+import { enforceCommandOptimisticLock } from '@open-mercato/shared/lib/crud/optimistic-lock-command'
 import { RuleSet } from '../../data/entities'
 import type { EntityManager } from '@mikro-orm/postgresql'
 import { escapeLikePattern } from '@open-mercato/shared/lib/db/escapeLikePattern'
@@ -171,7 +173,7 @@ export async function POST(req: Request) {
   }
 
   const ruleSet = em.create(RuleSet, parsed.data)
-  await em.persistAndFlush(ruleSet)
+  await em.persist(ruleSet).flush()
 
   return NextResponse.json({ id: ruleSet.id }, { status: 201 })
 }
@@ -200,6 +202,9 @@ export async function PUT(req: Request) {
     ...body,
     updatedBy: auth.sub ?? auth.email ?? null,
   }
+  delete (payload as Record<string, unknown>).tenantId
+  delete (payload as Record<string, unknown>).organizationId
+  delete (payload as Record<string, unknown>).createdBy
 
   const parsed = updateRuleSetSchema.safeParse(payload)
   if (!parsed.success) {
@@ -218,8 +223,22 @@ export async function PUT(req: Request) {
     return NextResponse.json({ error: 'Rule set not found' }, { status: 404 })
   }
 
+  try {
+    enforceCommandOptimisticLock({
+      resourceKind: 'business_rules.ruleSet',
+      resourceId: ruleSet.id,
+      current: ruleSet.updatedAt ?? null,
+      request: req,
+    })
+  } catch (err) {
+    if (isCrudHttpError(err)) {
+      return NextResponse.json(err.body, { status: err.status })
+    }
+    throw err
+  }
+
   em.assign(ruleSet, parsed.data)
-  await em.persistAndFlush(ruleSet)
+  await em.persist(ruleSet).flush()
 
   return NextResponse.json({ ok: true })
 }
@@ -251,8 +270,22 @@ export async function DELETE(req: Request) {
     return NextResponse.json({ error: 'Rule set not found' }, { status: 404 })
   }
 
+  try {
+    enforceCommandOptimisticLock({
+      resourceKind: 'business_rules.ruleSet',
+      resourceId: ruleSet.id,
+      current: ruleSet.updatedAt ?? null,
+      request: req,
+    })
+  } catch (err) {
+    if (isCrudHttpError(err)) {
+      return NextResponse.json(err.body, { status: err.status })
+    }
+    throw err
+  }
+
   ruleSet.deletedAt = new Date()
-  await em.persistAndFlush(ruleSet)
+  await em.persist(ruleSet).flush()
 
   return NextResponse.json({ ok: true })
 }

@@ -21,8 +21,12 @@
  */
 
 export * from './types'
-export { createQueue } from './factory'
+export { createQueue, createModuleQueue, resolveQueueStrategy } from './factory'
 
 // Worker utilities
 export * from './worker/registry'
 export { runWorker, createRoutedHandler } from './worker/runner'
+
+// Lightweight pending-job probes used by the lazy auto-spawn supervisor.
+export { getQueuePendingProbe } from './pending-probe'
+export type { QueuePendingProbeOptions, QueuePendingProbeResult } from './pending-probe'

@@ -13,6 +13,7 @@ import { flash } from '@open-mercato/ui/backend/FlashMessages'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
 import { cn } from '@open-mercato/shared/lib/utils'
 import { Copy, Download, Trash2 } from 'lucide-react'
+import { useDialogKeyHandler } from '@open-mercato/ui/hooks/useDialogKeyHandler'
 import { AttachmentContentPreview } from '@open-mercato/core/modules/attachments/components/AttachmentContentPreview'
 import { buildAttachmentFileUrl, buildAttachmentImageUrl, slugifyAttachmentFileName } from '@open-mercato/core/modules/attachments/lib/imageUrls'
 import { E } from '@open-mercato/core/generated-shims/entities.ids.generated'
@@ -94,7 +95,7 @@ type AttachmentMetadataDialogProps = {
 }
 
 function formatFileSize(value: number): string {
-  if (!Number.isFinite(value)) return '—'
+  if (!Number.isFinite(value)) return '\u2014'
   if (value <= 0) return '0 B'
   const units = ['B', 'KB', 'MB', 'GB', 'TB']
   let idx = 0
@@ -304,7 +305,7 @@ export function AttachmentMetadataDialog({ open, onOpenChange, item, availableTa
       tags: item.tags ?? [],
       assignments: prepareAssignmentsForForm(item.assignments),
     })
-    setExtractedContent(item.content ?? null)
+    setExtractedContent(item.content && item.content.trim() ? item.content : null)
     const loadDetails = async () => {
       try {
         const call = await apiCall<AttachmentMetadataResponse>(`/api/attachments/library/${encodeURIComponent(item.id)}`)
@@ -321,7 +322,7 @@ export function AttachmentMetadataDialog({ open, onOpenChange, item, availableTa
             assignments: prepareAssignmentsForForm(payload.assignments ?? item.assignments),
             ...prefixedCustom,
           })
-          const nextContent = typeof payload.content === 'string' ? payload.content : null
+          const nextContent = typeof payload.content === 'string' && payload.content.trim() ? payload.content : null
           setExtractedContent(nextContent)
         }
       } catch (err: any) {
@@ -476,15 +477,9 @@ export function AttachmentMetadataDialog({ open, onOpenChange, item, availableTa
     [item, onSave],
   )
 
-  const handleKeyDown = React.useCallback(
-    (event: React.KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        event.preventDefault()
-        onOpenChange(false)
-      }
-    },
-    [onOpenChange],
-  )
+  const handleKeyDown = useDialogKeyHandler({
+    onCancel: () => onOpenChange(false),
+  })
 
   const handleCopyResizedUrl = React.useCallback(async () => {
     if (!item) return
@@ -517,7 +512,7 @@ export function AttachmentMetadataDialog({ open, onOpenChange, item, availableTa
     }
   }, [item, sizeHeight, sizeWidth, t])
 
-  const loadMessage = t('attachments.library.metadata.loading', 'Loading attachment details…')
+  const loadMessage = t('attachments.library.metadata.loading', 'Loading attachment details\u2026')
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -533,7 +528,7 @@ export function AttachmentMetadataDialog({ open, onOpenChange, item, availableTa
                   {item.fileName}
                 </div>
                 <div className="text-xs text-muted-foreground">
-                  {formatFileSize(item.fileSize)} • {item.partitionTitle ?? item.partitionCode}
+                  {formatFileSize(item.fileSize)} {'\u2022'} {item.partitionTitle ?? item.partitionCode}
                 </div>
               </div>
               {downloadUrl ? (
@@ -560,7 +555,7 @@ export function AttachmentMetadataDialog({ open, onOpenChange, item, availableTa
                       className={cn(
                         'h-auto -mb-px rounded-none border-b-2 border-transparent px-0 py-1',
                         imageTab === tab
-                          ? 'border-primary text-foreground'
+                          ? 'border-accent-indigo text-foreground'
                           : 'text-muted-foreground hover:text-foreground',
                       )}
                     >
@@ -634,7 +629,7 @@ export function AttachmentMetadataDialog({ open, onOpenChange, item, availableTa
                 {loadError}
               </div>
             ) : null}
-            <div className="rounded border border-border/60 bg-muted/30 px-3 py-2">
+            <div className="rounded border border-border/70 bg-muted/30 px-3 py-2">
               <div className="text-xs font-semibold text-muted-foreground">
                 {t('attachments.library.metadata.extractedTitle', 'Extracted text')}
               </div>

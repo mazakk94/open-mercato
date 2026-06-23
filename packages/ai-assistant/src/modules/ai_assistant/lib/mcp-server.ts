@@ -17,7 +17,14 @@ import type { RbacService } from '@open-mercato/core/modules/auth/services/rbacS
  * Create and configure an MCP server instance.
  */
 export async function createMcpServer(options: McpServerOptions): Promise<Server> {
-  const { config, container, context, apiKeySecret } = options
+  const { config, container, context, allowUnauthenticatedSuperadmin } = options
+
+  // Treat empty / whitespace-only secrets as missing so a blank api key cannot
+  // fall through into an unauthenticated branch.
+  const apiKeySecret =
+    typeof options.apiKeySecret === 'string' && options.apiKeySecret.trim().length > 0
+      ? options.apiKeySecret
+      : undefined
 
   let tenantId: string | null = null
   let organizationId: string | null = null
@@ -37,41 +44,48 @@ export async function createMcpServer(options: McpServerOptions): Promise<Server
     userFeatures = authResult.features
     isSuperAdmin = authResult.isSuperAdmin
     console.error(`[MCP Server] Authenticated via API key: ${authResult.keyName}`)
-  } else if (context) {
-    // Manual context provided
+  } else if (context && context.userId) {
+    // Manual context with a real user — load that user's ACL.
     tenantId = context.tenantId
     organizationId = context.organizationId
     userId = context.userId
 
-    if (userId) {
-      try {
-        const rbacService = container.resolve('rbacService') as {
-          loadAcl: (
-            userId: string,
-            scope: { tenantId: string | null; organizationId: string | null }
-          ) => Promise<{
-            isSuperAdmin: boolean
-            features: string[]
-          }>
-        }
-        const acl = await rbacService.loadAcl(userId, {
-          tenantId,
-          organizationId,
-        })
-        userFeatures = acl.features
-        isSuperAdmin = acl.isSuperAdmin
-      } catch (error) {
-        console.error('[MCP Server] Failed to load user ACL:', error)
+    try {
+      const rbacService = container.resolve('rbacService') as {
+        loadAcl: (
+          userId: string,
+          scope: { tenantId: string | null; organizationId: string | null }
+        ) => Promise<{
+          isSuperAdmin: boolean
+          features: string[]
+        }>
       }
-    } else {
-      // No user specified - grant superadmin access for development/testing
-      isSuperAdmin = true
-      console.error('[MCP Server] No user specified, running with superadmin access')
+      const acl = await rbacService.loadAcl(userId, {
+        tenantId,
+        organizationId,
+      })
+      userFeatures = acl.features
+      isSuperAdmin = acl.isSuperAdmin
+    } catch (error) {
+      console.error('[MCP Server] Failed to load user ACL:', error)
     }
-  } else {
-    // No context and no API key - superadmin for dev/testing
+  } else if (allowUnauthenticatedSuperadmin) {
+    // Explicit, loud dev/testing opt-in. Without a user there is no ACL to load,
+    // so the server runs as superadmin with no tenant scoping beyond whatever the
+    // caller pinned via `context`. NEVER enable this in production.
+    if (context) {
+      tenantId = context.tenantId
+      organizationId = context.organizationId
+    }
     isSuperAdmin = true
-    console.error('[MCP Server] No auth context, running with superadmin access')
+    console.error(
+      '[MCP Server] WARNING: allowUnauthenticatedSuperadmin is enabled — running with UNAUTHENTICATED SUPERADMIN access and no per-user ACL. Do not use this outside local development/testing.'
+    )
+  } else {
+    // Fail closed: refuse to start rather than silently escalating to superadmin.
+    throw new Error(
+      '[internal] MCP server refused to start: no authentication provided. Supply a valid apiKeySecret, a context with a non-empty userId, or explicitly set allowUnauthenticatedSuperadmin: true for local development.'
+    )
   }
 
   const toolContext: McpToolContext = {
@@ -184,19 +198,10 @@ export async function runMcpServer(options: McpServerOptions): Promise<void> {
   // Load tools from all modules before starting
   await loadAllModuleTools()
 
-  // Index tools and API endpoints for hybrid search discovery (if search service available)
+  // Index tools for hybrid search discovery (if search service available)
   try {
     const searchService = options.container.resolve('searchService') as SearchService
-
-    // Index MCP tools
     await indexToolsForSearch(searchService)
-
-    // Index API endpoints for api_discover
-    const { indexApiEndpoints } = await import('./api-endpoint-index')
-    const endpointCount = await indexApiEndpoints(searchService)
-    if (endpointCount > 0) {
-      console.error(`[MCP Server] Indexed ${endpointCount} API endpoints for hybrid search`)
-    }
   } catch (error) {
     // Search service might not be configured - discovery will use fallback
     console.error('[MCP Server] Search indexing skipped (search service not available)')
@@ -209,14 +214,14 @@ export async function runMcpServer(options: McpServerOptions): Promise<void> {
 
   console.error(`[MCP Server] Starting ${options.config.name} v${options.config.version}`)
 
-  if (options.apiKeySecret) {
+  if (options.apiKeySecret && options.apiKeySecret.trim().length > 0) {
     console.error(`[MCP Server] Authentication: API key`)
-  } else if (options.context) {
+  } else if (options.context && options.context.userId) {
     console.error(`[MCP Server] Tenant: ${options.context.tenantId ?? '(none)'}`)
     console.error(`[MCP Server] Organization: ${options.context.organizationId ?? '(none)'}`)
-    console.error(`[MCP Server] User: ${options.context.userId ?? '(superadmin)'}`)
+    console.error(`[MCP Server] User: ${options.context.userId}`)
   } else {
-    console.error(`[MCP Server] Authentication: none (superadmin mode)`)
+    console.error(`[MCP Server] Authentication: none (unauthenticated superadmin opt-in)`)
   }
 
   console.error(`[MCP Server] Tools registered: ${toolCount}`)

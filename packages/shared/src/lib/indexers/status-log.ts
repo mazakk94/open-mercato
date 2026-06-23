@@ -1,5 +1,5 @@
 import type { EntityManager } from '@mikro-orm/postgresql'
-import type { Knex } from 'knex'
+import { type Kysely, sql } from 'kysely'
 import type { IndexerErrorSource } from './error-log'
 
 export type IndexerLogLevel = 'info' | 'warn'
@@ -18,7 +18,7 @@ export type RecordIndexerLogInput = {
 
 type RecordIndexerLogDeps = {
   em?: EntityManager
-  knex?: Knex
+  db?: Kysely<any>
 }
 
 const MAX_MESSAGE_LENGTH = 4_096
@@ -43,14 +43,11 @@ function safeJson(value: unknown): unknown {
   }
 }
 
-function pickKnex(deps: RecordIndexerLogDeps): Knex | null {
-  if (deps.knex) return deps.knex
+function pickDb(deps: RecordIndexerLogDeps): Kysely<any> | null {
+  if (deps.db) return deps.db
   if (deps.em) {
     try {
-      const connection = deps.em.getConnection()
-      if (connection && typeof connection.getKnex === 'function') {
-        return connection.getKnex()
-      }
+      return deps.em.getKysely<any>()
     } catch {
       return null
     }
@@ -58,30 +55,48 @@ function pickKnex(deps: RecordIndexerLogDeps): Knex | null {
   return null
 }
 
-async function pruneExcessLogs(knex: Knex, source: IndexerErrorSource): Promise<void> {
-  const rows = await knex('indexer_status_logs')
-    .select('id')
-    .where('source', source)
-    .orderBy('occurred_at', 'desc')
-    .orderBy('id', 'desc')
+/**
+ * Indexer status logging is best-effort observability and must never ride on —
+ * or be noisy about — the caller's transaction lifecycle. When index maintenance
+ * runs inline on a request `em` (e.g. an inline force reindex that emits the
+ * vector-purge subscriber), the captured Kysely can be a transaction handle that
+ * has already committed/rolled back, so a follow-up read/write throws
+ * "Transaction is already committed". Treat that class of error as a quiet skip
+ * rather than an error the operator must triage. A fresh-EM path (the events
+ * worker) never hits this; this guard only de-noises the inline path.
+ */
+function isInactiveTransactionError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? '')
+  return /transaction is already (committed|rolled back)/i.test(message)
+}
+
+async function pruneExcessLogs(db: Kysely<any>, source: IndexerErrorSource): Promise<void> {
+  const rows = await db
+    .selectFrom('indexer_status_logs' as any)
+    .select('id' as any)
+    .where('source' as any, '=', source)
+    .orderBy('occurred_at' as any, 'desc')
+    .orderBy('id' as any, 'desc')
     .offset(MAX_LOGS_PER_SOURCE)
     .limit(MAX_DELETE_BATCH)
+    .execute()
 
   if (!rows.length) return
   const ids = rows.map((row: any) => row.id).filter(Boolean)
   if (!ids.length) return
-  await knex('indexer_status_logs')
-    .whereIn('id', ids)
-    .del()
+  await db
+    .deleteFrom('indexer_status_logs' as any)
+    .where('id' as any, 'in', ids)
+    .execute()
 }
 
 export async function recordIndexerLog(
   deps: RecordIndexerLogDeps,
   input: RecordIndexerLogInput,
 ): Promise<void> {
-  const knex = pickKnex(deps)
-  if (!knex) {
-    console.warn('[indexers] Unable to record indexer log (missing knex connection)', {
+  const db = pickDb(deps)
+  if (!db) {
+    console.warn('[indexers] Unable to record indexer log (missing db connection)', {
       source: input.source,
       handler: input.handler,
     })
@@ -94,26 +109,35 @@ export async function recordIndexerLog(
   const occurredAt = new Date()
 
   try {
-    await knex('indexer_status_logs').insert({
-      source: input.source,
-      handler: input.handler,
-      level,
-      entity_type: input.entityType ?? null,
-      record_id: input.recordId ?? null,
-      tenant_id: input.tenantId ?? null,
-      organization_id: input.organizationId ?? null,
-      message,
-      details,
-      occurred_at: occurredAt,
-    })
+    await db
+      .insertInto('indexer_status_logs' as any)
+      .values({
+        source: input.source,
+        handler: input.handler,
+        level,
+        entity_type: input.entityType ?? null,
+        record_id: input.recordId ?? null,
+        tenant_id: input.tenantId ?? null,
+        organization_id: input.organizationId ?? null,
+        message,
+        details: details === null ? null : sql`${JSON.stringify(details)}::jsonb`,
+        occurred_at: occurredAt,
+      } as any)
+      .execute()
   } catch (error) {
-    console.error('[indexers] Failed to persist indexer log', error)
+    // A committed/rolled-back caller transaction is an expected, harmless
+    // condition for best-effort logging — skip quietly instead of surfacing it.
+    if (!isInactiveTransactionError(error)) {
+      console.error('[indexers] Failed to persist indexer log', error)
+    }
     return
   }
 
   try {
-    await pruneExcessLogs(knex, input.source)
+    await pruneExcessLogs(db, input.source)
   } catch (pruneError) {
-    console.warn('[indexers] Failed to prune indexer logs', pruneError)
+    if (!isInactiveTransactionError(pruneError)) {
+      console.warn('[indexers] Failed to prune indexer logs', pruneError)
+    }
   }
 }

@@ -1,6 +1,7 @@
 // @ts-nocheck
 
 import { registerCommand, type CommandHandler } from '@open-mercato/shared/lib/commands'
+import { LockMode } from '@mikro-orm/core'
 import type { EntityManager } from '@mikro-orm/postgresql'
 import { CrudHttpError } from '@open-mercato/shared/lib/crud/errors'
 import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
@@ -31,6 +32,7 @@ import {
   toNumericString,
 } from './shared'
 import { resolveDictionaryEntryValue } from '../lib/dictionaries'
+import { resolveRedoSnapshot } from '@open-mercato/shared/lib/commands/redo'
 import { invalidateCrudCache } from '@open-mercato/shared/lib/crud/cache'
 import { emitCrudSideEffects } from '@open-mercato/shared/lib/commands/helpers'
 import type { CrudEventsConfig } from '@open-mercato/shared/lib/crud/types'
@@ -113,12 +115,13 @@ async function invalidateOrderCache(container: any, order: SalesOrder | null | u
   )
 }
 
-export async function loadPaymentSnapshot(em: EntityManager, id: string): Promise<PaymentSnapshot | null> {
+export async function loadPaymentSnapshot(em: EntityManager, id: string, scope?: { tenantId?: string | null; organizationId?: string | null }): Promise<PaymentSnapshot | null> {
   const payment = await findOneWithDecryption(
     em,
     SalesPayment,
     { id },
     { populate: ['order', 'allocations', 'allocations.order', 'allocations.invoice'] },
+    scope,
   )
   if (!payment) return null
   const allocations: PaymentAllocationSnapshot[] = Array.from(payment.allocations ?? []).map((allocation) => ({
@@ -176,7 +179,7 @@ export async function restorePaymentSnapshot(em: EntityManager, snapshot: Paymen
     ? em.getReference(SalesPaymentMethod, snapshot.paymentMethodId)
     : null
   const entity =
-    (await em.findOne(SalesPayment, { id: snapshot.id })) ??
+    (await findOneWithDecryption(em, SalesPayment, { id: snapshot.id }, {}, { tenantId: snapshot.tenantId, organizationId: snapshot.organizationId })) ??
     em.create(SalesPayment, {
       id: snapshot.id,
       createdAt: new Date(),
@@ -215,7 +218,7 @@ export async function restorePaymentSnapshot(em: EntityManager, snapshot: Paymen
     })
   }
 
-  const existingAllocations = await em.find(SalesPaymentAllocation, { payment: entity })
+  const existingAllocations = await findWithDecryption(em, SalesPaymentAllocation, { payment: entity }, {}, { tenantId: snapshot.tenantId, organizationId: snapshot.organizationId })
   existingAllocations.forEach((allocation) => em.remove(allocation))
   snapshot.allocations.forEach((allocation) => {
     const order =
@@ -243,10 +246,20 @@ export async function restorePaymentSnapshot(em: EntityManager, snapshot: Paymen
 
 async function recomputeOrderPaymentTotals(
   em: EntityManager,
-  order: SalesOrder
+  order: SalesOrder,
+  options?: { lock?: boolean }
 ): Promise<{ paidTotalAmount: number; refundedTotalAmount: number; outstandingAmount: number }> {
   const orderId = order.id
   const scope = { organizationId: order.organizationId, tenantId: order.tenantId }
+
+  if (options?.lock) {
+    // Raw findOne is intentional: this acquires a row lock only — no encrypted
+    // SalesOrder field is read, so decryption (findOneWithDecryption) is unnecessary.
+    // Scope filter is defence-in-depth (#2111): the caller is expected to pass a
+    // correctly scoped order, but filtering here ensures we never lock a foreign
+    // tenant's row even if a caller messed up.
+    await em.findOne(SalesOrder, { id: orderId, ...scope }, { lockMode: LockMode.PESSIMISTIC_WRITE })
+  }
 
   const allocations = await findWithDecryption(
     em,
@@ -270,8 +283,8 @@ async function recomputeOrderPaymentTotals(
 
   const payments =
     paymentIds.size > 0
-      ? await em.find(SalesPayment, { id: { $in: Array.from(paymentIds) }, deletedAt: null, ...scope })
-      : await em.find(SalesPayment, { order: orderId, deletedAt: null, ...scope })
+      ? await findWithDecryption(em, SalesPayment, { id: { $in: Array.from(paymentIds) }, deletedAt: null, ...scope }, {}, scope)
+      : await findWithDecryption(em, SalesPayment, { order: orderId, deletedAt: null, ...scope }, {}, scope)
 
   const resolvePaidAmount = (payment: SalesPayment) => {
     const captured = toNumber(payment.capturedAmount)
@@ -325,128 +338,169 @@ const createPaymentCommand: CommandHandler<
     if (!input.orderId) {
       throw new CrudHttpError(400, { error: translate('sales.payments.order_required', 'Order is required for payments.') })
     }
-    const order = assertFound(
-      await em.findOne(SalesOrder, { id: input.orderId }),
-      'sales.payments.order_not_found'
-    )
-    ensureSameScope(order, input.organizationId, input.tenantId)
-    if (order.deletedAt) {
-      throw new CrudHttpError(404, { error: 'sales.payments.order_not_found' })
-    }
-    if (
-      order.currencyCode &&
-      input.currencyCode &&
-      order.currencyCode.toUpperCase() !== input.currencyCode.toUpperCase()
-    ) {
-      throw new CrudHttpError(400, {
-        error: translate('sales.payments.currency_mismatch', 'Payment currency must match the order currency.'),
-      })
-    }
-    let paymentMethod = null
-    if (input.paymentMethodId) {
-      const method = assertFound(
-        await em.findOne(SalesPaymentMethod, { id: input.paymentMethodId }),
-        'sales.payments.method_not_found'
+
+    const { payment, order, totals, orderPaymentMethodIdBefore, orderPaymentMethodCodeBefore } = await em.transactional(async (tx) => {
+      const order = assertFound(
+        await findOneWithDecryption(tx, SalesOrder, { id: input.orderId }, { lockMode: LockMode.PESSIMISTIC_WRITE }, { tenantId: input.tenantId, organizationId: input.organizationId }),
+        'sales.payments.order_not_found'
       )
-      ensureSameScope(method, input.organizationId, input.tenantId)
-      paymentMethod = method
-    }
-    const orderPaymentMethodIdBefore = order.paymentMethodId ?? null
-    const orderPaymentMethodCodeBefore = order.paymentMethodCode ?? null
-    if (paymentMethod && !order.paymentMethodId) {
-      order.paymentMethodId = paymentMethod.id
-      order.paymentMethodCode = paymentMethod.code ?? null
-      order.updatedAt = new Date()
-      em.persist(order)
-    }
-    if (input.documentStatusEntryId !== undefined) {
-      const orderStatus = await resolveDictionaryEntryValue(em, input.documentStatusEntryId ?? null)
-      if (input.documentStatusEntryId && !orderStatus) {
+      ensureSameScope(order, input.organizationId, input.tenantId)
+      if (order.deletedAt) {
+        throw new CrudHttpError(404, { error: 'sales.payments.order_not_found' })
+      }
+      if (
+        order.currencyCode &&
+        input.currencyCode &&
+        order.currencyCode.toUpperCase() !== input.currencyCode.toUpperCase()
+      ) {
         throw new CrudHttpError(400, {
-          error: translate('sales.documents.detail.statusInvalid', 'Selected status could not be found.'),
+          error: translate('sales.payments.currency_mismatch', 'Payment currency must match the order currency.'),
         })
       }
-      order.statusEntryId = input.documentStatusEntryId ?? null
-      order.status = orderStatus
-      order.updatedAt = new Date()
-      em.persist(order)
-    }
-    if (input.lineStatusEntryId !== undefined) {
-      const lineStatus = await resolveDictionaryEntryValue(em, input.lineStatusEntryId ?? null)
-      if (input.lineStatusEntryId && !lineStatus) {
-        throw new CrudHttpError(400, {
-          error: translate('sales.documents.detail.statusInvalid', 'Selected status could not be found.'),
+      let paymentMethod = null
+      if (input.paymentMethodId) {
+        const method = assertFound(
+          await findOneWithDecryption(tx, SalesPaymentMethod, { id: input.paymentMethodId }, {}, { tenantId: input.tenantId, organizationId: input.organizationId }),
+          'sales.payments.method_not_found'
+        )
+        ensureSameScope(method, input.organizationId, input.tenantId)
+        paymentMethod = method
+      }
+      const orderPaymentMethodIdBefore = order.paymentMethodId ?? null
+      const orderPaymentMethodCodeBefore = order.paymentMethodCode ?? null
+      if (paymentMethod && !order.paymentMethodId) {
+        order.paymentMethodId = paymentMethod.id
+        order.paymentMethodCode = paymentMethod.code ?? null
+        order.updatedAt = new Date()
+        tx.persist(order)
+      }
+      if (input.documentStatusEntryId !== undefined) {
+        const orderStatus = await resolveDictionaryEntryValue(tx, input.documentStatusEntryId ?? null, { tenantId: input.tenantId })
+        if (input.documentStatusEntryId && !orderStatus) {
+          throw new CrudHttpError(400, {
+            error: translate('sales.documents.detail.statusInvalid', 'Selected status could not be found.'),
+          })
+        }
+        order.statusEntryId = input.documentStatusEntryId ?? null
+        order.status = orderStatus
+        order.updatedAt = new Date()
+        tx.persist(order)
+      }
+      if (input.lineStatusEntryId !== undefined) {
+        const lineStatus = await resolveDictionaryEntryValue(tx, input.lineStatusEntryId ?? null, { tenantId: input.tenantId })
+        if (input.lineStatusEntryId && !lineStatus) {
+          throw new CrudHttpError(400, {
+            error: translate('sales.documents.detail.statusInvalid', 'Selected status could not be found.'),
+          })
+        }
+        const orderLines = await findWithDecryption(tx, SalesOrderLine, { order }, {}, { tenantId: input.tenantId, organizationId: input.organizationId })
+        orderLines.forEach((line) => {
+          line.statusEntryId = input.lineStatusEntryId ?? null
+          line.status = lineStatus
+          line.updatedAt = new Date()
+        })
+        orderLines.forEach((line) => tx.persist(line))
+      }
+      const status = await resolveDictionaryEntryValue(tx, input.statusEntryId ?? null, { tenantId: input.tenantId })
+      const payment = tx.create(SalesPayment, {
+        organizationId: input.organizationId,
+        tenantId: input.tenantId,
+        order,
+        paymentMethod,
+        paymentReference: input.paymentReference ?? null,
+        statusEntryId: input.statusEntryId ?? null,
+        status,
+        amount: toNumericString(input.amount) ?? '0',
+        currencyCode: input.currencyCode,
+        capturedAmount: toNumericString(input.capturedAmount) ?? '0',
+        refundedAmount: toNumericString(input.refundedAmount) ?? '0',
+        receivedAt: input.receivedAt ?? null,
+        capturedAt: input.capturedAt ?? null,
+        metadata: input.metadata ? cloneJson(input.metadata) : null,
+        customFieldSetId: input.customFieldSetId ?? null,
+      })
+      const allocationInputs = Array.isArray(input.allocations) ? input.allocations : []
+      const allocations = allocationInputs.length
+        ? allocationInputs
+        : [
+            {
+              orderId: input.orderId,
+              invoiceId: null,
+              amount: input.amount,
+              currencyCode: input.currencyCode,
+              metadata: null,
+            },
+          ]
+      const orderCache = new Map<string, SalesOrder>([[order.id, order]])
+      const invoiceCache = new Map<string, SalesInvoice>()
+      for (const allocation of allocations) {
+        let allocationOrder: SalesOrder | null = null
+        if (allocation.orderId) {
+          allocationOrder = orderCache.get(allocation.orderId) ?? null
+          if (!allocationOrder) {
+            allocationOrder = assertFound(
+              await findOneWithDecryption(
+                tx,
+                SalesOrder,
+                { id: allocation.orderId },
+                {},
+                { tenantId: input.tenantId, organizationId: input.organizationId },
+              ),
+              'sales.payments.order_not_found',
+            )
+            ensureSameScope(allocationOrder, input.organizationId, input.tenantId)
+            orderCache.set(allocation.orderId, allocationOrder)
+          }
+        }
+        let allocationInvoice: SalesInvoice | null = null
+        if (allocation.invoiceId) {
+          allocationInvoice = invoiceCache.get(allocation.invoiceId) ?? null
+          if (!allocationInvoice) {
+            allocationInvoice = assertFound(
+              await findOneWithDecryption(
+                tx,
+                SalesInvoice,
+                { id: allocation.invoiceId },
+                {},
+                { tenantId: input.tenantId, organizationId: input.organizationId },
+              ),
+              'sales.payments.invoice_not_found',
+            )
+            ensureSameScope(allocationInvoice, input.organizationId, input.tenantId)
+            invoiceCache.set(allocation.invoiceId, allocationInvoice)
+          }
+        }
+        const entity = tx.create(SalesPaymentAllocation, {
+          payment,
+          order: allocationOrder,
+          invoice: allocationInvoice,
+          organizationId: input.organizationId,
+          tenantId: input.tenantId,
+          amount: toNumericString(allocation.amount) ?? '0',
+          currencyCode: allocation.currencyCode,
+          metadata: allocation.metadata ? cloneJson(allocation.metadata) : null,
+        })
+        tx.persist(entity)
+      }
+      tx.persist(payment)
+      if (input.customFields !== undefined) {
+        if (!payment.id) {
+          await tx.flush()
+        }
+        await setRecordCustomFields(tx, {
+          entityId: E.sales.sales_payment,
+          recordId: payment.id,
+          organizationId: input.organizationId,
+          tenantId: input.tenantId,
+          values: normalizeCustomFieldsInput(input.customFields),
         })
       }
-      const orderLines = await em.find(SalesOrderLine, { order })
-      orderLines.forEach((line) => {
-        line.statusEntryId = input.lineStatusEntryId ?? null
-        line.status = lineStatus
-        line.updatedAt = new Date()
-      })
-      orderLines.forEach((line) => em.persist(line))
-    }
-    const status = await resolveDictionaryEntryValue(em, input.statusEntryId ?? null)
-    const payment = em.create(SalesPayment, {
-      organizationId: input.organizationId,
-      tenantId: input.tenantId,
-      order,
-      paymentMethod,
-      paymentReference: input.paymentReference ?? null,
-      statusEntryId: input.statusEntryId ?? null,
-      status,
-      amount: toNumericString(input.amount) ?? '0',
-      currencyCode: input.currencyCode,
-      capturedAmount: toNumericString(input.capturedAmount) ?? '0',
-      refundedAmount: toNumericString(input.refundedAmount) ?? '0',
-      receivedAt: input.receivedAt ?? null,
-      capturedAt: input.capturedAt ?? null,
-      metadata: input.metadata ? cloneJson(input.metadata) : null,
-      customFieldSetId: input.customFieldSetId ?? null,
+      await tx.flush()
+      const totals = await recomputeOrderPaymentTotals(tx, order)
+      await tx.flush()
+      return { payment, order, totals, orderPaymentMethodIdBefore, orderPaymentMethodCodeBefore }
     })
-    const allocationInputs = Array.isArray(input.allocations) ? input.allocations : []
-    const allocations = allocationInputs.length
-      ? allocationInputs
-      : [
-          {
-            orderId: input.orderId,
-            invoiceId: null,
-            amount: input.amount,
-            currencyCode: input.currencyCode,
-            metadata: null,
-          },
-        ]
-    allocations.forEach((allocation) => {
-      const orderRef = allocation.orderId ? em.getReference(SalesOrder, allocation.orderId) : order
-      const invoiceRef = allocation.invoiceId ? em.getReference(SalesInvoice, allocation.invoiceId) : null
-      const entity = em.create(SalesPaymentAllocation, {
-        payment,
-        order: orderRef,
-        invoice: invoiceRef,
-        organizationId: input.organizationId,
-        tenantId: input.tenantId,
-        amount: toNumericString(allocation.amount) ?? '0',
-        currencyCode: allocation.currencyCode,
-        metadata: allocation.metadata ? cloneJson(allocation.metadata) : null,
-      })
-      em.persist(entity)
-    })
-    em.persist(payment)
-    if (input.customFields !== undefined) {
-      if (!payment.id) {
-        await em.flush()
-      }
-      await setRecordCustomFields(em, {
-        entityId: E.sales.sales_payment,
-        recordId: payment.id,
-        organizationId: input.organizationId,
-        tenantId: input.tenantId,
-        values: normalizeCustomFieldsInput(input.customFields),
-      })
-    }
-    await em.flush()
-    const totals = await recomputeOrderPaymentTotals(em, order)
-    await em.flush()
+
     await invalidateOrderCache(ctx.container, order, ctx.auth?.tenantId ?? null)
 
     const dataEngine = ctx.container.resolve('dataEngine') as DataEngine
@@ -496,7 +550,8 @@ const createPaymentCommand: CommandHandler<
   },
   captureAfter: async (_input, result, ctx) => {
     const em = (ctx.container.resolve('em') as EntityManager).fork()
-    return result?.paymentId ? loadPaymentSnapshot(em, result.paymentId) : null
+    const scope = ctx.auth?.tenantId ? { tenantId: ctx.auth.tenantId, organizationId: ctx.auth?.orgId ?? null } : undefined
+    return result?.paymentId ? loadPaymentSnapshot(em, result.paymentId, scope) : null
   },
   buildLog: async ({ result, snapshots }) => {
     const after = snapshots.after as PaymentSnapshot | undefined
@@ -519,11 +574,11 @@ const createPaymentCommand: CommandHandler<
     const after = payload?.after
     if (!after) return
     const em = (ctx.container.resolve('em') as EntityManager).fork()
-    const existing = await em.findOne(SalesPayment, { id: after.id })
+    const existing = await findOneWithDecryption(em, SalesPayment, { id: after.id }, {}, { tenantId: after.tenantId, organizationId: after.organizationId })
     if (existing) {
       const orderRef =
         typeof existing.order === 'string' ? existing.order : existing.order?.id ?? null
-      const allocations = await em.find(SalesPaymentAllocation, { payment: existing })
+      const allocations = await findWithDecryption(em, SalesPaymentAllocation, { payment: existing }, {}, { tenantId: after.tenantId, organizationId: after.organizationId })
       const allocationOrders = allocations
         .map((allocation) =>
           typeof allocation.order === 'string'
@@ -547,18 +602,97 @@ const createPaymentCommand: CommandHandler<
         )
       )
       for (const id of orderIds) {
-        const order = await em.findOne(SalesOrder, { id })
-        if (!order) continue
-        if (id === after.orderId && 'orderPaymentMethodIdBefore' in (payload ?? {})) {
-          order.paymentMethodId = payload.orderPaymentMethodIdBefore ?? null
-          order.paymentMethodCode = payload.orderPaymentMethodCodeBefore ?? null
-          order.updatedAt = new Date()
-          await em.flush()
-        }
-        await recomputeOrderPaymentTotals(em, order)
-        await em.flush()
+        await em.transactional(async (tx) => {
+          const order = await findOneWithDecryption(tx, SalesOrder, { id }, { lockMode: LockMode.PESSIMISTIC_WRITE }, { tenantId: after.tenantId, organizationId: after.organizationId })
+          if (!order) return
+          if (id === after.orderId && 'orderPaymentMethodIdBefore' in (payload ?? {})) {
+            order.paymentMethodId = payload.orderPaymentMethodIdBefore ?? null
+            order.paymentMethodCode = payload.orderPaymentMethodCodeBefore ?? null
+            order.updatedAt = new Date()
+            await tx.flush()
+          }
+          await recomputeOrderPaymentTotals(tx, order)
+          await tx.flush()
+        })
       }
     }
+  },
+  redo: async ({ ctx, logEntry }) => {
+    const after = resolveRedoSnapshot<PaymentSnapshot>(logEntry)
+    const paymentId = after?.id ?? logEntry.resourceId ?? null
+    if (!after || !paymentId) {
+      throw new CrudHttpError(400, { error: '[internal] redo snapshot unavailable for sales.payments.create' })
+    }
+    const em = (ctx.container.resolve('em') as EntityManager).fork()
+    await restorePaymentSnapshot(em, after)
+    await em.flush()
+
+    const orderIds = Array.from(
+      new Set(
+        [
+          after.orderId,
+          ...after.allocations.map((allocation) => allocation.orderId),
+        ].filter((value): value is string => typeof value === 'string' && value.length > 0)
+      )
+    )
+    let totals: { paidTotalAmount: number; refundedTotalAmount: number; outstandingAmount: number } | undefined
+    for (const orderId of orderIds) {
+      const recomputed = await em.transactional(async (tx) => {
+        const order = await findOneWithDecryption(
+          tx,
+          SalesOrder,
+          { id: orderId },
+          { lockMode: LockMode.PESSIMISTIC_WRITE },
+          { tenantId: after.tenantId, organizationId: after.organizationId },
+        )
+        if (!order) return undefined
+        if (orderId === after.orderId && after.paymentMethodId && !order.paymentMethodId) {
+          const method = await findOneWithDecryption(
+            tx,
+            SalesPaymentMethod,
+            { id: after.paymentMethodId },
+            {},
+            { tenantId: after.tenantId, organizationId: after.organizationId },
+          )
+          order.paymentMethodId = method?.id ?? after.paymentMethodId
+          order.paymentMethodCode = method?.code ?? null
+          order.updatedAt = new Date()
+          await tx.flush()
+        }
+        const result = await recomputeOrderPaymentTotals(tx, order)
+        await tx.flush()
+        return result
+      })
+      if (recomputed && (!totals || orderId === after.orderId)) {
+        totals = recomputed
+      }
+      // Raw findOne is intentional: the order is fetched only to read its id/scope
+      // for cache invalidation — no encrypted field is read, so decryption is unnecessary.
+      // Scope filter (#2111): never cache-invalidate a foreign tenant's order even
+      // if a snapshot's orderId was somehow tampered with.
+      const target = await em.findOne(SalesOrder, { id: orderId, organizationId: after.organizationId, tenantId: after.tenantId })
+      if (target) {
+        ensureSameScope(target, after.organizationId, after.tenantId)
+        await invalidateOrderCache(ctx.container, target, ctx.auth?.tenantId ?? null)
+      }
+    }
+
+    const payment = await findOneWithDecryption(em, SalesPayment, { id: after.id }, {}, { tenantId: after.tenantId, organizationId: after.organizationId })
+    const dataEngine = ctx.container.resolve('dataEngine') as DataEngine
+    await emitCrudSideEffects({
+      dataEngine,
+      action: 'created',
+      entity: payment,
+      identifiers: {
+        id: after.id,
+        organizationId: after.organizationId,
+        tenantId: after.tenantId,
+      },
+      indexer: { entityType: E.sales.sales_payment },
+      events: paymentCrudEvents,
+    })
+
+    return { paymentId: after.id, orderTotals: totals }
   },
 }
 
@@ -571,7 +705,8 @@ const updatePaymentCommand: CommandHandler<
     const parsed = paymentUpdateSchema.parse(rawInput ?? {})
     if (!parsed.id) return {}
     const em = ctx.container.resolve('em') as EntityManager
-    const snapshot = await loadPaymentSnapshot(em, parsed.id)
+    const scope = ctx.auth?.tenantId ? { tenantId: ctx.auth.tenantId, organizationId: ctx.auth?.orgId ?? null } : undefined
+    const snapshot = await loadPaymentSnapshot(em, parsed.id, scope)
     if (snapshot) {
       ensureTenantScope(ctx, snapshot.tenantId)
       ensureOrganizationScope(ctx, snapshot.organizationId)
@@ -583,7 +718,7 @@ const updatePaymentCommand: CommandHandler<
     const em = (ctx.container.resolve('em') as EntityManager).fork()
     const { translate } = await resolveTranslations()
     const scopeSeed = assertFound(
-      await em.findOne(SalesPayment, { id: input.id }),
+      await findOneWithDecryption(em, SalesPayment, { id: input.id }, {}, { tenantId: input.tenantId, organizationId: input.organizationId }),
       'sales.payments.not_found'
     )
     const resolvedTenantId = input.tenantId ?? scopeSeed.tenantId
@@ -602,147 +737,245 @@ const updatePaymentCommand: CommandHandler<
     )
     ensureSameScope(payment, resolvedOrganizationId, resolvedTenantId)
     const previousOrder = payment.order as SalesOrder | null
-    if (input.orderId !== undefined) {
-      if (!input.orderId) {
-        payment.order = null
-      } else {
-        const order = assertFound(
-          await em.findOne(SalesOrder, { id: input.orderId }),
-          'sales.payments.order_not_found'
-        )
-        ensureSameScope(order, resolvedOrganizationId, resolvedTenantId)
-        if (
-          order.currencyCode &&
-          input.currencyCode &&
-          order.currencyCode.toUpperCase() !== input.currencyCode.toUpperCase()
-        ) {
+    // Apply payment scalar fields, order/line status changes and the
+    // allocations rebuild in one transaction so a mid-write failure cannot
+    // leave the payment and its allocations partially committed (#2336).
+    await em.transactional(async (tx) => {
+      if (input.orderId !== undefined) {
+        if (!input.orderId) {
+          payment.order = null
+        } else {
+          const order = assertFound(
+            await findOneWithDecryption(tx, SalesOrder, { id: input.orderId }, {}, { tenantId: resolvedTenantId, organizationId: resolvedOrganizationId }),
+            'sales.payments.order_not_found'
+          )
+          ensureSameScope(order, resolvedOrganizationId, resolvedTenantId)
+          if (
+            order.currencyCode &&
+            input.currencyCode &&
+            order.currencyCode.toUpperCase() !== input.currencyCode.toUpperCase()
+          ) {
+            throw new CrudHttpError(400, {
+              error: translate('sales.payments.currency_mismatch', 'Payment currency must match the order currency.'),
+            })
+          }
+          payment.order = order
+        }
+      }
+      if (input.paymentMethodId !== undefined) {
+        if (!input.paymentMethodId) {
+          payment.paymentMethod = null
+        } else {
+          const method = assertFound(
+            await findOneWithDecryption(tx, SalesPaymentMethod, { id: input.paymentMethodId }, {}, { tenantId: resolvedTenantId, organizationId: resolvedOrganizationId }),
+            'sales.payments.method_not_found'
+          )
+          ensureSameScope(method, resolvedOrganizationId, resolvedTenantId)
+          payment.paymentMethod = method
+        }
+      }
+      const currentOrder = payment.order as SalesOrder | null
+      if ((input.documentStatusEntryId !== undefined || input.lineStatusEntryId !== undefined) && !currentOrder) {
+        throw new CrudHttpError(400, { error: translate('sales.payments.order_required', 'Order is required for payments.') })
+      }
+      if (currentOrder && input.documentStatusEntryId !== undefined) {
+        const orderStatus = await resolveDictionaryEntryValue(tx, input.documentStatusEntryId ?? null, { tenantId: resolvedTenantId })
+        if (input.documentStatusEntryId && !orderStatus) {
           throw new CrudHttpError(400, {
-            error: translate('sales.payments.currency_mismatch', 'Payment currency must match the order currency.'),
+            error: translate('sales.documents.detail.statusInvalid', 'Selected status could not be found.'),
           })
         }
-        payment.order = order
+        currentOrder.statusEntryId = input.documentStatusEntryId ?? null
+        currentOrder.status = orderStatus
+        currentOrder.updatedAt = new Date()
+        tx.persist(currentOrder)
       }
-    }
-    if (input.paymentMethodId !== undefined) {
-      if (!input.paymentMethodId) {
-        payment.paymentMethod = null
-      } else {
-        const method = assertFound(
-          await em.findOne(SalesPaymentMethod, { id: input.paymentMethodId }),
-          'sales.payments.method_not_found'
-        )
-        ensureSameScope(method, resolvedOrganizationId, resolvedTenantId)
-        payment.paymentMethod = method
-      }
-    }
-    const currentOrder = payment.order as SalesOrder | null
-    if ((input.documentStatusEntryId !== undefined || input.lineStatusEntryId !== undefined) && !currentOrder) {
-      throw new CrudHttpError(400, { error: translate('sales.payments.order_required', 'Order is required for payments.') })
-    }
-    if (currentOrder && input.documentStatusEntryId !== undefined) {
-      const orderStatus = await resolveDictionaryEntryValue(em, input.documentStatusEntryId ?? null)
-      if (input.documentStatusEntryId && !orderStatus) {
-        throw new CrudHttpError(400, {
-          error: translate('sales.documents.detail.statusInvalid', 'Selected status could not be found.'),
+      if (currentOrder && input.lineStatusEntryId !== undefined) {
+        const lineStatus = await resolveDictionaryEntryValue(tx, input.lineStatusEntryId ?? null, { tenantId: resolvedTenantId })
+        if (input.lineStatusEntryId && !lineStatus) {
+          throw new CrudHttpError(400, {
+            error: translate('sales.documents.detail.statusInvalid', 'Selected status could not be found.'),
+          })
+        }
+        const orderLines = await findWithDecryption(tx, SalesOrderLine, { order: currentOrder }, {}, { tenantId: resolvedTenantId, organizationId: resolvedOrganizationId })
+        orderLines.forEach((line) => {
+          line.statusEntryId = input.lineStatusEntryId ?? null
+          line.status = lineStatus
+          line.updatedAt = new Date()
         })
+        orderLines.forEach((line) => tx.persist(line))
       }
-      currentOrder.statusEntryId = input.documentStatusEntryId ?? null
-      currentOrder.status = orderStatus
-      currentOrder.updatedAt = new Date()
-      em.persist(currentOrder)
-    }
-    if (currentOrder && input.lineStatusEntryId !== undefined) {
-      const lineStatus = await resolveDictionaryEntryValue(em, input.lineStatusEntryId ?? null)
-      if (input.lineStatusEntryId && !lineStatus) {
-        throw new CrudHttpError(400, {
-          error: translate('sales.documents.detail.statusInvalid', 'Selected status could not be found.'),
-        })
+      if (input.paymentReference !== undefined) payment.paymentReference = input.paymentReference ?? null
+      if (input.statusEntryId !== undefined) {
+        payment.statusEntryId = input.statusEntryId ?? null
+        payment.status = await resolveDictionaryEntryValue(tx, input.statusEntryId ?? null, { tenantId: resolvedTenantId })
       }
-      const orderLines = await em.find(SalesOrderLine, { order: currentOrder })
-      orderLines.forEach((line) => {
-        line.statusEntryId = input.lineStatusEntryId ?? null
-        line.status = lineStatus
-        line.updatedAt = new Date()
-      })
-      orderLines.forEach((line) => em.persist(line))
-    }
-    if (input.paymentReference !== undefined) payment.paymentReference = input.paymentReference ?? null
-    if (input.statusEntryId !== undefined) {
-      payment.statusEntryId = input.statusEntryId ?? null
-      payment.status = await resolveDictionaryEntryValue(em, input.statusEntryId ?? null)
-    }
-    if (input.amount !== undefined) payment.amount = toNumericString(input.amount) ?? '0'
-    if (input.currencyCode !== undefined) payment.currencyCode = input.currencyCode
-    if (input.capturedAmount !== undefined) {
-      payment.capturedAmount = toNumericString(input.capturedAmount) ?? '0'
-    }
-    if (input.refundedAmount !== undefined) {
-      payment.refundedAmount = toNumericString(input.refundedAmount) ?? '0'
-    }
-    if (input.receivedAt !== undefined) payment.receivedAt = input.receivedAt ?? null
-    if (input.capturedAt !== undefined) payment.capturedAt = input.capturedAt ?? null
-    if (input.metadata !== undefined) {
-      payment.metadata = input.metadata ? cloneJson(input.metadata) : null
-    }
-    if (input.customFieldSetId !== undefined) {
-      payment.customFieldSetId = input.customFieldSetId ?? null
-    }
-    if (input.customFields !== undefined) {
-      if (!payment.id) {
-        await em.flush()
+      if (input.amount !== undefined) payment.amount = toNumericString(input.amount) ?? '0'
+      if (input.currencyCode !== undefined) payment.currencyCode = input.currencyCode
+      if (input.capturedAmount !== undefined) {
+        payment.capturedAmount = toNumericString(input.capturedAmount) ?? '0'
       }
-      await setRecordCustomFields(em, {
-        entityId: E.sales.sales_payment,
-        recordId: payment.id,
-        organizationId: payment.organizationId,
-        tenantId: payment.tenantId,
-        values: normalizeCustomFieldsInput(input.customFields),
-      })
-    }
-    if (input.allocations !== undefined) {
-      const existingAllocations = await em.find(SalesPaymentAllocation, { payment })
-      existingAllocations.forEach((allocation) => em.remove(allocation))
-      const allocationInputs = Array.isArray(input.allocations) ? input.allocations : []
-      allocationInputs.forEach((allocation) => {
-        const orderRef =
-          allocation.orderId ??
-          (typeof payment.order === 'string' ? payment.order : payment.order?.id) ??
-          null
-        const order =
-          orderRef && typeof orderRef === 'string' ? em.getReference(SalesOrder, orderRef) : null
-        const invoice = allocation.invoiceId
-          ? em.getReference(SalesInvoice, allocation.invoiceId)
-          : null
-        const entity = em.create(SalesPaymentAllocation, {
-          payment,
-          order,
-          invoice,
+      if (input.refundedAmount !== undefined) {
+        payment.refundedAmount = toNumericString(input.refundedAmount) ?? '0'
+      }
+      if (input.receivedAt !== undefined) payment.receivedAt = input.receivedAt ?? null
+      if (input.capturedAt !== undefined) payment.capturedAt = input.capturedAt ?? null
+      if (input.metadata !== undefined) {
+        payment.metadata = input.metadata ? cloneJson(input.metadata) : null
+      }
+      if (input.customFieldSetId !== undefined) {
+        payment.customFieldSetId = input.customFieldSetId ?? null
+      }
+      if (input.customFields !== undefined) {
+        if (!payment.id) {
+          await tx.flush()
+        }
+        await setRecordCustomFields(tx, {
+          entityId: E.sales.sales_payment,
+          recordId: payment.id,
           organizationId: payment.organizationId,
           tenantId: payment.tenantId,
-          amount: toNumericString(allocation.amount) ?? '0',
-          currencyCode: allocation.currencyCode,
-          metadata: allocation.metadata ? cloneJson(allocation.metadata) : null,
+          values: normalizeCustomFieldsInput(input.customFields),
         })
-        em.persist(entity)
-      })
-    }
-    payment.updatedAt = new Date()
-    await em.flush()
+      }
+      payment.updatedAt = new Date()
 
-    const nextOrder =
-      (payment.order as SalesOrder | null) ??
-      (typeof payment.order === 'string'
-        ? await em.findOne(SalesOrder, { id: payment.order })
-        : null)
+      // Persist the payment scalar changes before any allocation query below.
+      // MikroORM discards pending scalar mutations when a find() runs on the
+      // same EntityManager before they are flushed, which would otherwise drop
+      // the updated amount/reference when allocations are (re)synced.
+      await tx.flush()
+
+      if (input.allocations !== undefined) {
+        const existingAllocations = await findWithDecryption(tx, SalesPaymentAllocation, { payment }, {}, { tenantId: payment.tenantId, organizationId: payment.organizationId })
+        existingAllocations.forEach((allocation) => tx.remove(allocation))
+        const allocationInputs = Array.isArray(input.allocations) ? input.allocations : []
+        const paymentOrderId =
+          (typeof payment.order === 'string' ? payment.order : payment.order?.id) ?? null
+        const orderCache = new Map<string, SalesOrder>()
+        if (currentOrder) orderCache.set(currentOrder.id, currentOrder)
+        const invoiceCache = new Map<string, SalesInvoice>()
+        for (const allocation of allocationInputs) {
+          const orderId = allocation.orderId ?? paymentOrderId
+          let order: SalesOrder | null = null
+          if (orderId && typeof orderId === 'string') {
+            order = orderCache.get(orderId) ?? null
+            if (!order) {
+              order = assertFound(
+                await findOneWithDecryption(
+                  tx,
+                  SalesOrder,
+                  { id: orderId },
+                  {},
+                  { tenantId: payment.tenantId, organizationId: payment.organizationId },
+                ),
+                'sales.payments.order_not_found',
+              )
+              ensureSameScope(order, payment.organizationId, payment.tenantId)
+              orderCache.set(orderId, order)
+            }
+          }
+          let invoice: SalesInvoice | null = null
+          if (allocation.invoiceId) {
+            invoice = invoiceCache.get(allocation.invoiceId) ?? null
+            if (!invoice) {
+              invoice = assertFound(
+                await findOneWithDecryption(
+                  tx,
+                  SalesInvoice,
+                  { id: allocation.invoiceId },
+                  {},
+                  { tenantId: payment.tenantId, organizationId: payment.organizationId },
+                ),
+                'sales.payments.invoice_not_found',
+              )
+              ensureSameScope(invoice, payment.organizationId, payment.tenantId)
+              invoiceCache.set(allocation.invoiceId, invoice)
+            }
+          }
+          const entity = tx.create(SalesPaymentAllocation, {
+            payment,
+            order,
+            invoice,
+            organizationId: payment.organizationId,
+            tenantId: payment.tenantId,
+            amount: toNumericString(allocation.amount) ?? '0',
+            currencyCode: allocation.currencyCode,
+            metadata: allocation.metadata ? cloneJson(allocation.metadata) : null,
+          })
+          tx.persist(entity)
+        }
+      } else if (input.amount !== undefined || input.currencyCode !== undefined) {
+        // The caller changed the payment amount/currency without managing
+        // allocations explicitly. A simple payment carries a single
+        // auto-created allocation covering the full amount (see create); keep
+        // it in sync so recomputeOrderPaymentTotals — which sums allocations in
+        // preference to the payment amount — does not report a stale paid total
+        // after a payment edit (#2455).
+        const existingAllocations = await findWithDecryption(tx, SalesPaymentAllocation, { payment }, {}, { tenantId: payment.tenantId, organizationId: payment.organizationId })
+        const paymentOrderId =
+          (typeof payment.order === 'string' ? payment.order : payment.order?.id) ?? null
+        const isDefaultAllocation = (allocation: SalesPaymentAllocation): boolean => {
+          const allocationOrderId =
+            typeof allocation.order === 'string' ? allocation.order : allocation.order?.id ?? null
+          const allocationInvoiceId =
+            typeof allocation.invoice === 'string' ? allocation.invoice : allocation.invoice?.id ?? null
+          return allocationInvoiceId === null && allocationOrderId === paymentOrderId
+        }
+        if (existingAllocations.length === 1 && isDefaultAllocation(existingAllocations[0])) {
+          const [allocation] = existingAllocations
+          allocation.amount = toNumericString(toNumber(payment.amount)) ?? '0'
+          allocation.currencyCode = payment.currencyCode
+          tx.persist(allocation)
+        }
+      }
+    })
+
+    const nextOrderId =
+      (payment.order as SalesOrder | null)?.id ??
+      (typeof payment.order === 'string' ? payment.order : null)
     let totals: { paidTotalAmount: number; refundedTotalAmount: number; outstandingAmount: number } | undefined
-    if (nextOrder) {
-      totals = await recomputeOrderPaymentTotals(em, nextOrder)
-      await em.flush()
-      await invalidateOrderCache(ctx.container, nextOrder, ctx.auth?.tenantId ?? null)
+    if (nextOrderId) {
+      totals = await em.transactional(async (tx) => {
+        // Scope filter (#2111): never lock or recompute totals on a foreign
+        // tenant's order, even if payment.order somehow points there.
+        const lockedOrder = await tx.findOne(
+          SalesOrder,
+          { id: nextOrderId, organizationId: payment.organizationId, tenantId: payment.tenantId },
+          { lockMode: LockMode.PESSIMISTIC_WRITE },
+        )
+        if (!lockedOrder) return undefined
+        ensureSameScope(lockedOrder, payment.organizationId, payment.tenantId)
+        const result = await recomputeOrderPaymentTotals(tx, lockedOrder)
+        await tx.flush()
+        return result
+      })
+      if (totals) {
+        // Raw findOne is intentional: the order is fetched only to read its id/scope
+        // for cache invalidation — no encrypted field is read, so decryption is unnecessary.
+        // Scope filter (#2111): same rationale as the lock above.
+        const nextOrder = await em.findOne(SalesOrder, { id: nextOrderId, organizationId: payment.organizationId, tenantId: payment.tenantId })
+        if (nextOrder) {
+          ensureSameScope(nextOrder, payment.organizationId, payment.tenantId)
+          await invalidateOrderCache(ctx.container, nextOrder, ctx.auth?.tenantId ?? null)
+        }
+      }
     }
-    if (previousOrder && (!nextOrder || previousOrder.id !== nextOrder.id)) {
-      await recomputeOrderPaymentTotals(em, previousOrder)
-      await em.flush()
+    if (previousOrder && (!nextOrderId || previousOrder.id !== nextOrderId)) {
+      await em.transactional(async (tx) => {
+        // Scope filter (#2111): previousOrder was already loaded via the
+        // payment's scope, so its tenant/org match the payment's. Filter
+        // the lock query the same way as defence-in-depth.
+        const lockedOrder = await tx.findOne(
+          SalesOrder,
+          { id: previousOrder.id, organizationId: payment.organizationId, tenantId: payment.tenantId },
+          { lockMode: LockMode.PESSIMISTIC_WRITE },
+        )
+        if (!lockedOrder) return
+        ensureSameScope(lockedOrder, payment.organizationId, payment.tenantId)
+        await recomputeOrderPaymentTotals(tx, lockedOrder)
+        await tx.flush()
+      })
       await invalidateOrderCache(ctx.container, previousOrder, ctx.auth?.tenantId ?? null)
     }
 
@@ -764,7 +997,8 @@ const updatePaymentCommand: CommandHandler<
   },
   captureAfter: async (_input, result, ctx) => {
     const em = (ctx.container.resolve('em') as EntityManager).fork()
-    return result?.paymentId ? loadPaymentSnapshot(em, result.paymentId) : null
+    const scope = ctx.auth?.tenantId ? { tenantId: ctx.auth.tenantId, organizationId: ctx.auth?.orgId ?? null } : undefined
+    return result?.paymentId ? loadPaymentSnapshot(em, result.paymentId, scope) : null
   },
   buildLog: async ({ snapshots, result }) => {
     const { translate } = await resolveTranslations()
@@ -791,11 +1025,12 @@ const updatePaymentCommand: CommandHandler<
     await restorePaymentSnapshot(em, before)
     await em.flush()
     if (before.orderId) {
-      const order = await em.findOne(SalesOrder, { id: before.orderId })
-      if (order) {
-        await recomputeOrderPaymentTotals(em, order)
-        await em.flush()
-      }
+      await em.transactional(async (tx) => {
+        const order = await findOneWithDecryption(tx, SalesOrder, { id: before.orderId! }, { lockMode: LockMode.PESSIMISTIC_WRITE }, { tenantId: before.tenantId, organizationId: before.organizationId })
+        if (!order) return
+        await recomputeOrderPaymentTotals(tx, order)
+        await tx.flush()
+      })
     }
   },
 }
@@ -809,7 +1044,8 @@ const deletePaymentCommand: CommandHandler<
     const parsed = paymentUpdateSchema.parse(rawInput ?? {})
     if (!parsed.id) return {}
     const em = ctx.container.resolve('em') as EntityManager
-    const snapshot = await loadPaymentSnapshot(em, parsed.id)
+    const scope = ctx.auth?.tenantId ? { tenantId: ctx.auth.tenantId, organizationId: ctx.auth?.orgId ?? null } : undefined
+    const snapshot = await loadPaymentSnapshot(em, parsed.id, scope)
     if (snapshot) {
       ensureTenantScope(ctx, snapshot.tenantId)
       ensureOrganizationScope(ctx, snapshot.organizationId)
@@ -833,7 +1069,7 @@ const deletePaymentCommand: CommandHandler<
     )
     ensureSameScope(payment, input.organizationId, input.tenantId)
     const order = payment.order as SalesOrder | null
-    const allocations = await em.find(SalesPaymentAllocation, { payment })
+    const allocations = await findWithDecryption(em, SalesPaymentAllocation, { payment }, {}, { tenantId: payment.tenantId, organizationId: payment.organizationId })
     const allocationOrders = allocations
       .map((allocation) =>
         typeof allocation.order === 'string'
@@ -841,10 +1077,13 @@ const deletePaymentCommand: CommandHandler<
           : allocation.order?.id ?? null
       )
       .filter((value): value is string => typeof value === 'string' && value.length > 0)
-    allocations.forEach((allocation) => em.remove(allocation))
-    await em.flush()
-    em.remove(payment)
-    await em.flush()
+    // Remove the allocations and the payment in one transaction so a failure
+    // between the two deletes cannot leave orphaned allocations committed
+    // without their payment (#2336).
+    await em.transactional(async (tx) => {
+      allocations.forEach((allocation) => tx.remove(allocation))
+      tx.remove(payment)
+    })
     let totals: { paidTotalAmount: number; refundedTotalAmount: number; outstandingAmount: number } | undefined
     const orderIds = Array.from(
       new Set(
@@ -856,14 +1095,31 @@ const deletePaymentCommand: CommandHandler<
     )
     const primaryOrderId = order && typeof order === 'object' ? order.id : null
     for (const orderId of orderIds) {
-      const target = typeof order === 'object' && order.id === orderId ? order : await em.findOne(SalesOrder, { id: orderId })
-      if (!target) continue
-      const recomputed = await recomputeOrderPaymentTotals(em, target)
-      if (!totals || (primaryOrderId && orderId === primaryOrderId)) {
+      const recomputed = await em.transactional(async (tx) => {
+        // Scope filter (#2111): never lock or recompute totals on a foreign
+        // tenant's order, even if a payment allocation somehow points there.
+        const lockedOrder = await tx.findOne(
+          SalesOrder,
+          { id: orderId, organizationId: payment.organizationId, tenantId: payment.tenantId },
+          { lockMode: LockMode.PESSIMISTIC_WRITE },
+        )
+        if (!lockedOrder) return undefined
+        ensureSameScope(lockedOrder, payment.organizationId, payment.tenantId)
+        const result = await recomputeOrderPaymentTotals(tx, lockedOrder)
+        await tx.flush()
+        return result
+      })
+      if (recomputed && (!totals || (primaryOrderId && orderId === primaryOrderId))) {
         totals = recomputed
       }
-      await em.flush()
-      await invalidateOrderCache(ctx.container, target, ctx.auth?.tenantId ?? null)
+      // Raw findOne is intentional: the order is fetched only to read its id/scope
+      // for cache invalidation — no encrypted field is read, so decryption is unnecessary.
+      // Scope filter (#2111): same rationale as the lock above.
+      const target = await em.findOne(SalesOrder, { id: orderId, organizationId: payment.organizationId, tenantId: payment.tenantId })
+      if (target) {
+        ensureSameScope(target, payment.organizationId, payment.tenantId)
+        await invalidateOrderCache(ctx.container, target, ctx.auth?.tenantId ?? null)
+      }
     }
     const dataEngine = ctx.container.resolve('dataEngine') as DataEngine
     await emitCrudSideEffects({
@@ -920,11 +1176,12 @@ const deletePaymentCommand: CommandHandler<
     await restorePaymentSnapshot(em, before)
     await em.flush()
     if (before.orderId) {
-      const order = await em.findOne(SalesOrder, { id: before.orderId })
-      if (order) {
-        await recomputeOrderPaymentTotals(em, order)
-        await em.flush()
-      }
+      await em.transactional(async (tx) => {
+        const order = await findOneWithDecryption(tx, SalesOrder, { id: before.orderId! }, { lockMode: LockMode.PESSIMISTIC_WRITE }, { tenantId: before.tenantId, organizationId: before.organizationId })
+        if (!order) return
+        await recomputeOrderPaymentTotals(tx, order)
+        await tx.flush()
+      })
     }
   },
 }

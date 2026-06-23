@@ -8,8 +8,7 @@ import { z } from 'zod'
 import type { EntityManager } from '@mikro-orm/postgresql'
 import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
 import type { CommandBus } from '@open-mercato/shared/lib/commands'
-import { CrudHttpError } from '@open-mercato/shared/lib/crud/errors'
-import { loadCustomFieldValues } from '@open-mercato/shared/lib/crud/custom-fields'
+import { CrudHttpError, isCrudHttpError } from '@open-mercato/shared/lib/crud/errors'
 import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
 import {
   runCrudMutationGuardAfterSuccess,
@@ -25,9 +24,12 @@ import {
   mapInteractionRecordToActivitySummary,
   CUSTOMER_INTERACTION_ACTIVITY_ADAPTER_SOURCE,
 } from '../../lib/interactionCompatibility'
+import { withOperationMetadata } from '../../lib/operationMetadata'
 import { resolveCustomerInteractionFeatureFlags } from '../../lib/interactionFeatureFlags'
 import { resolveCustomersRequestContext } from '../../lib/interactionRequestContext'
 import { hydrateCanonicalInteractions } from '../../lib/interactionReadModel'
+import { resolveCanonicalActivityTargetId } from '../../lib/legacyActivityBridge'
+import { buildEmailVisibilityMikroFilter } from '../../lib/visibilityFilter'
 
 const listSchema = z.object({
   page: z.coerce.number().min(1).default(1),
@@ -67,6 +69,12 @@ const ADAPTER_HEADERS = {
   Sunset: 'Tue, 30 Jun 2026 00:00:00 GMT',
   Link: '</api/customers/interactions>; rel="successor-version"',
 }
+
+// Caps the per-source fetch window used by the deprecated merged (legacy +
+// canonical bridge) read path. Keeps memory bounded on tenants with large
+// activity history; deep-pagination beyond this window is not supported here —
+// use /api/customers/interactions instead.
+const MERGED_ACTIVITY_FETCH_CAP = 2000
 
 type ActivityItem = {
   id: string
@@ -179,7 +187,7 @@ function paginateActivityItems(
   }
 }
 
-async function decorateActivityItems(
+export async function decorateActivityItems(
   em: EntityManager,
   items: ActivityItem[],
   decryptionScope?: { tenantId: string; organizationId: string },
@@ -201,12 +209,23 @@ async function decorateActivityItems(
     ),
   )
 
+  if (dealIds.length > 0 && (!decryptionScope?.tenantId || !decryptionScope?.organizationId)) {
+    const { translate } = await resolveTranslations()
+    throw new CrudHttpError(400, {
+      error: translate('customers.errors.tenant_required', 'Tenant context is required'),
+    })
+  }
+
   const [users, deals] = await Promise.all([
     authorIds.length > 0 ? em.find(User, { id: { $in: authorIds } }) : Promise.resolve([]),
-    dealIds.length > 0
-      ? decryptionScope
-        ? findWithDecryption(em, CustomerDeal, { id: { $in: dealIds } }, undefined, decryptionScope)
-        : em.find(CustomerDeal, { id: { $in: dealIds } })
+    dealIds.length > 0 && decryptionScope
+      ? findWithDecryption(
+          em,
+          CustomerDeal,
+          { id: { $in: dealIds }, tenantId: decryptionScope.tenantId, organizationId: decryptionScope.organizationId },
+          undefined,
+          decryptionScope,
+        )
       : Promise.resolve([]),
   ])
 
@@ -247,78 +266,6 @@ function mapLegacyActivity(activity: CustomerActivity): ActivityItem {
   }
 }
 
-async function loadLegacyActivityCustomValues(
-  em: EntityManager,
-  activity: CustomerActivity,
-): Promise<Record<string, unknown> | null> {
-  const values = await loadCustomFieldValues({
-    em,
-    entityId: 'customers:customer_activity',
-    recordIds: [activity.id],
-    tenantIdByRecord: { [activity.id]: activity.tenantId },
-    organizationIdByRecord: { [activity.id]: activity.organizationId },
-    tenantFallbacks: [activity.tenantId],
-  })
-  return values[activity.id] ?? null
-}
-
-async function ensureCanonicalActivityBridge(
-  em: EntityManager,
-  commandBus: CommandBus,
-  commandContext: Parameters<CommandBus['execute']>[1]['ctx'],
-  activity: CustomerActivity,
-): Promise<string> {
-  const existing = await em.findOne(CustomerInteraction, { id: activity.id })
-  if (existing) return existing.id
-
-  const entityId = typeof activity.entity === 'string' ? activity.entity : activity.entity.id
-  const dealId = activity.deal
-    ? (typeof activity.deal === 'string' ? activity.deal : activity.deal.id)
-    : null
-  const customValues = await loadLegacyActivityCustomValues(em, activity)
-
-  await commandBus.execute('customers.interactions.create', {
-    input: {
-      id: activity.id,
-      entityId,
-      interactionType: activity.activityType,
-      title: activity.subject ?? null,
-      body: activity.body ?? null,
-      occurredAt: activity.occurredAt ?? null,
-      status: activity.occurredAt ? 'done' : 'planned',
-      dealId,
-      authorUserId: activity.authorUserId ?? null,
-      appearanceIcon: activity.appearanceIcon ?? null,
-      appearanceColor: activity.appearanceColor ?? null,
-      source: CUSTOMER_INTERACTION_ACTIVITY_ADAPTER_SOURCE,
-      ...(customValues ? { customValues } : {}),
-    },
-    ctx: commandContext,
-  })
-
-  return activity.id
-}
-
-async function resolveCanonicalActivityTargetId(
-  em: EntityManager,
-  commandBus: CommandBus,
-  commandContext: Parameters<CommandBus['execute']>[1]['ctx'],
-  targetId: string,
-): Promise<string> {
-  const existing = await em.findOne(CustomerInteraction, { id: targetId })
-  if (existing) return existing.id
-
-  const legacy = await em.findOne(CustomerActivity, { id: targetId }, { populate: ['entity', 'deal'] })
-  if (!legacy) return targetId
-
-  return ensureCanonicalActivityBridge(
-    em,
-    commandBus,
-    commandContext,
-    legacy,
-  )
-}
-
 async function listCanonicalActivities(
   em: EntityManager,
   container: { resolve: (name: string) => unknown },
@@ -345,6 +292,18 @@ async function listCanonicalActivities(
   if (options?.source) {
     where.source = Array.isArray(options.source) ? { $in: options.source } : options.source
   }
+
+  // Per-user email privacy: exclude other users' private email interactions from
+  // the deprecated /activities surface (mirrors the /interactions Layer-1 filter).
+  // v1 strict owner-only — no admin bypass (the filter ignores caller features).
+  const activitiesViewerUserId = auth.keyId ? null : (auth.sub ?? auth.userId ?? null)
+  Object.assign(
+    where,
+    buildEmailVisibilityMikroFilter({
+      currentUserId: activitiesViewerUserId,
+      userFeatures: undefined,
+    }),
+  )
 
   const findOptions = {
     orderBy: buildCanonicalOrderBy(query.sortField, query.sortDir ?? 'desc'),
@@ -460,23 +419,36 @@ export async function GET(request: Request): Promise<Response> {
           organizationIds,
           query,
         )
-      : await Promise.all([
-        listLegacyActivities(em, auth.tenantId, organizationIds, query, { paginate: false }, selectedOrganizationId),
-        listCanonicalActivities(
-          em,
-          container,
-          auth,
-          selectedOrganizationId,
-          auth.tenantId,
-          organizationIds,
-          query,
-          {
-            includeDeleted: true,
-            paginate: false,
-            source: CUSTOMER_INTERACTION_ACTIVITY_ADAPTER_SOURCE,
-          },
-        ),
-      ]).then(([legacy, canonical]) => {
+      : await (async () => {
+        const windowSize = Math.min(
+          MERGED_ACTIVITY_FETCH_CAP,
+          Math.max(query.pageSize, query.page * query.pageSize + query.pageSize),
+        )
+        const windowedQuery = { ...query, page: 1, pageSize: windowSize }
+        const [legacy, canonical] = await Promise.all([
+          listLegacyActivities(
+            em,
+            auth.tenantId,
+            organizationIds,
+            windowedQuery,
+            { paginate: true },
+            selectedOrganizationId,
+          ),
+          listCanonicalActivities(
+            em,
+            container,
+            auth,
+            selectedOrganizationId,
+            auth.tenantId,
+            organizationIds,
+            windowedQuery,
+            {
+              includeDeleted: true,
+              paginate: true,
+              source: CUSTOMER_INTERACTION_ACTIVITY_ADAPTER_SOURCE,
+            },
+          ),
+        ])
         const merged = sortActivityItems(
           [
             ...legacy.items.filter((item) => !canonical.bridgeIds.has(item.id)),
@@ -490,7 +462,7 @@ export async function GET(request: Request): Promise<Response> {
           items: paged.items,
           total: paged.total,
         }
-      })
+      })()
 
     return withAdapterHeaders(
       NextResponse.json({
@@ -502,7 +474,7 @@ export async function GET(request: Request): Promise<Response> {
       }),
     )
   } catch (err) {
-    if (err instanceof CrudHttpError) {
+    if (isCrudHttpError(err)) {
       return withAdapterHeaders(NextResponse.json(err.body, { status: err.status }))
     }
     if (err instanceof z.ZodError) {
@@ -542,8 +514,10 @@ export async function POST(request: Request): Promise<Response> {
       return withAdapterHeaders(NextResponse.json(guardResult.body, { status: guardResult.status }))
     }
     const commandBus = container.resolve('commandBus') as CommandBus
-    const { result } = await commandBus.execute('customers.interactions.create', {
+    const { result, logEntry } = await commandBus.execute('customers.interactions.create', {
       input: {
+        tenantId: auth.tenantId,
+        organizationId: selectedOrganizationId ?? auth.orgId,
         entityId: parsed.entityId,
         interactionType: parsed.activityType,
         title: parsed.subject ?? null,
@@ -574,27 +548,22 @@ export async function POST(request: Request): Promise<Response> {
       })
     }
 
+    const createdId =
+      result && typeof result === 'object' && 'interactionId' in result && typeof result.interactionId === 'string'
+        ? result.interactionId
+        : result && typeof result === 'object' && 'id' in result && typeof result.id === 'string'
+          ? result.id
+          : null
+
     return withAdapterHeaders(
-      NextResponse.json(
-        {
-          id:
-            result &&
-            typeof result === 'object' &&
-            'interactionId' in result &&
-            typeof result.interactionId === 'string'
-              ? result.interactionId
-              : result &&
-                  typeof result === 'object' &&
-                  'id' in result &&
-                  typeof result.id === 'string'
-                ? result.id
-                : null,
-        },
-        { status: 201 },
+      withOperationMetadata(
+        NextResponse.json({ id: createdId }, { status: 201 }),
+        logEntry,
+        { resourceKind: 'customers.activity', resourceId: createdId },
       ),
     )
   } catch (err) {
-    if (err instanceof CrudHttpError) {
+    if (isCrudHttpError(err)) {
       return withAdapterHeaders(NextResponse.json(err.body, { status: err.status }))
     }
     if (err instanceof z.ZodError) {
@@ -636,9 +605,9 @@ export async function PUT(request: Request): Promise<Response> {
     const commandBus = container.resolve('commandBus') as CommandBus
     const interactionId = flags.unified
       ? parsed.id
-      : await resolveCanonicalActivityTargetId(em, commandBus, commandContext, parsed.id)
+      : await resolveCanonicalActivityTargetId(em, commandBus, commandContext, parsed.id, auth.tenantId)
 
-    await commandBus.execute('customers.interactions.update', {
+    const { logEntry } = await commandBus.execute('customers.interactions.update', {
       input: {
         id: interactionId,
         interactionType: parsed.activityType,
@@ -669,9 +638,15 @@ export async function PUT(request: Request): Promise<Response> {
       })
     }
 
-    return withAdapterHeaders(NextResponse.json({ ok: true }))
+    return withAdapterHeaders(
+      withOperationMetadata(
+        NextResponse.json({ ok: true }),
+        logEntry,
+        { resourceKind: 'customers.activity', resourceId: parsed.id },
+      ),
+    )
   } catch (err) {
-    if (err instanceof CrudHttpError) {
+    if (isCrudHttpError(err)) {
       return withAdapterHeaders(NextResponse.json(err.body, { status: err.status }))
     }
     if (err instanceof z.ZodError) {
@@ -713,8 +688,8 @@ export async function DELETE(request: Request): Promise<Response> {
     const commandBus = container.resolve('commandBus') as CommandBus
     const interactionId = flags.unified
       ? parsed.id
-      : await resolveCanonicalActivityTargetId(em, commandBus, commandContext, parsed.id)
-    await commandBus.execute('customers.interactions.delete', {
+      : await resolveCanonicalActivityTargetId(em, commandBus, commandContext, parsed.id, auth.tenantId)
+    const { logEntry } = await commandBus.execute('customers.interactions.delete', {
       input: { id: interactionId },
       ctx: commandContext,
     })
@@ -731,9 +706,15 @@ export async function DELETE(request: Request): Promise<Response> {
         metadata: guardResult.metadata ?? null,
       })
     }
-    return withAdapterHeaders(NextResponse.json({ ok: true }))
+    return withAdapterHeaders(
+      withOperationMetadata(
+        NextResponse.json({ ok: true }),
+        logEntry,
+        { resourceKind: 'customers.activity', resourceId: parsed.id },
+      ),
+    )
   } catch (err) {
-    if (err instanceof CrudHttpError) {
+    if (isCrudHttpError(err)) {
       return withAdapterHeaders(NextResponse.json(err.body, { status: err.status }))
     }
     if (err instanceof z.ZodError) {

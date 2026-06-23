@@ -14,6 +14,7 @@ import {
 import { Button } from '@open-mercato/ui/primitives/button'
 import { apiCall } from '@open-mercato/ui/backend/utils/apiCall'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
+import { useDialogKeyHandler } from '@open-mercato/ui/hooks/useDialogKeyHandler'
 
 type Props = {
   open: boolean
@@ -40,7 +41,11 @@ export default function McpConfigDialog({ open, onOpenChange, mcpUrl }: Props) {
     setIsGenerating(true)
     setError(null)
     try {
-      const res = await apiCall<ApiKeyResponse>('/api/api_keys/keys', {
+      // Use the dedicated MCP-key endpoint so the key inherits the current
+      // user's roles/ACL. A raw POST /api/api_keys/keys assigns no roles, which
+      // produced a key with zero features (the MCP server then exposes only
+      // `context_whoami`).
+      const res = await apiCall<ApiKeyResponse>('/api/ai_assistant/mcp-key', {
         method: 'POST',
         body: JSON.stringify({
           name: `MCP Config - ${new Date().toLocaleDateString()}`,
@@ -87,16 +92,6 @@ export default function McpConfigDialog({ open, onOpenChange, mcpUrl }: Props) {
     }
   }
 
-  const handleKeyDown = React.useCallback(
-    (event: React.KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        event.preventDefault()
-        onOpenChange(false)
-      }
-    },
-    [onOpenChange],
-  )
-
   const handleClose = () => {
     setApiKey(null)
     setError(null)
@@ -104,6 +99,8 @@ export default function McpConfigDialog({ open, onOpenChange, mcpUrl }: Props) {
     setCopiedKey(false)
     onOpenChange(false)
   }
+
+  const handleKeyDown = useDialogKeyHandler({ onCancel: handleClose })
 
   return (
     <Dialog open={open} onOpenChange={handleClose}>
@@ -162,9 +159,9 @@ export default function McpConfigDialog({ open, onOpenChange, mcpUrl }: Props) {
           )}
 
           {apiKey && (
-            <div className="flex items-start gap-2 p-3 bg-amber-50 dark:bg-amber-900/20 rounded-lg border border-amber-200 dark:border-amber-800">
-              <AlertTriangle className="h-4 w-4 text-amber-600 dark:text-amber-400 mt-0.5 shrink-0" />
-              <p className="text-sm text-amber-700 dark:text-amber-300">
+            <div className="flex items-start gap-2 p-3 bg-status-warning-bg rounded-lg border border-status-warning-border">
+              <AlertTriangle className="h-4 w-4 text-status-warning-icon mt-0.5 shrink-0" />
+              <p className="text-sm text-status-warning-text">
                 {t('ai_assistant.mcp.saveKeyWarning')}
               </p>
             </div>

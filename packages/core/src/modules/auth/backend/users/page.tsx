@@ -3,12 +3,13 @@ import * as React from 'react'
 import Link from 'next/link'
 import { useSearchParams } from 'next/navigation'
 import { Page, PageBody } from '@open-mercato/ui/backend/Page'
-import { DataTable } from '@open-mercato/ui/backend/DataTable'
+import { DataTable, type DataTableExportFormat } from '@open-mercato/ui/backend/DataTable'
 import type { ColumnDef, SortingState } from '@tanstack/react-table'
 import type { FilterDef, FilterValues } from '@open-mercato/ui/backend/FilterBar'
 import { Button } from '@open-mercato/ui/primitives/button'
 import { RowActions } from '@open-mercato/ui/backend/RowActions'
-import { apiCall } from '@open-mercato/ui/backend/utils/apiCall'
+import { apiCall, withScopedApiRequestHeaders } from '@open-mercato/ui/backend/utils/apiCall'
+import { buildOptimisticLockHeader } from '@open-mercato/ui/backend/utils/optimisticLock'
 import { raiseCrudError } from '@open-mercato/ui/backend/utils/serverErrors'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
@@ -16,15 +17,18 @@ import { buildOrganizationTreeOptions, formatOrganizationTreeLabel, type Organiz
 import { useOrganizationScopeVersion } from '@open-mercato/shared/lib/frontend/useOrganizationScope'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
 import { useConfirmDialog } from '@open-mercato/ui/backend/confirm-dialog'
+import { ListEmptyState } from '@open-mercato/ui/backend/filters/ListEmptyState'
 
 type Row = {
   id: string
   email: string
+  name: string | null
   organizationId: string | null
   organizationName?: string | null
   tenantId: string | null
   tenantName?: string | null
   roles: string[]
+  updatedAt?: string | null
 }
 
 type FilterOption = { value: string; label: string }
@@ -217,6 +221,12 @@ export default function UsersListPage() {
 
   const filters = React.useMemo<FilterDef[]>(() => [
     {
+      id: 'name',
+      label: t('auth.users.list.filters.name', 'Display name'),
+      type: 'text',
+      placeholder: t('auth.users.list.filters.namePlaceholder', 'Filter by display name'),
+    },
+    {
       id: 'organizationId',
       label: t('auth.users.list.filters.organization', 'Organization'),
       type: 'select',
@@ -258,6 +268,8 @@ export default function UsersListPage() {
 
   const handleFiltersApply = React.useCallback((values: FilterValues) => {
     const next: FilterValues = {}
+    const name = typeof values.name === 'string' ? values.name.trim() : ''
+    if (name) next.name = name
     const org = typeof values.organizationId === 'string' ? values.organizationId.trim() : ''
     if (org) next.organizationId = org
     const rawRoles = Array.isArray(values.roles) ? (values.roles as string[]) : []
@@ -274,17 +286,63 @@ export default function UsersListPage() {
     setPage(1)
   }, [])
 
+  const exportParams = React.useMemo(() => {
+    const name = typeof filterValues.name === 'string' ? filterValues.name.trim() : ''
+    return {
+      page,
+      pageSize: 50,
+      search,
+      name: name.length ? name : undefined,
+      organizationId,
+      roleIds: normalizedRoleIds,
+    }
+  }, [filterValues.name, normalizedRoleIds, organizationId, page, search])
+
+  const exportConfig = React.useMemo(() => ({
+    view: {
+      getUrl: (format: DataTableExportFormat) => {
+        const params = new URLSearchParams()
+        params.set('page', String(exportParams.page))
+        params.set('pageSize', String(exportParams.pageSize))
+        if (exportParams.search) params.set('search', exportParams.search)
+        if (exportParams.name) params.set('name', exportParams.name)
+        if (exportParams.organizationId) params.set('organizationId', exportParams.organizationId)
+        for (const roleId of exportParams.roleIds) params.append('roleId', roleId)
+        params.set('format', format)
+        params.set('exportScope', 'view')
+        return `/api/auth/users?${params.toString()}`
+      },
+    },
+    full: {
+      getUrl: (format: DataTableExportFormat) => {
+        const params = new URLSearchParams()
+        params.set('page', String(exportParams.page))
+        params.set('pageSize', String(exportParams.pageSize))
+        if (exportParams.search) params.set('search', exportParams.search)
+        if (exportParams.name) params.set('name', exportParams.name)
+        if (exportParams.organizationId) params.set('organizationId', exportParams.organizationId)
+        for (const roleId of exportParams.roleIds) params.append('roleId', roleId)
+        params.set('format', format)
+        params.set('exportScope', 'full')
+        params.set('all', 'true')
+        return `/api/auth/users?${params.toString()}`
+      },
+    },
+  }), [exportParams])
+
   const params = React.useMemo(() => {
     const p = new URLSearchParams()
     p.set('page', String(page))
     p.set('pageSize', '50')
     if (search) p.set('search', search)
+    const name = typeof filterValues.name === 'string' ? filterValues.name.trim() : ''
+    if (name) p.set('name', name)
     if (organizationId) p.set('organizationId', organizationId)
     if (normalizedRoleIds.length) {
       for (const id of normalizedRoleIds) p.append('roleId', id)
     }
     return p.toString()
-  }, [page, search, organizationId, normalizedRoleIds])
+  }, [filterValues.name, page, search, organizationId, normalizedRoleIds])
 
   const { data: usersData, isLoading } = useQuery({
     queryKey: ['users', params, scopeVersion],
@@ -315,6 +373,7 @@ export default function UsersListPage() {
   const columns = React.useMemo<ColumnDef<Row>[]>(() => {
     const base: ColumnDef<Row>[] = [
       { accessorKey: 'email', header: 'Email' },
+      { accessorKey: 'name', header: t('auth.users.list.columns.name', 'Display name') },
       { accessorKey: 'organizationName', header: 'Organization' },
       { accessorKey: 'roles', header: 'Roles', cell: ({ row }) => (row.original.roles || []).join(', ') },
     ]
@@ -322,7 +381,7 @@ export default function UsersListPage() {
       base.splice(1, 0, { accessorKey: 'tenantName', header: 'Tenant' })
     }
     return base
-  }, [showTenantColumn])
+  }, [showTenantColumn, t])
 
   const handleDelete = React.useCallback(async (row: Row) => {
     const confirmed = await confirm({
@@ -332,7 +391,10 @@ export default function UsersListPage() {
     if (!confirmed) return
     const deleteErrorMessage = t('auth.users.list.error.delete', 'Failed to delete user')
     try {
-      const call = await apiCall(`/api/auth/users?id=${encodeURIComponent(row.id)}`, { method: 'DELETE' })
+      const call = await withScopedApiRequestHeaders(
+        buildOptimisticLockHeader(row.updatedAt),
+        () => apiCall(`/api/auth/users?id=${encodeURIComponent(row.id)}`, { method: 'DELETE' }),
+      )
       if (!call.ok) {
         await raiseCrudError(call.response, deleteErrorMessage)
       }
@@ -356,6 +418,7 @@ export default function UsersListPage() {
           )}
           columns={columns}
           data={rowsWithOrgNames}
+          exporter={exportConfig}
           searchValue={search}
           onSearchChange={handleSearchChange}
           filters={filters}
@@ -366,6 +429,13 @@ export default function UsersListPage() {
           sorting={sorting}
           onSortingChange={setSorting}
           perspective={{ tableId: 'auth.users.list' }}
+          emptyState={(
+            <ListEmptyState
+              entityName={t('auth.users.list.title', 'Users')}
+              createHref="/backend/users/create"
+              createLabel={t('common.create', 'Create')}
+            />
+          )}
           rowActions={(row) => (
             <RowActions items={[
               { id: 'edit', label: t('common.edit', 'Edit'), href: `/backend/users/${row.id}/edit` },

@@ -3,6 +3,7 @@
 import * as React from 'react'
 import { Loader2, Pencil, X } from 'lucide-react'
 import { Button } from '@open-mercato/ui/primitives/button'
+import { Input } from '@open-mercato/ui/primitives/input'
 import { DictionaryEntrySelect } from '@open-mercato/core/modules/dictionaries/components/DictionaryEntrySelect'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
 import { cn } from '@open-mercato/shared/lib/utils'
@@ -167,7 +168,7 @@ export function AnnualRevenueField({
 
   const containerClasses = React.useMemo(
     () =>
-      cn('group rounded border bg-muted/20 p-3', {
+      cn('group rounded border bg-muted/30 p-3', {
         'cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring': !editing,
       }),
     [editing],
@@ -223,8 +224,7 @@ export function AnnualRevenueField({
             <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
               {t('customers.companies.detail.fields.annualRevenuePlaceholder', 'Enter amount')}
             </label>
-            <input
-              className="w-full rounded-md border px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+            <Input
               value={draftAmount}
               onChange={(event) => {
                 setDraftAmount(event.target.value)
@@ -249,11 +249,12 @@ export function AnnualRevenueField({
               allowInlineCreate={false}
               allowAppearance={false}
               selectClassName="w-full"
+              sortOptions="none"
               disabled={currencyDictionaryLoading}
               showLabelInput={false}
             />
           </div>
-          {error ? <p className="text-xs text-red-600">{error}</p> : null}
+          {error ? <p className="text-xs text-status-error-text">{error}</p> : null}
           <div className="flex items-center gap-2">
             <Button type="button" size="sm" onClick={handleSave} disabled={saving}>
               {saving ? <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" /> : null}

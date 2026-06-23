@@ -14,6 +14,10 @@ import {
 import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
 import type { EmbeddingProviderConfig, EmbeddingProviderId, VectorDriver } from '../../../../vector'
 import { EMBEDDING_PROVIDERS, DEFAULT_EMBEDDING_CONFIG, EmbeddingService } from '../../../../vector'
+import {
+  assertSafeOllamaBaseUrl,
+  UnsafeOllamaBaseUrlError,
+} from '../../../../vector/lib/ollama-url-safety'
 import { searchDebug, searchDebugWarn, searchError } from '../../../../lib/debug'
 import { embeddingsOpenApi } from '../openapi'
 
@@ -177,7 +181,12 @@ export async function POST(req: Request) {
     if (parsed.data.autoIndexingEnabled !== undefined) {
       if (envDisablesAutoIndexing()) {
         return NextResponse.json(
-          { error: t('search.api.errors.autoIndexingDisabled', 'Auto-indexing is disabled via DISABLE_VECTOR_SEARCH_AUTOINDEXING.') },
+          {
+            error: t(
+              'search.api.errors.autoIndexingDisabled',
+              'Auto-indexing is disabled via OM_DISABLE_VECTOR_SEARCH_AUTOINDEXING (legacy alias: DISABLE_VECTOR_SEARCH_AUTOINDEXING).',
+            ),
+          },
           { status: 409 },
         )
       }
@@ -205,6 +214,26 @@ export async function POST(req: Request) {
           { error: t('search.api.errors.providerNotConfigured', `Provider ${providerInfo.name} is not configured. Set ${providerInfo.envKeyRequired} environment variable.`) },
           { status: 400 },
         )
+      }
+
+      if (newConfig.providerId === 'ollama' && newConfig.baseUrl != null) {
+        try {
+          assertSafeOllamaBaseUrl(newConfig.baseUrl)
+        } catch (err) {
+          if (err instanceof UnsafeOllamaBaseUrlError) {
+            return NextResponse.json(
+              {
+                error: t(
+                  'search.api.errors.invalidOllamaBaseUrl',
+                  'Ollama base URL is not allowed. Set OLLAMA_BASE_URL in the environment, or add the host to OM_SEARCH_OLLAMA_BASE_URL_ALLOWLIST.',
+                ),
+                reason: err.reason,
+              },
+              { status: 400 },
+            )
+          }
+          throw err
+        }
       }
 
       const change = detectConfigChange(

@@ -121,6 +121,7 @@ export function OrderEditingSettings() {
         orderCustomerEditableStatuses: customerStatuses,
         orderAddressEditableStatuses: addressStatuses,
       }
+      // optimistic-lock-exempt: single-row tenant order-editing settings blob — no per-record version / concurrent record edit
       const call = await apiCall<SettingsResponse>('/api/sales/settings/order-editing', {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
@@ -180,7 +181,7 @@ export function OrderEditingSettings() {
                     <span className="truncate" title={status.label || status.value}>
                       {status.label || status.value}
                     </span>
-                    <Badge variant="outline" className="ml-auto text-[11px] uppercase tracking-wide">
+                    <Badge variant="outline" className="ml-auto text-overline uppercase tracking-wide">
                       {status.value}
                     </Badge>
                   </label>

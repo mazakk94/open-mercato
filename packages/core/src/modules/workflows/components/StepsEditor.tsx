@@ -4,6 +4,13 @@ import * as React from 'react'
 import { Button } from '@open-mercato/ui/primitives/button'
 import { Input } from '@open-mercato/ui/primitives/input'
 import { Label } from '@open-mercato/ui/primitives/label'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@open-mercato/ui/primitives/select'
 import { Textarea } from '@open-mercato/ui/primitives/textarea'
 import { Trash2, Plus, ChevronUp, ChevronDown } from 'lucide-react'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
@@ -165,18 +172,21 @@ export function StepsEditor({ value = [], onChange, error }: StepsEditorProps) {
                   <Label htmlFor={`step-${index}-type`} className="text-xs">
                     {t('workflows.steps.stepType')} *
                   </Label>
-                  <select
-                    id={`step-${index}-type`}
+                  <Select
                     value={step.stepType}
-                    onChange={(e) => updateStep(index, 'stepType', e.target.value)}
-                    className="mt-1 w-full px-3 py-2 border border-gray-300 rounded-md text-sm"
+                    onValueChange={(value) => updateStep(index, 'stepType', value)}
                   >
-                    {STEP_TYPES.map((type) => (
-                      <option key={type.value} value={type.value}>
-                        {t(`workflows.steps.types.${type.value}`)}
-                      </option>
-                    ))}
-                  </select>
+                    <SelectTrigger id={`step-${index}-type`} className="mt-1">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {STEP_TYPES.map((type) => (
+                        <SelectItem key={type.value} value={type.value}>
+                          {t(`workflows.steps.types.${type.value}`)}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
                 </div>
                 <div>
                   <Label htmlFor={`step-${index}-timeout`} className="text-xs">
@@ -192,6 +202,42 @@ export function StepsEditor({ value = [], onChange, error }: StepsEditorProps) {
                   />
                 </div>
               </div>
+
+              {step.stepType === 'WAIT_FOR_TIMER' && (
+                <div className="grid grid-cols-1 sm:grid-cols-[1fr_auto_1fr] gap-3 items-end">
+                  <div>
+                    <Label htmlFor={`step-${index}-duration`} className="text-xs">
+                      {t('workflows.activities.waitDuration')}
+                    </Label>
+                    <Input
+                      id={`step-${index}-duration`}
+                      value={step.config?.duration || ''}
+                      onChange={(e) => updateStep(index, 'config', { ...step.config, duration: e.target.value, until: undefined })}
+                      placeholder={t('workflows.activities.waitDurationPlaceholder')}
+                      className="mt-1"
+                    />
+                    <p className="text-xs text-muted-foreground mt-1">
+                      {t('workflows.activities.waitDurationDescription')}
+                    </p>
+                  </div>
+                  <span className="text-xs text-muted-foreground pb-6">{t('workflows.activities.waitOr')}</span>
+                  <div>
+                    <Label htmlFor={`step-${index}-until`} className="text-xs">
+                      {t('workflows.activities.waitUntil')}
+                    </Label>
+                    <Input
+                      id={`step-${index}-until`}
+                      type="datetime-local"
+                      value={step.config?.until ? step.config.until.slice(0, 16) : ''}
+                      onChange={(e) => updateStep(index, 'config', { ...step.config, until: e.target.value ? new Date(e.target.value).toISOString() : undefined, duration: undefined })}
+                      className="mt-1"
+                    />
+                    <p className="text-xs text-muted-foreground mt-1">
+                      {t('workflows.activities.waitUntilDescription')}
+                    </p>
+                  </div>
+                </div>
+              )}
 
               <div>
                 <Label htmlFor={`step-${index}-description`} className="text-xs">

@@ -3,6 +3,7 @@
 import Image from 'next/image'
 import Link from 'next/link'
 import { useState } from 'react'
+import { useSearchParams } from 'next/navigation'
 import { useLocale, useT } from '@open-mercato/shared/lib/i18n/context'
 import { translateWithFallback } from '@open-mercato/shared/lib/i18n/translate'
 import { formatPasswordRequirements, getPasswordPolicy } from '@open-mercato/shared/lib/auth/passwordPolicy'
@@ -12,6 +13,8 @@ import { Button } from '@open-mercato/ui/primitives/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@open-mercato/ui/primitives/card'
 import { Checkbox } from '@open-mercato/ui/primitives/checkbox'
 import { Input } from '@open-mercato/ui/primitives/input'
+import { EmailInput } from '@open-mercato/ui/primitives/email-input'
+import { PasswordInput } from '@open-mercato/ui/primitives/password-input'
 import { Label } from '@open-mercato/ui/primitives/label'
 
 type SubmissionState = 'idle' | 'loading' | 'success'
@@ -29,6 +32,7 @@ export default function OnboardingPageClient({ onboardingEnabled }: Props) {
   const translate = (key: string, fallback: string, params?: Record<string, string | number>) =>
     translateWithFallback(t, key, fallback, params)
   const locale = useLocale()
+  const searchParams = useSearchParams()
   const [state, setState] = useState<SubmissionState>('idle')
   const [globalError, setGlobalError] = useState<string | null>(null)
   const [fieldErrors, setFieldErrors] = useState<FieldErrors>({})
@@ -150,12 +154,40 @@ export default function OnboardingPageClient({ onboardingEnabled }: Props) {
   const onboardingDisabled = !onboardingEnabled
   const submitting = state === 'loading'
   const disabled = onboardingDisabled || submitting || state === 'success'
+  const verifyStatusMessages: Record<string, string> = {
+    redirect_misconfigured: translate(
+      'onboarding.verifyStatus.redirectMisconfigured',
+      'The verification link cannot redirect safely because APP_URL does not match the URL that handled the request. Check APP_URL and APP_ALLOWED_ORIGINS, then open the verification link again.',
+    ),
+    origin_not_allowed: translate(
+      'onboarding.verifyStatus.originNotAllowed',
+      'The verification link was opened from an origin that is not allowed. Check APP_URL and APP_ALLOWED_ORIGINS, then open the verification link again.',
+    ),
+    url_not_configured: translate(
+      'onboarding.verifyStatus.urlNotConfigured',
+      'Onboarding verification is not configured. APP_URL must be set before verification links can be used.',
+    ),
+    already_exists: translate(
+      'onboarding.verifyStatus.alreadyExists',
+      'We already have an account with this email. Try signing in or resetting your password.',
+    ),
+    invalid: translate(
+      'onboarding.verifyStatus.invalid',
+      'The verification link is invalid or expired. Submit the onboarding form again to receive a new link.',
+    ),
+    error: translate(
+      'onboarding.verifyStatus.error',
+      'We could not complete verification. Please try again or contact support.',
+    ),
+  }
+  const verifyStatus = searchParams.get('status') ?? ''
+  const verifyStatusError = verifyStatusMessages[verifyStatus] ?? null
 
   return (
-    <div className="relative flex min-h-svh items-center justify-center bg-muted/40 px-4 pb-24">
+    <div className="relative flex min-h-svh items-center justify-center bg-muted/50 px-4 pb-24">
       <Card className="relative w-full max-w-lg overflow-hidden shadow-lg">
         {onboardingDisabled ? (
-          <div className="absolute inset-0 z-10 flex items-center justify-center rounded-lg bg-background/70 p-6 backdrop-blur-[2px]">
+          <div className="absolute inset-0 z-10 flex items-center justify-center rounded-lg bg-background/80 p-6 backdrop-blur-[2px]">
             <div
               className="max-w-sm rounded-xl border border-border/70 bg-background/95 px-5 py-4 text-center shadow-sm"
               role="alert"
@@ -202,24 +234,22 @@ export default function OnboardingPageClient({ onboardingEnabled }: Props) {
               </p>
             </div>
           )}
-          {state !== 'success' && globalError && (
+          {state !== 'success' && (globalError || verifyStatusError) && (
             <div className="mb-4 rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700" role="alert" aria-live="assertive">
-              {globalError}
+              {globalError || verifyStatusError}
             </div>
           )}
           <form className="grid gap-4" onSubmit={onSubmit} noValidate>
             <div className="grid gap-1">
               <Label htmlFor="email">{translate('onboarding.form.email', 'Work email')}</Label>
-              <Input
+              <EmailInput
                 id="email"
                 name="email"
-                type="email"
                 required
                 disabled={disabled}
-                autoComplete="email"
                 aria-invalid={Boolean(fieldErrors.email)}
                 aria-describedby={fieldErrors.email ? 'email-error' : undefined}
-                className={fieldErrors.email ? 'border-red-500 focus-visible:ring-red-500' : undefined}
+                className={fieldErrors.email ? 'border-red-500 aria-invalid:ring-destructive' : undefined}
               />
               {fieldErrors.email && (
                 <p id="email-error" className="text-xs text-red-600">{fieldErrors.email}</p>
@@ -237,7 +267,7 @@ export default function OnboardingPageClient({ onboardingEnabled }: Props) {
                   autoComplete="given-name"
                   aria-invalid={Boolean(fieldErrors.firstName)}
                   aria-describedby={fieldErrors.firstName ? 'firstName-error' : undefined}
-                  className={fieldErrors.firstName ? 'border-red-500 focus-visible:ring-red-500' : undefined}
+                  className={fieldErrors.firstName ? 'border-red-500 aria-invalid:ring-destructive' : undefined}
                 />
                 {fieldErrors.firstName && (
                   <p id="firstName-error" className="text-xs text-red-600">{fieldErrors.firstName}</p>
@@ -254,7 +284,7 @@ export default function OnboardingPageClient({ onboardingEnabled }: Props) {
                   autoComplete="family-name"
                   aria-invalid={Boolean(fieldErrors.lastName)}
                   aria-describedby={fieldErrors.lastName ? 'lastName-error' : undefined}
-                  className={fieldErrors.lastName ? 'border-red-500 focus-visible:ring-red-500' : undefined}
+                  className={fieldErrors.lastName ? 'border-red-500 aria-invalid:ring-destructive' : undefined}
                 />
                 {fieldErrors.lastName && (
                   <p id="lastName-error" className="text-xs text-red-600">{fieldErrors.lastName}</p>
@@ -272,7 +302,7 @@ export default function OnboardingPageClient({ onboardingEnabled }: Props) {
                 autoComplete="organization"
                 aria-invalid={Boolean(fieldErrors.organizationName)}
                 aria-describedby={fieldErrors.organizationName ? 'organizationName-error' : undefined}
-                className={fieldErrors.organizationName ? 'border-red-500 focus-visible:ring-red-500' : undefined}
+                className={fieldErrors.organizationName ? 'border-red-500 aria-invalid:ring-destructive' : undefined}
               />
               {fieldErrors.organizationName && (
                 <p id="organizationName-error" className="text-xs text-red-600">{fieldErrors.organizationName}</p>
@@ -280,17 +310,16 @@ export default function OnboardingPageClient({ onboardingEnabled }: Props) {
             </div>
             <div className="grid gap-1">
               <Label htmlFor="password">{translate('onboarding.form.password', 'Password')}</Label>
-              <Input
+              <PasswordInput
                 id="password"
                 name="password"
-                type="password"
                 required
                 disabled={disabled}
                 autoComplete="new-password"
                 minLength={passwordPolicy.minLength}
                 aria-invalid={Boolean(fieldErrors.password)}
                 aria-describedby={fieldErrors.password ? 'password-error' : undefined}
-                className={fieldErrors.password ? 'border-red-500 focus-visible:ring-red-500' : undefined}
+                className={fieldErrors.password ? 'border-red-500 aria-invalid:ring-destructive' : undefined}
               />
               {passwordDescription ? (
                 <p className="text-xs text-muted-foreground">{passwordDescription}</p>
@@ -301,16 +330,15 @@ export default function OnboardingPageClient({ onboardingEnabled }: Props) {
             </div>
             <div className="grid gap-1">
               <Label htmlFor="confirmPassword">{translate('onboarding.form.confirmPassword', 'Confirm password')}</Label>
-              <Input
+              <PasswordInput
                 id="confirmPassword"
                 name="confirmPassword"
-                type="password"
                 required
                 disabled={disabled}
                 autoComplete="new-password"
                 aria-invalid={Boolean(fieldErrors.confirmPassword)}
                 aria-describedby={fieldErrors.confirmPassword ? 'confirmPassword-error' : undefined}
-                className={fieldErrors.confirmPassword ? 'border-red-500 focus-visible:ring-red-500' : undefined}
+                className={fieldErrors.confirmPassword ? 'border-red-500 aria-invalid:ring-destructive' : undefined}
               />
               {fieldErrors.confirmPassword && (
                 <p id="confirmPassword-error" className="text-xs text-red-600">{fieldErrors.confirmPassword}</p>
@@ -383,7 +411,7 @@ export default function OnboardingPageClient({ onboardingEnabled }: Props) {
             <Button
               type="submit"
               disabled={disabled}
-              className="mt-2 h-11 bg-foreground text-background transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+              className="mt-2 h-11 bg-foreground text-background transition hover:opacity-80 disabled:cursor-not-allowed disabled:opacity-50"
             >
               {submitting
                 ? translate('onboarding.form.loading', 'Sending...')

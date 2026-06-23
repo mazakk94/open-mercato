@@ -1,5 +1,6 @@
 import type { EntityId } from '@open-mercato/shared/modules/entities'
 import type { Profiler } from '../profiler'
+import type { ResolvedCustomFieldDefinitions } from '../crud/custom-field-definition-index'
 
 export type FilterOp = 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte' | 'in' | 'nin' | 'like' | 'ilike' | 'exists'
 
@@ -100,6 +101,20 @@ export type QueryOptions = {
   tenantId?: string // enforce tenant scope
   // Optional list of organization ids to scope results. Takes precedence over organizationId.
   organizationIds?: string[]
+  /**
+   * When true, the engine does not apply default `organization_id` / `tenant_id` equality guards.
+   *
+   * Callers MUST encode full visibility in `filters` (for example with `$or` of scoped branches)
+   * and MUST fail closed when the authenticated principal lacks a resolvable tenant/org, otherwise
+   * queries return cross-tenant rows.
+   *
+   * When this flag is set, the hybrid query engine delegates to the basic engine, which means
+   * custom-field (`cf:*`) filters/sorts, `search_tokens` fulltext filtering, and vector-search
+   * branches are BYPASSED. Only use this on entities whose scoping does not match the standard
+   * `organization_id = X AND tenant_id = Y` shape and which do not rely on custom-field/search
+   * features.
+   */
+  omitAutomaticTenantOrgScope?: boolean
   // Soft-delete behavior: when false (default), rows with non-null deleted_at
   // are excluded if the base table has that column. Set true to include them.
   withDeleted?: boolean
@@ -110,6 +125,16 @@ export type QueryOptions = {
   // Used by the search indexing pipeline to prevent feedback loops where indexing triggers
   // re-indexing indefinitely.
   skipAutoReindex?: boolean
+  /**
+   * Force routing this query to custom-entity doc storage (`custom_entities_storage`)
+   * instead of classifying the entity automatically. Automatic classification routes
+   * ids backed by a registered ORM table to that base table, so surfaces that manage
+   * doc records for ids that are ALSO table-backed (e.g. the entities records browser
+   * reading a module-declared custom entity such as `example:todo`) must set this flag.
+   * Honored by the hybrid query engine only; `BasicQueryEngine` has no doc-storage
+   * reader and ignores it.
+   */
+  forceCustomEntityStorage?: boolean
   // Optional UMES query extensions context. When provided, the engine will
   // emit sync lifecycle events and apply query-level enrichers.
   extensions?: QueryExtensionsConfig
@@ -123,8 +148,16 @@ export type PartialIndexWarning = {
   scope?: 'scoped' | 'global'
 }
 
+export type EncryptedSortRowCapWarning = {
+  entity: EntityId
+  sortFields: string[]
+  maxRows: number
+  totalMatched: number
+}
+
 export type QueryResultMeta = {
   partialIndexWarning?: PartialIndexWarning
+  encryptedSortRowCapWarning?: EncryptedSortRowCapWarning
 }
 
 export type QueryResult<T = any> = {
@@ -133,6 +166,14 @@ export type QueryResult<T = any> = {
   pageSize: number
   total: number
   meta?: QueryResultMeta
+  /**
+   * Custom-field definitions the engine resolved while building this result
+   * (only present when `includeCustomFields: true`). Lets the CRUD factory
+   * decorate list rows without reloading definitions from the DB (issue #2133).
+   * Internal contract — additive and optional; callers must treat absence as a
+   * cue to load definitions themselves.
+   */
+  customFieldDefinitions?: ResolvedCustomFieldDefinitions
 }
 
 export interface QueryEngine {

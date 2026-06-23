@@ -1,16 +1,25 @@
 "use client"
 
 import * as React from 'react'
-import dynamic from 'next/dynamic'
 import { FileCode, Loader2, Mail, Pencil, Phone, X } from 'lucide-react'
 import type { PluggableList } from 'unified'
 import { PhoneNumberField } from '@open-mercato/ui/backend/inputs/PhoneNumberField'
 import { Button } from '@open-mercato/ui/primitives/button'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@open-mercato/ui/primitives/select'
 import { Textarea } from '@open-mercato/ui/primitives/textarea'
+import { DatePicker } from '@open-mercato/ui/primitives/date-picker'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
 import { cn } from '@open-mercato/shared/lib/utils'
+import { format } from 'date-fns/format'
 import { LoadingMessage } from './LoadingMessage'
 import { mapCrudServerErrorToFormErrors } from '../utils/serverErrors'
+import { MarkdownPreview } from '../markdown'
 
 function resolveInlineErrorMessage(err: unknown, fallbackMessage: string): string {
   const { message, fieldErrors } = mapCrudServerErrorToFormErrors(err)
@@ -35,6 +44,19 @@ function resolveInlineErrorMessage(err: unknown, fallbackMessage: string): strin
 type EditorVariant = 'default' | 'muted' | 'plain'
 
 export type InlineFieldType = 'text' | 'email' | 'tel' | 'url'
+
+const ALLOWED_INLINE_URL_PROTOCOLS = new Set(['http:', 'https:', 'mailto:', 'tel:'])
+
+export function resolveSafeInlineUrlHref(value: string): string | null {
+  const trimmed = value.trim()
+  if (!trimmed.length) return null
+  try {
+    const parsed = new URL(trimmed)
+    return ALLOWED_INLINE_URL_PROTOCOLS.has(parsed.protocol) ? trimmed : null
+  } catch {
+    return null
+  }
+}
 
 export type InlineTextEditorProps = {
   label: string
@@ -117,7 +139,7 @@ export function InlineTextEditor({
   const containerClasses = cn(
     'group overflow-hidden',
     variant === 'muted'
-      ? 'relative rounded border bg-muted/20 p-3'
+      ? 'relative rounded border bg-muted/30 p-3'
       : variant === 'plain'
         ? 'relative flex items-center gap-3 rounded-none border-0 p-0'
         : 'rounded-lg border p-4',
@@ -256,8 +278,12 @@ export function InlineTextEditor({
       )
     }
     if (resolvedType === 'url') {
+      const safeHref = resolveSafeInlineUrlHref(baseValue)
+      if (!safeHref) {
+        return <p className={textClass}>{baseValue}</p>
+      }
       return (
-        <a className={textClass} href={baseValue} target="_blank" rel="noreferrer">
+        <a className={textClass} href={safeHref} target="_blank" rel="noopener noreferrer">
           {baseValue}
         </a>
       )
@@ -292,33 +318,82 @@ export function InlineTextEditor({
                 }
               }}
             >
-              {resolvedType === 'tel' ? (
-                <PhoneNumberField
-                  value={draft.length ? draft : undefined}
-                  onValueChange={(next) => {
-                    if (error) setError(null)
-                    setDraft(next ?? '')
-                  }}
-                  placeholder={placeholder}
-                  autoFocus
-                  disabled={saving}
-                  minDigits={7}
-                />
-              ) : (
-              <input
-                className="w-full rounded-md border px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-                value={draft}
-                onChange={(event) => {
-                  if (error) setError(null)
-                  setDraft(event.target.value)
-                }}
-                placeholder={placeholder}
-                type={inputType ?? resolvedType}
-                autoFocus
-              />
-              )}
+              {(() => {
+                const lowerType = (inputType ?? resolvedType ?? '').toLowerCase()
+                const isDate = lowerType === 'date'
+                const isDateTime = lowerType === 'datetime-local' || lowerType === 'datetime'
+                if (resolvedType === 'tel') {
+                  return (
+                    <PhoneNumberField
+                      value={draft.length ? draft : undefined}
+                      onValueChange={(next) => {
+                        if (error) setError(null)
+                        setDraft(next ?? '')
+                      }}
+                      placeholder={placeholder}
+                      autoFocus
+                      disabled={saving}
+                      minDigits={7}
+                    />
+                  )
+                }
+                if (isDate || isDateTime) {
+                  let parsed: Date | null = null
+                  if (draft && draft.length) {
+                    const candidate = new Date(draft)
+                    if (!Number.isNaN(candidate.getTime())) parsed = candidate
+                  }
+                  return (
+                    <DatePicker
+                      value={parsed}
+                      onChange={(date) => {
+                        if (error) setError(null)
+                        const formatted = !date
+                          ? ''
+                          : isDateTime
+                            ? format(date, "yyyy-MM-dd'T'HH:mm")
+                            : format(date, 'yyyy-MM-dd')
+                        setDraft(formatted)
+                        setSaving(true)
+                        ;(async () => {
+                          try {
+                            await onSave(formatted.length ? formatted : null)
+                            setEditingSafe(false)
+                          } catch (err) {
+                            setError(resolveInlineErrorMessage(err, fallbackError))
+                          } finally {
+                            setSaving(false)
+                          }
+                        })()
+                      }}
+                      withTime={isDateTime}
+                      footer="apply-cancel"
+                      placeholder={placeholder}
+                      disabled={saving}
+                    />
+                  )
+                }
+                return (
+                  <input
+                    className="w-full rounded-md border px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    value={draft}
+                    onChange={(event) => {
+                      if (error) setError(null)
+                      setDraft(event.target.value)
+                    }}
+                    placeholder={placeholder}
+                    type={inputType ?? resolvedType}
+                    autoFocus
+                  />
+                )
+              })()}
               {error ? <p className="text-xs text-destructive">{error}</p> : null}
               {renderBelowInput ? renderBelowInput({ draft, resolvedType, error, saving }) : null}
+              {(() => {
+                const lowerType = (inputType ?? resolvedType ?? '').toLowerCase()
+                const isDateLike = lowerType === 'date' || lowerType === 'datetime-local' || lowerType === 'datetime'
+                if (isDateLike) return null
+                return (
               <div className="flex items-center gap-2">
                 <Button type="submit" size="sm" disabled={saving}>
                   {saving ? <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" /> : null}
@@ -328,6 +403,8 @@ export function InlineTextEditor({
                   {t('ui.detail.inline.cancel', 'Cancel')}
                 </Button>
               </div>
+                )
+              })()}
             </form>
           ) : (
             <div className={variant === 'plain' ? '' : 'mt-1'}>{displayContent}</div>
@@ -366,50 +443,9 @@ export type InlineMultilineEditorProps = {
   renderDisplay?: (params: { value: string | null | undefined; emptyLabel: string }) => React.ReactNode
 }
 
-type UiMarkdownEditorProps = {
-  value?: string
-  height?: number
-  onChange?: (value?: string) => void
-  previewOptions?: { remarkPlugins?: unknown[] }
-}
-
-type MarkdownPreviewProps = {
-  children: string
-  className?: string
-  remarkPlugins?: PluggableList
-}
-
-const isTestEnv = typeof process !== 'undefined' && process.env.NODE_ENV === 'test'
-
-function MarkdownEditorFallback() {
-  const t = useT()
-  return (
-    <LoadingMessage label={t('ui.detail.inline.editorLoading', 'Loading editor…')} className="min-h-[200px] justify-center" />
-  )
-}
-
-const MarkdownEditorTestStub: React.ComponentType<UiMarkdownEditorProps> = ({ value, onChange }) => (
-  <Textarea
-    data-testid="markdown-editor"
-    rows={8}
-    value={value ?? ''}
-    onChange={(event) => onChange?.(event.target.value)}
-  />
-)
-
-const MarkdownEditorComponent: React.ComponentType<UiMarkdownEditorProps> = isTestEnv
-  ? MarkdownEditorTestStub
-  : (dynamic(() => import('@uiw/react-md-editor'), {
-      ssr: false,
-      loading: () => <MarkdownEditorFallback />,
-    }) as unknown as React.ComponentType<UiMarkdownEditorProps>)
-
-const MarkdownPreviewComponent: React.ComponentType<MarkdownPreviewProps> = isTestEnv
-  ? ({ children, className }) => <div className={className}>{children}</div>
-  : (dynamic(() => import('react-markdown').then((mod) => mod.default as React.ComponentType<MarkdownPreviewProps>), {
-      ssr: false,
-      loading: () => null,
-    }) as unknown as React.ComponentType<MarkdownPreviewProps>)
+const isTestEnv =
+  typeof process !== 'undefined' &&
+  (process.env.NODE_ENV === 'test' || typeof process.env.JEST_WORKER_ID !== 'undefined')
 
 let markdownPluginsPromise: Promise<PluggableList> | null = null
 
@@ -443,7 +479,6 @@ export function InlineMultilineEditor({
   const [saving, setSaving] = React.useState(false)
   const [isMarkdownEnabled, setIsMarkdownEnabled] = React.useState(true)
   const textareaRef = React.useRef<HTMLTextAreaElement | null>(null)
-  const markdownEditorRef = React.useRef<HTMLDivElement | null>(null)
   const [markdownPlugins, setMarkdownPlugins] = React.useState<PluggableList>([])
   const fallbackError = React.useMemo(
     () => t('ui.detail.inline.error', 'Failed to save value.'),
@@ -473,14 +508,6 @@ export function InlineMultilineEditor({
 
   React.useEffect(() => {
     if (!editing) return
-    if (isMarkdownEnabled) {
-      const element = markdownEditorRef.current?.querySelector('textarea')
-      if (!element) return
-      window.requestAnimationFrame(() => {
-        element.focus()
-      })
-      return
-    }
     const element = textareaRef.current
     if (!element) return
     window.requestAnimationFrame(() => {
@@ -547,7 +574,7 @@ export function InlineMultilineEditor({
 
   const containerClasses = cn(
     'group rounded-lg border p-4',
-    variant === 'muted' ? 'bg-muted/20' : null,
+    variant === 'muted' ? 'bg-muted/30' : null,
     activateOnClick && !editing ? 'cursor-pointer' : null,
     containerClassName ?? null,
   )
@@ -607,42 +634,20 @@ export function InlineMultilineEditor({
                 }
               }}
             >
-              {isMarkdownEnabled ? (
-                <div
-                  ref={markdownEditorRef}
-                  className={cn(
-                    'w-full rounded-md border border-muted-foreground/30 bg-background p-2',
-                    saving ? 'pointer-events-none opacity-75' : null,
-                  )}
-                >
-                  <div data-color-mode="light" className="w-full">
-                    <MarkdownEditorComponent
-                      value={draft}
-                      height={220}
-                      onChange={(nextValue) => {
-                        if (error) setError(null)
-                        setDraft(typeof nextValue === 'string' ? nextValue : '')
-                      }}
-                      previewOptions={{ remarkPlugins: markdownPlugins }}
-                    />
-                  </div>
-                </div>
-              ) : (
-                <Textarea
-                  ref={textareaRef}
-                  rows={3}
-                  className="w-full resize-none overflow-hidden rounded-md border px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-                  placeholder={placeholder}
-                  value={draft}
-                  onChange={(event) => {
-                    if (error) setError(null)
-                    setDraft(event.target.value)
-                  }}
-                  onInput={(event) => adjustTextareaSize(event.currentTarget)}
-                  autoFocus
-                  disabled={saving}
-                />
-              )}
+              <Textarea
+                ref={textareaRef}
+                rows={isMarkdownEnabled ? 8 : 3}
+                className="w-full resize-none overflow-hidden rounded-md border px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                placeholder={placeholder}
+                value={draft}
+                onChange={(event) => {
+                  if (error) setError(null)
+                  setDraft(event.target.value)
+                }}
+                onInput={(event) => adjustTextareaSize(event.currentTarget)}
+                autoFocus
+                disabled={saving}
+              />
               {error ? <p className="text-xs text-destructive">{error}</p> : null}
               <div className="flex items-center gap-2">
                 <Button type="submit" size="sm" disabled={saving}>
@@ -691,12 +696,12 @@ export function InlineMultilineEditor({
               {renderDisplay ? (
                 renderDisplay({ value, emptyLabel })
               ) : value && value.length ? (
-                <MarkdownPreviewComponent
+                <MarkdownPreview
                   remarkPlugins={markdownPlugins}
                   className="prose prose-sm max-w-none text-foreground [&>*]:my-2 [&>*:last-child]:mb-0 [&_pre]:rounded-md [&_pre]:bg-muted [&_pre]:p-3 [&_code]:rounded [&_code]:bg-muted [&_code]:px-1 [&_code]:py-0.5"
                 >
                   {value}
-                </MarkdownPreviewComponent>
+                </MarkdownPreview>
               ) : (
                 <span className="text-muted-foreground">{emptyLabel}</span>
               )}
@@ -819,18 +824,21 @@ export function InlineSelectEditor({
               {renderEditor ? (
                 renderEditor({ value: draft, onChange: setDraft })
               ) : (
-                <select
-                  className="w-full rounded-md border px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-                  value={draft}
-                  onChange={(event) => setDraft(event.target.value)}
+                <Select
+                  value={draft || undefined}
+                  onValueChange={(next) => setDraft(next ?? '')}
                 >
-                  <option value="">{t('ui.detail.inline.select.placeholder', 'Not set')}</option>
-                  {options.map((option) => (
-                    <option key={option.value} value={option.value}>
-                      {option.label}
-                    </option>
-                  ))}
-                </select>
+                  <SelectTrigger>
+                    <SelectValue placeholder={t('ui.detail.inline.select.placeholder', 'Not set')} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {options.map((option) => (
+                      <SelectItem key={option.value} value={option.value}>
+                        {option.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
               )}
               <div className="flex items-center gap-2">
                 <Button type="button" size="sm" onClick={() => void handleSave()} disabled={saving}>

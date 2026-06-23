@@ -3,6 +3,7 @@ import bcrypt from 'bcryptjs'
 import { slugify } from '@open-mercato/shared/lib/slugify'
 import { CrudHttpError } from '@open-mercato/shared/lib/crud/errors'
 import { normalizeCustomFieldResponse } from '@open-mercato/shared/lib/custom-fields/normalize'
+import { parseDecryptedFieldValue } from '@open-mercato/shared/lib/encryption/tenantDataEncryptionService'
 import type { EntityManager } from '@mikro-orm/postgresql'
 import { getPaymentGatewayDescriptor } from '@open-mercato/shared/modules/payment_gateways/types'
 import { CheckoutLink, CheckoutLinkTemplate, CheckoutTransaction } from '../data/entities'
@@ -50,6 +51,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isCheckoutLinkRecord(record: CheckoutLinkTemplate | CheckoutLink): record is CheckoutLink {
   return typeof (record as { slug?: unknown }).slug === 'string'
+}
+
+function normalizeMaybeStringifiedJsonObject(value: unknown): Record<string, unknown> {
+  if (isRecord(value)) return value
+  if (typeof value !== 'string') return {}
+
+  const parsed = parseDecryptedFieldValue(value)
+  return isRecord(parsed) ? parsed : {}
 }
 
 export function pickExplicitParsedOverrides<TInput extends Record<string, unknown>>(
@@ -112,6 +121,20 @@ export function toMoneyString(value: string | number | null | undefined): string
 
 export { normalizeOptionalString, buildCheckoutAttachmentPreviewUrl } from './client-utils'
 
+function normalizeJsonRecord(value: unknown): Record<string, unknown> {
+  if (!value) return {}
+  if (typeof value === 'object' && !Array.isArray(value)) return value as Record<string, unknown>
+  if (typeof value !== 'string') return {}
+  try {
+    const parsed = JSON.parse(value)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {}
+  } catch {
+    return {}
+  }
+}
+
 export function deriveConfiguredCurrencies(input: TemplateOrLinkInput): string[] {
   const currencies = new Set<string>()
   if (input.pricingMode === 'fixed' && input.fixedPriceCurrencyCode) currencies.add(input.fixedPriceCurrencyCode)
@@ -147,7 +170,7 @@ export function toTemplateOrLinkMutationInput(
     customAmountCurrencyCode: record.customAmountCurrencyCode ?? null,
     priceListItems: record.priceListItems ?? null,
     gatewayProviderKey: record.gatewayProviderKey ?? '',
-    gatewaySettings: record.gatewaySettings ?? {},
+    gatewaySettings: normalizeJsonRecord(record.gatewaySettings),
     customFieldsetCode: record.customFieldsetCode ?? null,
     collectCustomerDetails: record.collectCustomerDetails,
     customerFieldsSchema: (record.customerFieldsSchema ?? []) as CreateTemplateInput['customerFieldsSchema'],
@@ -241,6 +264,17 @@ function normalizeCheckoutAccessSessionVersion(value: Date | string | null | und
   return value instanceof Date ? value.toISOString() : value
 }
 
+// Derive a non-reversible cookie-safe representation of `sessionVersion`
+// so the embedded payload never exposes the raw input (typically the
+// checkout link's bcrypt passwordHash — see #2675). The HMAC keeps
+// rotation semantics intact: any change to the input produces a fresh
+// digest, invalidating outstanding cookies.
+function deriveCheckoutAccessSessionVersion(value: Date | string | null | undefined): string | null {
+  const normalized = normalizeCheckoutAccessSessionVersion(value)
+  if (normalized == null) return null
+  return createHmac('sha256', getCheckoutAccessTokenSecret()).update(normalized).digest('base64url')
+}
+
 export function signCheckoutAccessToken(
   slug: string,
   options?: { linkId?: string | null; sessionVersion?: Date | string | null },
@@ -248,7 +282,7 @@ export function signCheckoutAccessToken(
   const payload = Buffer.from(JSON.stringify({
     slug,
     linkId: options?.linkId ?? null,
-    sessionVersion: normalizeCheckoutAccessSessionVersion(options?.sessionVersion),
+    sessionVersion: deriveCheckoutAccessSessionVersion(options?.sessionVersion),
     exp: Date.now() + (60 * 60 * 1000),
   }), 'utf-8').toString('base64url')
   const signature = createHmac('sha256', getCheckoutAccessTokenSecret()).update(payload).digest('base64url')
@@ -276,7 +310,7 @@ export function verifyCheckoutAccessToken(
     if (parsed.slug !== slug || typeof parsed.exp !== 'number' || parsed.exp <= Date.now()) return false
     if (options?.linkId && parsed.linkId !== options.linkId) return false
     if (options?.sessionVersion) {
-      return parsed.sessionVersion === normalizeCheckoutAccessSessionVersion(options.sessionVersion)
+      return parsed.sessionVersion === deriveCheckoutAccessSessionVersion(options.sessionVersion)
     }
     return true
   } catch {
@@ -316,6 +350,17 @@ export function applyTerminalTransactionState(
   }
 }
 
+// Security model: the consent proof is a GDPR/consent audit trail, so `markdownHash`
+// must be tamper-evident. It is an HMAC keyed with the server-side checkout secret
+// (never a public constant), which an attacker who can edit a stored consent row
+// cannot recompute without the secret. The document key is folded into the HMAC
+// message to namespace each document while keeping a single server-held key.
+export function computeConsentMarkdownHash(documentKey: string, markdown: string): string {
+  return createHmac('sha256', getCheckoutAccessTokenSecret())
+    .update(`${documentKey}\n${markdown}`)
+    .digest('hex')
+}
+
 export function buildConsentProof(link: CheckoutLink, acceptedLegalConsents: PublicSubmitInput['acceptedLegalConsents']) {
   const proof: Record<string, unknown> = {}
   const legalDocuments = link.legalDocuments && typeof link.legalDocuments === 'object'
@@ -330,7 +375,7 @@ export function buildConsentProof(link: CheckoutLink, acceptedLegalConsents: Pub
       title: document.title ?? key,
       required: document.required === true,
       acceptedAt: new Date().toISOString(),
-      markdownHash: createHmac('sha256', key).update(document.markdown).digest('hex'),
+      markdownHash: computeConsentMarkdownHash(key, document.markdown),
     }
   }
   return proof
@@ -407,7 +452,7 @@ export function serializeTemplateOrLink(record: CheckoutLinkTemplate | CheckoutL
     customAmountCurrencyCode: record.customAmountCurrencyCode ?? null,
     priceListItems: record.priceListItems ?? [],
     gatewayProviderKey: record.gatewayProviderKey ?? null,
-    gatewaySettings: record.gatewaySettings ?? {},
+    gatewaySettings: normalizeJsonRecord(record.gatewaySettings),
     customFieldsetCode: record.customFieldsetCode ?? null,
     collectCustomerDetails: record.collectCustomerDetails,
     customerFieldsSchema: record.customerFieldsSchema ?? [],
@@ -455,8 +500,8 @@ export function serializeTransaction(record: CheckoutTransaction, link?: Checkou
     paymentStatus: record.paymentStatus ?? null,
     gatewayTransactionId: record.gatewayTransactionId ?? null,
     selectedPriceItemId: record.selectedPriceItemId ?? null,
-    acceptedLegalConsents: includePii ? (record.acceptedLegalConsents ?? {}) : null,
-    customerData: includePii ? (record.customerData ?? {}) : null,
+    acceptedLegalConsents: includePii ? normalizeMaybeStringifiedJsonObject(record.acceptedLegalConsents) : null,
+    customerData: includePii ? normalizeMaybeStringifiedJsonObject(record.customerData) : null,
     firstName: includePii ? (record.firstName ?? null) : null,
     lastName: includePii ? (record.lastName ?? null) : null,
     email: includePii ? (record.email ?? null) : null,

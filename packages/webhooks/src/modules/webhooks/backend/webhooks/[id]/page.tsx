@@ -6,7 +6,7 @@ import { Page, PageBody } from '@open-mercato/ui/backend/Page'
 import { apiCall } from '@open-mercato/ui/backend/utils/apiCall'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
-import { LoadingMessage, ErrorMessage } from '@open-mercato/ui/backend/detail'
+import { LoadingMessage, ErrorMessage, RecordNotFoundState } from '@open-mercato/ui/backend/detail'
 import { DataTable } from '@open-mercato/ui/backend/DataTable'
 import { useAppEvent } from '@open-mercato/ui/backend/injection/useAppEvent'
 import type { ColumnDef } from '@tanstack/react-table'
@@ -16,7 +16,9 @@ import { FormHeader } from '@open-mercato/ui/backend/forms'
 import { RowActions } from '@open-mercato/ui/backend/RowActions'
 import { CrudForm } from '@open-mercato/ui/backend/CrudForm'
 import { deleteCrud, updateCrud } from '@open-mercato/ui/backend/utils/crud'
-import { Notice } from '@open-mercato/ui/primitives/Notice'
+import { buildOptimisticLockHeader } from '@open-mercato/ui/backend/utils/optimisticLock'
+import { surfaceRecordConflict } from '@open-mercato/ui/backend/conflicts'
+import { Alert, AlertDescription } from '@open-mercato/ui/primitives/alert'
 import {
   buildWebhookFormContentHeader,
   buildWebhookFormFields,
@@ -103,6 +105,7 @@ export default function WebhookDetailPage() {
   const [webhook, setWebhook] = React.useState<Webhook | null>(null)
   const [isLoading, setIsLoading] = React.useState(true)
   const [error, setError] = React.useState<string | null>(null)
+  const [isNotFound, setIsNotFound] = React.useState(false)
   const [isEditing, setIsEditing] = React.useState(false)
 
   const [deliveries, setDeliveries] = React.useState<DeliveryRow[]>([])
@@ -120,7 +123,7 @@ export default function WebhookDetailPage() {
 
   const fetchWebhook = React.useCallback(async (options?: { silent?: boolean }) => {
     if (!webhookId) {
-      setError(t('webhooks.errors.notFound'))
+      setIsNotFound(true)
       setIsLoading(false)
       return
     }
@@ -131,6 +134,7 @@ export default function WebhookDetailPage() {
     }
 
     setError(null)
+    setIsNotFound(false)
 
     try {
       const call = await apiCall<Webhook>(
@@ -144,7 +148,11 @@ export default function WebhookDetailPage() {
         return
       }
 
-      setError(t('webhooks.errors.notFound'))
+      if (call.status === 404) {
+        setIsNotFound(true)
+      } else {
+        setError(t('webhooks.detail.loadError'))
+      }
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : t('webhooks.detail.loadError'))
     } finally {
@@ -356,10 +364,14 @@ export default function WebhookDetailPage() {
   const handleDelete = React.useCallback(async () => {
     if (!webhook) return
     try {
-      await deleteCrud(`webhooks/${encodeURIComponent(webhook.id)}`, { fallbackResult: null })
+      await deleteCrud(`webhooks/${encodeURIComponent(webhook.id)}`, {
+        fallbackResult: null,
+        headers: buildOptimisticLockHeader(webhook.updatedAt),
+      })
       flash(t('webhooks.list.deleteSuccess'), 'success')
       router.push('/backend/webhooks')
-    } catch {
+    } catch (error) {
+      if (surfaceRecordConflict(error, t)) return
       flash(t('webhooks.list.deleteError'), 'error')
     }
   }, [router, t, webhook])
@@ -466,7 +478,20 @@ export default function WebhookDetailPage() {
   }, [access.canManage, access.canSecrets, access.canTest, handleDelete, handleRotateSecret, handleTest, handleToggleActive, t, webhook?.isActive])
 
   if (isLoading) return <Page><PageBody><LoadingMessage label={t('webhooks.detail.loading')} /></PageBody></Page>
-  if (error || !webhook) return <Page><PageBody><ErrorMessage label={error ?? t('webhooks.errors.notFound')} /></PageBody></Page>
+  if (isNotFound) {
+    return (
+      <Page>
+        <PageBody>
+          <RecordNotFoundState
+            label={t('webhooks.errors.notFound')}
+            backHref="/backend/webhooks"
+            backLabel={t('webhooks.detail.backToList', 'Back to webhooks')}
+          />
+        </PageBody>
+      </Page>
+    )
+  }
+  if (error || !webhook) return <Page><PageBody><ErrorMessage label={error ?? t('webhooks.detail.loadError')} /></PageBody></Page>
 
   if (isEditing) {
     return (
@@ -478,6 +503,7 @@ export default function WebhookDetailPage() {
             fields={fields}
             groups={groups}
             initialValues={createWebhookInitialValues(webhook)}
+            optimisticLockUpdatedAt={webhook.updatedAt}
             submitLabel={t('common.save')}
             cancelHref={`/backend/webhooks/${webhook.id}`}
             contentHeader={contentHeader}
@@ -508,8 +534,8 @@ export default function WebhookDetailPage() {
           statusBadge={
             <Badge
               className={webhook.isActive
-                ? 'border-transparent bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200'
-                : 'border-transparent bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400'}
+                ? 'border-transparent bg-status-success-bg text-status-success-text'
+                : 'border-transparent bg-status-neutral-bg text-status-neutral-text'}
             >
               {webhook.isActive ? t('webhooks.list.status.active') : t('webhooks.list.status.inactive')}
             </Badge>
@@ -520,11 +546,17 @@ export default function WebhookDetailPage() {
 
         <div className="mt-6 space-y-4">
           {!access.isLoading && !access.canManage && !access.canSecrets && !access.canTest ? (
-            <Notice compact>{t('webhooks.detail.readOnlyTip')}</Notice>
+            <Alert variant="info">
+              <AlertDescription>{t('webhooks.detail.readOnlyTip')}</AlertDescription>
+            </Alert>
           ) : null}
           <div className="grid gap-3 lg:grid-cols-2">
-            <Notice compact>{t('webhooks.detail.deliveryTip')}</Notice>
-            <Notice compact>{t('webhooks.detail.signatureTip')}</Notice>
+            <Alert variant="info">
+              <AlertDescription>{t('webhooks.detail.deliveryTip')}</AlertDescription>
+            </Alert>
+            <Alert variant="info">
+              <AlertDescription>{t('webhooks.detail.signatureTip')}</AlertDescription>
+            </Alert>
           </div>
           <div className="grid grid-cols-2 gap-4 text-sm">
             <div>
@@ -583,7 +615,7 @@ export default function WebhookDetailPage() {
             </div>
             <div className="col-span-2">
               <span className="text-muted-foreground">{t('webhooks.form.customHeaders')}:</span>
-              <pre className="mt-2 rounded border bg-muted/40 p-3 text-xs">
+              <pre className="mt-2 rounded border bg-muted/50 p-3 text-xs">
                 {webhook.customHeaders ? JSON.stringify(webhook.customHeaders, null, 2) : '—'}
               </pre>
             </div>
@@ -597,7 +629,7 @@ export default function WebhookDetailPage() {
               <div>{t('webhooks.deliveries.columns.status')}: {testDelivery.status}</div>
               <div>{t('webhooks.deliveries.columns.responseStatus')}: {testDelivery.responseStatus ?? '—'}</div>
               <div>{t('webhooks.deliveries.columns.duration')}: {testDelivery.durationMs != null ? `${testDelivery.durationMs}ms` : '—'}</div>
-              <pre className="overflow-auto rounded border bg-muted/40 p-3 text-xs">
+              <pre className="overflow-auto rounded border bg-muted/50 p-3 text-xs">
                 {JSON.stringify(testDelivery.payload, null, 2)}
               </pre>
             </div>
@@ -628,21 +660,25 @@ export default function WebhookDetailPage() {
             columns={deliveryColumns}
             data={deliveries}
             onRowClick={(row) => { void handleDeliveryOpen(row.id) }}
-            rowActions={(row) => (
-              access.canManage && (row.status === 'failed' || row.status === 'expired')
-                ? (
-                  <RowActions
-                    items={[
-                      {
-                        id: 'retry',
-                        label: t('webhooks.deliveries.actions.retry'),
-                        onSelect: () => { void handleRetryDelivery(row.id) },
-                      },
-                    ]}
-                  />
-                )
-                : null
-            )}
+            rowActions={(row) => {
+              const items: Array<{ id: string; label: string; onSelect: () => void }> = [
+                {
+                  id: 'view-details',
+                  label: t('webhooks.deliveries.actions.viewDetails'),
+                  onSelect: () => { void handleDeliveryOpen(row.id) },
+                },
+              ]
+
+              if (access.canManage && (row.status === 'failed' || row.status === 'expired')) {
+                items.push({
+                  id: 'retry',
+                  label: t('webhooks.deliveries.actions.retry'),
+                  onSelect: () => { void handleRetryDelivery(row.id) },
+                })
+              }
+
+              return <RowActions items={items} />
+            }}
             perspective={{ tableId: 'webhooks.deliveries' }}
             pagination={{
               page: deliveryPage,
@@ -667,19 +703,19 @@ export default function WebhookDetailPage() {
                 <div>{t('webhooks.deliveries.columns.duration')}: {selectedDelivery.durationMs != null ? `${selectedDelivery.durationMs}ms` : '—'}</div>
                 <div>
                   <div className="mb-2 font-medium">{t('webhooks.deliveries.requestBody')}</div>
-                  <pre className="overflow-auto rounded border bg-muted/40 p-3 text-xs">
+                  <pre className="overflow-auto rounded border bg-muted/50 p-3 text-xs">
                     {JSON.stringify(selectedDelivery.payload, null, 2)}
                   </pre>
                 </div>
                 <div>
                   <div className="mb-2 font-medium">{t('webhooks.deliveries.responseBody')}</div>
-                  <pre className="overflow-auto rounded border bg-muted/40 p-3 text-xs">
+                  <pre className="overflow-auto rounded border bg-muted/50 p-3 text-xs">
                     {selectedDelivery.responseBody ?? '—'}
                   </pre>
                 </div>
                 <div>
                   <div className="mb-2 font-medium">{t('webhooks.deliveries.responseHeaders')}</div>
-                  <pre className="overflow-auto rounded border bg-muted/40 p-3 text-xs">
+                  <pre className="overflow-auto rounded border bg-muted/50 p-3 text-xs">
                     {selectedDelivery.responseHeaders ? JSON.stringify(selectedDelivery.responseHeaders, null, 2) : '—'}
                   </pre>
                 </div>

@@ -1,3 +1,4 @@
+import { fetchWithTimeout } from '@open-mercato/shared/lib/http/fetchWithTimeout'
 import { dedupeStrings, labelFromLocalizedRecord, safeRecord, type AkeneoAttribute, type AkeneoAttributeOption, type AkeneoCategory, type AkeneoChannel, type AkeneoCredentialShape, type AkeneoFamily, type AkeneoFamilyVariant, type AkeneoLocale, type AkeneoProduct, type AkeneoProductModel } from './shared'
 
 type TokenState = {
@@ -33,8 +34,73 @@ type AkeneoMediaFile = {
 
 type AkeneoClient = ReturnType<typeof createAkeneoClient>
 
+const DEFAULT_ALLOWED_AKENEO_HOST_PATTERNS = ['*.cloud.akeneo.com', '*.akeneo.cloud'] as const
+const ALLOWED_AKENEO_HOSTS_ENV_KEYS = [
+  'OM_INTEGRATION_AKENEO_ALLOWED_HOSTS',
+  'OPENMERCATO_AKENEO_ALLOWED_HOSTS',
+  'AKENEO_ALLOWED_HOSTS',
+] as const
+
 function normalizeBaseUrl(url: string): string {
   return url.trim().replace(/\/+$/g, '')
+}
+
+function readAllowedAkeneoHostPatterns(env: NodeJS.ProcessEnv = process.env): string[] {
+  for (const key of ALLOWED_AKENEO_HOSTS_ENV_KEYS) {
+    const raw = env[key]
+    if (typeof raw !== 'string') continue
+    const patterns = raw
+      .split(',')
+      .map((entry) => entry.trim().toLowerCase())
+      .filter((entry) => entry.length > 0)
+    if (patterns.length > 0) {
+      return patterns
+    }
+  }
+
+  return [...DEFAULT_ALLOWED_AKENEO_HOST_PATTERNS]
+}
+
+function matchesAkeneoHostPattern(hostname: string, pattern: string): boolean {
+  if (pattern.startsWith('*.')) {
+    const suffix = pattern.slice(2)
+    return hostname === suffix || hostname.endsWith(`.${suffix}`)
+  }
+
+  return hostname === pattern
+}
+
+export function validateAkeneoApiUrl(rawUrl: string, env: NodeJS.ProcessEnv = process.env): string {
+  let parsed: URL
+  try {
+    parsed = new URL(rawUrl.trim())
+  } catch {
+    throw new Error('Akeneo URL must be a valid absolute URL')
+  }
+
+  if (parsed.protocol !== 'https:') {
+    throw new Error('Akeneo URL must use https')
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error('Akeneo URL must not include embedded credentials')
+  }
+  if (parsed.port && parsed.port !== '443') {
+    throw new Error('Akeneo URL must not use a custom port')
+  }
+  if (parsed.pathname !== '/' && parsed.pathname !== '') {
+    throw new Error('Akeneo URL must not include a path')
+  }
+  if (parsed.search || parsed.hash) {
+    throw new Error('Akeneo URL must not include query parameters or fragments')
+  }
+
+  const hostname = parsed.hostname.toLowerCase()
+  const allowedPatterns = readAllowedAkeneoHostPatterns(env)
+  if (!allowedPatterns.some((pattern) => matchesAkeneoHostPattern(hostname, pattern))) {
+    throw new Error(`Akeneo URL host is not allowed: ${hostname}`)
+  }
+
+  return normalizeBaseUrl(parsed.origin)
 }
 
 export function normalizeAkeneoDateTime(value: string | null | undefined): string | null {
@@ -123,7 +189,7 @@ function coerceCredentials(credentials: Record<string, unknown>): AkeneoCredenti
     throw new Error('Akeneo credentials are incomplete')
   }
   return {
-    apiUrl: normalizeBaseUrl(apiUrl),
+    apiUrl: validateAkeneoApiUrl(apiUrl),
     clientId,
     clientSecret,
     username,
@@ -135,8 +201,34 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+const DEFAULT_AKENEO_REQUEST_TIMEOUT_MS = 30_000
+const DEFAULT_AKENEO_MAX_RATE_LIMIT_RETRIES = 5
+const DEFAULT_AKENEO_RETRY_AFTER_CAP_MS = 60_000
+
+function resolvePositiveIntEnv(raw: string | undefined, fallback: number): number {
+  const parsed = Number.parseInt(raw ?? '', 10)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
+}
+
+function resolveAkeneoRequestTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  return resolvePositiveIntEnv(env.OM_INTEGRATION_AKENEO_REQUEST_TIMEOUT_MS, DEFAULT_AKENEO_REQUEST_TIMEOUT_MS)
+}
+
+function resolveAkeneoMaxRateLimitRetries(env: NodeJS.ProcessEnv = process.env): number {
+  return resolvePositiveIntEnv(env.OM_INTEGRATION_AKENEO_MAX_RATE_LIMIT_RETRIES, DEFAULT_AKENEO_MAX_RATE_LIMIT_RETRIES)
+}
+
+function clampAkeneoRetryAfterMs(retryAfterHeader: string | null, env: NodeJS.ProcessEnv = process.env): number {
+  const retryAfter = Number(retryAfterHeader ?? '1')
+  const requestedMs = Number.isFinite(retryAfter) ? retryAfter * 1000 : 1000
+  const cap = resolvePositiveIntEnv(env.OM_INTEGRATION_AKENEO_RETRY_AFTER_CAP_MS, DEFAULT_AKENEO_RETRY_AFTER_CAP_MS)
+  return Math.min(Math.max(requestedMs, 0), cap)
+}
+
 export function createAkeneoClient(credentialsInput: Record<string, unknown>) {
   const credentials = coerceCredentials(credentialsInput)
+  const akeneoBaseUrl = new URL(`${credentials.apiUrl}/`)
+  const tokenEndpointUrl = new URL('/api/oauth/v1/token', akeneoBaseUrl).toString()
   let tokenState: TokenState | null = null
   let lastAttributeOptionRequestAt = 0
   const familyCache = new Map<string, Promise<AkeneoFamily | null>>()
@@ -146,9 +238,22 @@ export function createAkeneoClient(credentialsInput: Record<string, unknown>) {
   const categoryCache = new Map<string, Promise<AkeneoCategory | null>>()
   const mediaFileCache = new Map<string, Promise<AkeneoMediaFile | null>>()
 
+  function resolveAkeneoRequestUrl(pathOrUrl: string): string {
+    const resolved = new URL(pathOrUrl, akeneoBaseUrl)
+    if (resolved.origin !== akeneoBaseUrl.origin) {
+      throw new Error(`Akeneo request URL must stay on the configured host: ${resolved.origin}`)
+    }
+    return resolved.toString()
+  }
+
+  function normalizeAkeneoNextUrl(nextUrl: string): string {
+    return resolveAkeneoRequestUrl(nextUrl)
+  }
+
   async function acquirePasswordGrantToken(): Promise<TokenState> {
-    const response = await fetch(`${credentials.apiUrl}/api/oauth/v1/token`, {
+    const response = await fetchWithTimeout(tokenEndpointUrl, {
       method: 'POST',
+      timeoutMs: resolveAkeneoRequestTimeoutMs(),
       headers: {
         accept: 'application/json',
         'content-type': 'application/json',
@@ -185,8 +290,9 @@ export function createAkeneoClient(credentialsInput: Record<string, unknown>) {
 
   async function refreshAccessToken(current: TokenState): Promise<TokenState> {
     if (!current.refreshToken) return acquirePasswordGrantToken()
-    const response = await fetch(`${credentials.apiUrl}/api/oauth/v1/token`, {
+    const response = await fetchWithTimeout(tokenEndpointUrl, {
       method: 'POST',
+      timeoutMs: resolveAkeneoRequestTimeoutMs(),
       headers: {
         accept: 'application/json',
         'content-type': 'application/json',
@@ -228,14 +334,14 @@ export function createAkeneoClient(credentialsInput: Record<string, unknown>) {
     pathOrUrl: string,
     init: RequestInit = {},
     retried = false,
+    rateLimitAttempts = 0,
   ): Promise<T> {
+    const url = resolveAkeneoRequestUrl(pathOrUrl)
     const token = await ensureToken()
-    const url = pathOrUrl.startsWith('http://') || pathOrUrl.startsWith('https://')
-      ? pathOrUrl
-      : `${credentials.apiUrl}${pathOrUrl.startsWith('/') ? pathOrUrl : `/${pathOrUrl}`}`
 
-    const response = await fetch(url, {
+    const response = await fetchWithTimeout(url, {
       ...init,
+      timeoutMs: resolveAkeneoRequestTimeoutMs(),
       headers: {
         accept: 'application/json',
         authorization: `Bearer ${token}`,
@@ -245,13 +351,16 @@ export function createAkeneoClient(credentialsInput: Record<string, unknown>) {
 
     if (response.status === 401 && !retried) {
       await ensureToken(true)
-      return request<T>(pathOrUrl, init, true)
+      return request<T>(pathOrUrl, init, true, rateLimitAttempts)
     }
 
     if (response.status === 429) {
-      const retryAfter = Number(response.headers.get('retry-after') ?? '1')
-      await sleep(Number.isFinite(retryAfter) ? retryAfter * 1000 : 1000)
-      return request<T>(pathOrUrl, init, retried)
+      if (rateLimitAttempts >= resolveAkeneoMaxRateLimitRetries()) {
+        const body = await response.text()
+        throw new Error(`Akeneo request failed (429): ${body}`)
+      }
+      await sleep(clampAkeneoRetryAfterMs(response.headers.get('retry-after')))
+      return request<T>(pathOrUrl, init, retried, rateLimitAttempts + 1)
     }
 
     if (!response.ok) {
@@ -270,18 +379,18 @@ export function createAkeneoClient(credentialsInput: Record<string, unknown>) {
     pathOrUrl: string,
     init: RequestInit = {},
     retried = false,
+    rateLimitAttempts = 0,
   ): Promise<{
     buffer: Buffer
     contentType: string | null
     contentLength: number | null
   }> {
+    const url = resolveAkeneoRequestUrl(pathOrUrl)
     const token = await ensureToken()
-    const url = pathOrUrl.startsWith('http://') || pathOrUrl.startsWith('https://')
-      ? pathOrUrl
-      : `${credentials.apiUrl}${pathOrUrl.startsWith('/') ? pathOrUrl : `/${pathOrUrl}`}`
 
-    const response = await fetch(url, {
+    const response = await fetchWithTimeout(url, {
       ...init,
+      timeoutMs: resolveAkeneoRequestTimeoutMs(),
       headers: {
         authorization: `Bearer ${token}`,
         ...init.headers,
@@ -290,13 +399,16 @@ export function createAkeneoClient(credentialsInput: Record<string, unknown>) {
 
     if (response.status === 401 && !retried) {
       await ensureToken(true)
-      return requestBinary(pathOrUrl, init, true)
+      return requestBinary(pathOrUrl, init, true, rateLimitAttempts)
     }
 
     if (response.status === 429) {
-      const retryAfter = Number(response.headers.get('retry-after') ?? '1')
-      await sleep(Number.isFinite(retryAfter) ? retryAfter * 1000 : 1000)
-      return requestBinary(pathOrUrl, init, retried)
+      if (rateLimitAttempts >= resolveAkeneoMaxRateLimitRetries()) {
+        const body = await response.text()
+        throw new Error(`Akeneo request failed (429): ${body}`)
+      }
+      await sleep(clampAkeneoRetryAfterMs(response.headers.get('retry-after')))
+      return requestBinary(pathOrUrl, init, retried, rateLimitAttempts + 1)
     }
 
     if (!response.ok) {
@@ -313,7 +425,7 @@ export function createAkeneoClient(credentialsInput: Record<string, unknown>) {
   }
 
   function buildUrl(path: string, params: Record<string, string | number | boolean | undefined | null>): string {
-    const url = new URL(`${credentials.apiUrl}${path}`)
+    const url = new URL(resolveAkeneoRequestUrl(path))
     for (const [key, value] of Object.entries(params)) {
       if (value === undefined || value === null || value === '') continue
       url.searchParams.set(key, String(value))
@@ -331,7 +443,9 @@ export function createAkeneoClient(credentialsInput: Record<string, unknown>) {
     )
     return {
       items: Array.isArray(payload?._embedded?.items) ? payload._embedded.items : [],
-      nextUrl: typeof payload?._links?.next?.href === 'string' ? payload._links.next.href : null,
+      nextUrl: typeof payload?._links?.next?.href === 'string'
+        ? normalizeAkeneoNextUrl(payload._links.next.href)
+        : null,
       totalEstimate: typeof payload?.items_count === 'number' ? payload.items_count : null,
     }
   }
@@ -379,10 +493,10 @@ export function createAkeneoClient(credentialsInput: Record<string, unknown>) {
     updatedAfter?: string | null
   }): Promise<{ items: AkeneoProduct[]; nextUrl: string | null; totalEstimate: number | null }> {
     if (options.nextUrl) {
-      const page = await readList<AkeneoProduct>(sanitizeAkeneoProductNextUrl(options.nextUrl))
+      const page = await readList<AkeneoProduct>(normalizeAkeneoNextUrl(sanitizeAkeneoProductNextUrl(options.nextUrl)))
       return {
         ...page,
-        nextUrl: page.nextUrl ? sanitizeAkeneoProductNextUrl(page.nextUrl) : null,
+        nextUrl: page.nextUrl ? normalizeAkeneoNextUrl(sanitizeAkeneoProductNextUrl(page.nextUrl)) : null,
       }
     }
     const params: Record<string, string | number | boolean | undefined | null> = {
@@ -408,7 +522,7 @@ export function createAkeneoClient(credentialsInput: Record<string, unknown>) {
     return {
       ...page,
       totalEstimate: totalEstimate ?? page.totalEstimate,
-      nextUrl: page.nextUrl ? sanitizeAkeneoProductNextUrl(page.nextUrl) : null,
+      nextUrl: page.nextUrl ? normalizeAkeneoNextUrl(sanitizeAkeneoProductNextUrl(page.nextUrl)) : null,
     }
   }
 

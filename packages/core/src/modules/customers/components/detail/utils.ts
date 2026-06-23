@@ -147,3 +147,21 @@ export function createDictionarySelectLabels(
       return base
   }
 }
+
+export function formatCurrency(amount: number, currency?: string | null): string {
+  try {
+    return new Intl.NumberFormat(undefined, {
+      style: 'currency',
+      currency: currency || 'PLN',
+      maximumFractionDigits: 0,
+    }).format(amount)
+  } catch {
+    return `${amount.toLocaleString()} ${currency || 'PLN'}`
+  }
+}
+
+export function formatFallbackLabel(value: string): string {
+  return value
+    .replace(/[_-]+/g, ' ')
+    .replace(/^\w/, (c) => c.toUpperCase())
+}

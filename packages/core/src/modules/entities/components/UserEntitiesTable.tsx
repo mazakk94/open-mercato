@@ -5,6 +5,7 @@ import Link from 'next/link'
 import { useQuery } from '@tanstack/react-query'
 import type { ColumnDef, SortingState } from '@tanstack/react-table'
 import { DataTable, RowActions, Button } from '@open-mercato/ui'
+import { ListEmptyState } from '@open-mercato/ui/backend/filters/ListEmptyState'
 import { readApiResultOrThrow } from '@open-mercato/ui/backend/utils/apiCall'
 import { useOrganizationScopeVersion } from '@open-mercato/shared/lib/frontend/useOrganizationScope'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
@@ -31,7 +32,7 @@ function buildColumns(t: (key: string, fallback: string) => string): ColumnDef<E
       meta: { priority: 5 },
       cell: ({ getValue }) => (
         <span className={`px-2 py-1 rounded text-xs ${
-          getValue() ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400' : 'bg-muted text-muted-foreground'
+          getValue() ? 'bg-status-success-bg text-status-success-text' : 'bg-muted text-muted-foreground'
         }`}>
           {getValue() ? t('common.yes', 'Yes') : t('common.no', 'No')}
         </span>
@@ -107,6 +108,13 @@ export default function UserEntitiesTable() {
       sorting={sorting}
       onSortingChange={setSorting}
       perspective={{ tableId: 'entities.user.list' }}
+      emptyState={(
+        <ListEmptyState
+          entityName={t('entities.user.table.title', 'User Entities')}
+          createHref="/backend/entities/user/create"
+          createLabel={t('common.create', 'Create')}
+        />
+      )}
       rowActions={(row) => (
         <RowActions
           items={[

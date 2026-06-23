@@ -73,6 +73,7 @@ export const WorkflowEventTypes = {
   SIGNAL_TIMEOUT: 'SIGNAL_TIMEOUT',
 
   // Timer events (Phase 9)
+  TIMER_AWAITING: 'TIMER_AWAITING',
   TIMER_FIRED: 'TIMER_FIRED',
   TIMER_CANCELLED: 'TIMER_CANCELLED',
 } as const
@@ -86,6 +87,7 @@ export type WorkflowEventType = typeof WorkflowEventTypes[keyof typeof WorkflowE
 export interface WorkflowEventInput {
   workflowInstanceId: string
   stepInstanceId?: string
+  branchInstanceId?: string | null
   eventType: WorkflowEventType | string
   eventData: any
   userId?: string
@@ -127,6 +129,7 @@ export async function logWorkflowEvent(
   const workflowEvent = em.create(WorkflowEvent, {
     workflowInstanceId: event.workflowInstanceId,
     stepInstanceId: event.stepInstanceId || null,
+    branchInstanceId: event.branchInstanceId ?? null,
     eventType: event.eventType,
     eventData: event.eventData || {},
     userId: event.userId || null,
@@ -135,7 +138,7 @@ export async function logWorkflowEvent(
     occurredAt: new Date(),
   })
 
-  await em.persistAndFlush(workflowEvent)
+  await em.persist(workflowEvent).flush()
 
   return workflowEvent
 }
@@ -155,6 +158,7 @@ export async function logWorkflowEvents(
     em.create(WorkflowEvent, {
       workflowInstanceId: event.workflowInstanceId,
       stepInstanceId: event.stepInstanceId || null,
+      branchInstanceId: event.branchInstanceId ?? null,
       eventType: event.eventType,
       eventData: event.eventData || {},
       userId: event.userId || null,
@@ -164,7 +168,7 @@ export async function logWorkflowEvents(
     })
   )
 
-  await em.persistAndFlush(workflowEvents)
+  await em.persist(workflowEvents).flush()
 
   return workflowEvents
 }

@@ -14,8 +14,10 @@ import { run } from './mercato.js'
 const BOOTSTRAP_FREE_COMMANDS = [
   'generate',
   'module',
+  'deploy',
   'db',
   'init',
+  'agentic:init',
   'eject',
   'test',
   'test:integration',

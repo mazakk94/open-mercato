@@ -2,6 +2,7 @@ import type { EntityManager } from '@mikro-orm/postgresql'
 import { z } from 'zod'
 import { registerCommand, type CommandHandler } from '@open-mercato/shared/lib/commands'
 import { extractUndoPayload, type UndoPayload } from '@open-mercato/shared/lib/commands/undo'
+import { findOneWithDecryption } from '@open-mercato/shared/lib/encryption/find'
 import { Message, MessageObject, MessageRecipient } from '../data/entities'
 import { emitMessagesEvent } from '../events'
 import {
@@ -9,9 +10,17 @@ import {
   isTerminalMessageAction,
   resolveActionCommandInput,
   resolveActionHref,
+  resolveMessageActionData,
 } from '../lib/actions'
 import { getMessageType } from '../lib/message-types-registry'
 import { assertOrganizationAccess, type MessageScopeInput } from './shared'
+
+const actionStateSnapshotSchema = z.object({
+  actionTaken: z.string().nullable(),
+  actionTakenByUserId: z.string().nullable(),
+  actionTakenAt: z.string().nullable(),
+  actionResult: z.record(z.string(), z.unknown()).nullable(),
+})
 
 const recordTerminalActionSchema = z.object({
   messageId: z.string().uuid(),
@@ -20,6 +29,10 @@ const recordTerminalActionSchema = z.object({
   tenantId: z.string().uuid(),
   organizationId: z.string().uuid().nullable(),
   userId: z.string().uuid(),
+  // Optional pre-claim snapshot supplied by `messages.actions.execute` so the
+  // undo log records the true (un-taken) state even though the terminal action
+  // was atomically claimed before this finalizer runs.
+  previousState: actionStateSnapshotSchema.optional(),
 })
 
 type RecordTerminalActionInput = z.infer<typeof recordTerminalActionSchema>
@@ -52,11 +65,17 @@ function toDate(value: string | null | undefined): Date | null {
 }
 
 async function requireActionTarget(em: EntityManager, input: RecordTerminalActionInput) {
-  const message = await em.findOne(Message, {
-    id: input.messageId,
-    tenantId: input.tenantId,
-    deletedAt: null,
-  })
+  const message = await findOneWithDecryption(
+    em,
+    Message,
+    {
+      id: input.messageId,
+      tenantId: input.tenantId,
+      deletedAt: null,
+    },
+    undefined,
+    { tenantId: input.tenantId, organizationId: input.organizationId },
+  )
   if (!message) throw new Error('Message not found')
   assertOrganizationAccess(input as MessageScopeInput, message)
 
@@ -70,11 +89,17 @@ async function requireActionTarget(em: EntityManager, input: RecordTerminalActio
 }
 
 async function requireActionMessage(em: EntityManager, input: ExecuteActionInput) {
-  const message = await em.findOne(Message, {
-    id: input.messageId,
-    tenantId: input.tenantId,
-    deletedAt: null,
-  })
+  const message = await findOneWithDecryption(
+    em,
+    Message,
+    {
+      id: input.messageId,
+      tenantId: input.tenantId,
+      deletedAt: null,
+    },
+    undefined,
+    { tenantId: input.tenantId, organizationId: input.organizationId },
+  )
   if (!message) throw new Error('Message not found')
   assertOrganizationAccess(input as MessageScopeInput, message)
   const recipient = await em.findOne(MessageRecipient, {
@@ -107,12 +132,35 @@ const recordTerminalActionCommand: CommandHandler<unknown, { ok: true }> = {
     const input = recordTerminalActionSchema.parse(rawInput)
     const em = (ctx.container.resolve('em') as EntityManager).fork()
     const message = await requireActionTarget(em, input)
-    if (message.actionTaken) {
-      throw new Error('Action already taken')
+    const claimedByCaller =
+      message.actionTaken === input.actionId && message.actionTakenByUserId === input.userId
+    if (!claimedByCaller) {
+      if (message.actionTaken) {
+        throw new Error('Action already taken')
+      }
+      // Atomic compare-and-set: only one concurrent request transitions the
+      // message out of the un-taken state. nativeUpdate runs as a single
+      // `UPDATE ... WHERE action_taken IS NULL` so the loser matches 0 rows.
+      const claimedRows = await em.nativeUpdate(
+        Message,
+        { id: input.messageId, tenantId: input.tenantId, actionTaken: null, deletedAt: null },
+        {
+          actionTaken: input.actionId,
+          actionTakenByUserId: input.userId,
+          actionTakenAt: new Date(),
+        },
+      )
+      if (claimedRows === 0) {
+        throw new Error('Action already taken')
+      }
+      message.actionTaken = input.actionId
+      message.actionTakenByUserId = input.userId
     }
-    message.actionTaken = input.actionId
-    message.actionTakenByUserId = input.userId
-    message.actionTakenAt = new Date()
+    if (!message.actionTakenAt) {
+      message.actionTakenAt = new Date()
+    }
+    // action_result is an encrypted column, so it must be written through the
+    // flush path (the encryption subscriber) rather than nativeUpdate.
     message.actionResult = input.result
     await em.flush()
     return { ok: true }
@@ -125,6 +173,13 @@ const recordTerminalActionCommand: CommandHandler<unknown, { ok: true }> = {
   },
   buildLog: async ({ input, snapshots }) => {
     const parsed = recordTerminalActionSchema.parse(input)
+    // When the action was pre-claimed by `messages.actions.execute`, the
+    // prepare-captured snapshot already reflects the claimed state, so prefer
+    // the explicit pre-claim snapshot for the undo baseline.
+    const before =
+      (parsed.previousState as ActionStateSnapshot | undefined) ??
+      (snapshots.before as ActionStateSnapshot | undefined) ??
+      null
     return {
       actionLabel: 'Execute message terminal action',
       resourceKind: 'messages.message',
@@ -133,11 +188,11 @@ const recordTerminalActionCommand: CommandHandler<unknown, { ok: true }> = {
       organizationId: parsed.organizationId,
       payload: {
         undo: {
-          before: (snapshots.before as ActionStateSnapshot | undefined) ?? null,
+          before,
           after: (snapshots.after as ActionStateSnapshot | undefined) ?? null,
         } satisfies UndoPayload<ActionStateSnapshot>,
       },
-      snapshotBefore: snapshots.before ?? null,
+      snapshotBefore: before,
       snapshotAfter: snapshots.after ?? null,
     }
   },
@@ -148,7 +203,7 @@ const recordTerminalActionCommand: CommandHandler<unknown, { ok: true }> = {
     const messageId = logEntry?.resourceId as string | null
     if (!messageId) return
     const em = (ctx.container.resolve('em') as EntityManager).fork()
-    const message = await em.findOne(Message, { id: messageId })
+    const message = await findOneWithDecryption(em, Message, { id: messageId })
     if (!message) return
     message.actionTaken = before.actionTaken
     message.actionTakenByUserId = before.actionTakenByUserId
@@ -180,8 +235,9 @@ const executeActionCommand: CommandHandler<
 
     const shouldRecordActionTaken = isTerminalMessageAction(action)
 
-    if (message.actionData?.expiresAt) {
-      if (new Date(message.actionData.expiresAt) < new Date()) {
+    const actionData = resolveMessageActionData(message)
+    if (actionData?.expiresAt) {
+      if (new Date(actionData.expiresAt) < new Date()) {
         throw new Error('Actions have expired')
       }
     } else {
@@ -192,6 +248,52 @@ const executeActionCommand: CommandHandler<
           throw new Error('Actions have expired')
         }
       }
+    }
+
+    // Capture the un-taken state for the undo log before reserving the action.
+    const previousState = snapshotActionState(message)
+    let claimedTerminal = false
+    const releaseTerminalClaim = async () => {
+      if (!claimedTerminal) return
+      claimedTerminal = false
+      await em.nativeUpdate(
+        Message,
+        {
+          id: message.id,
+          tenantId: input.tenantId,
+          actionTaken: action.id,
+          actionTakenByUserId: input.userId,
+        },
+        { actionTaken: null, actionTakenByUserId: null, actionTakenAt: null },
+      )
+    }
+
+    if (shouldRecordActionTaken) {
+      // Atomically reserve the terminal action BEFORE running the target
+      // command so concurrent requests cannot both execute it. The losing
+      // request matches 0 rows and surfaces the existing 409 response.
+      const claimedRows = await em.nativeUpdate(
+        Message,
+        { id: message.id, tenantId: input.tenantId, actionTaken: null, deletedAt: null },
+        {
+          actionTaken: action.id,
+          actionTakenByUserId: input.userId,
+          actionTakenAt: new Date(),
+        },
+      )
+      if (claimedRows === 0) {
+        const current = await findOneWithDecryption(
+          em,
+          Message,
+          { id: message.id, tenantId: input.tenantId, deletedAt: null },
+          undefined,
+          { tenantId: input.tenantId, organizationId: input.organizationId },
+        )
+        throw Object.assign(new Error('Action already taken'), {
+          actionTaken: current?.actionTaken ?? message.actionTaken ?? action.id,
+        })
+      }
+      claimedTerminal = true
     }
 
     const commandBus = ctx.container.resolve('commandBus') as {
@@ -248,17 +350,24 @@ const executeActionCommand: CommandHandler<
         operationLogEntry = commandResult.logEntry ?? null
       } catch (err) {
         console.error('[messages] executeActionCommand sub-command failed', err)
+        // The target command never completed — release the reservation so the
+        // action stays retryable, matching the pre-claim failure semantics.
+        await releaseTerminalClaim()
         throw new Error('Action failed')
       }
     } else if (action.href) {
-      result = {
-        redirect: resolveActionHref(action, message, {
-          tenantId: input.tenantId,
-          organizationId: input.organizationId,
-          userId: input.userId,
-        }) ?? action.href,
+      const safeRedirect = resolveActionHref(action, message, {
+        tenantId: input.tenantId,
+        organizationId: input.organizationId,
+        userId: input.userId,
+      })
+      if (!safeRedirect) {
+        await releaseTerminalClaim()
+        throw new Error('Action has an unsafe redirect target')
       }
+      result = { redirect: safeRedirect }
     } else {
+      await releaseTerminalClaim()
       throw new Error('Action has no executable target')
     }
 
@@ -271,6 +380,7 @@ const executeActionCommand: CommandHandler<
           tenantId: input.tenantId,
           organizationId: input.organizationId,
           userId: input.userId,
+          previousState,
         },
         ctx: {
           container: ctx.container,
@@ -289,6 +399,7 @@ const executeActionCommand: CommandHandler<
           messageId: message.id,
           actionId: action.id,
           userId: input.userId,
+          recipientUserId: input.userId,
           result,
           tenantId: input.tenantId,
           organizationId: input.organizationId,

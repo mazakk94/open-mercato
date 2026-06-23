@@ -5,14 +5,11 @@ import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
 import { GatewayTransaction } from '../../data/entities'
 import { listTransactionsQuerySchema } from '../../data/validators'
 import { paymentGatewaysTag } from '../openapi'
+import { buildIlikeTerm } from '@open-mercato/shared/lib/db/buildIlikeTerm'
 
 export const metadata = {
   path: '/payment_gateways/transactions',
   GET: { requireAuth: true, requireFeatures: ['payment_gateways.view'] },
-}
-
-function escapeLikePattern(value: string): string {
-  return value.replace(/[\\%_]/g, '\\$&')
 }
 
 function formatDateValue(value: unknown): string | null {
@@ -58,7 +55,7 @@ export async function GET(req: Request) {
     qb.andWhere({ unifiedStatus: status })
   }
   if (search) {
-    const pattern = `%${escapeLikePattern(search)}%`
+    const pattern = buildIlikeTerm(search)
     qb.andWhere(`(
       cast(gt.id as text) ilike ?
       or cast(gt.payment_id as text) ilike ?
@@ -75,7 +72,7 @@ export async function GET(req: Request) {
 
   const [items, total] = await Promise.all([
     qb.getResultList(),
-    countQb.count('gt.id', true),
+    countQb.getCount('gt.id', true),
   ])
 
   return NextResponse.json({
@@ -99,7 +96,7 @@ export async function GET(req: Request) {
     total,
     page,
     pageSize,
-    totalPages: Math.max(1, Math.ceil(total / pageSize)),
+    totalPages: Math.max(1, Math.ceil(Number(total) / pageSize)),
   })
 }
 

@@ -10,6 +10,10 @@ import { CustomerSessionService } from '@open-mercato/core/modules/customer_acco
 import { CustomerRbacService } from '@open-mercato/core/modules/customer_accounts/services/customerRbacService'
 import { adminUpdateUserSchema } from '@open-mercato/core/modules/customer_accounts/data/validators'
 import { emitCustomerAccountsEvent } from '@open-mercato/core/modules/customer_accounts/events'
+import { findOneWithDecryption, findWithDecryption } from '@open-mercato/shared/lib/encryption/find'
+import { isOwnedCompanyEntity } from '@open-mercato/core/modules/customer_accounts/lib/customerEntityOwnership'
+import { enforceCommandOptimisticLock } from '@open-mercato/shared/lib/crud/optimistic-lock-command'
+import { isCrudHttpError } from '@open-mercato/shared/lib/crud/errors'
 
 export const metadata = {}
 
@@ -34,30 +38,41 @@ export async function GET(req: Request, { params }: { params: { id: string } }) 
 
   const em = container.resolve('em') as import('@mikro-orm/postgresql').EntityManager
 
-  const user = await em.findOne(CustomerUser, {
-    id: params.id,
-    tenantId: auth.tenantId,
-    deletedAt: null,
-  })
+  const user = await findOneWithDecryption(
+    em,
+    CustomerUser,
+    { id: params.id, tenantId: auth.tenantId, deletedAt: null } as any,
+    undefined,
+    { tenantId: auth.tenantId, organizationId: auth.orgId },
+  )
   if (!user) {
     return NextResponse.json({ ok: false, error: 'User not found' }, { status: 404 })
   }
 
-  const userRoles = await em.find(CustomerUserRole, {
-    user: user.id as any,
-    deletedAt: null,
-  }, { populate: ['role'] })
+  const userRoles = await findWithDecryption(
+    em,
+    CustomerUserRole,
+    { user: user.id as any, deletedAt: null } as any,
+    { populate: ['role'] },
+    { tenantId: auth.tenantId, organizationId: auth.orgId },
+  )
   const roles = userRoles.map((ur) => ({
     id: (ur.role as any).id,
     name: (ur.role as any).name,
     slug: (ur.role as any).slug,
   }))
 
-  const activeSessions = await em.find(CustomerUserSession, {
-    user: user.id as any,
-    deletedAt: null,
-    expiresAt: { $gt: new Date() },
-  }, { orderBy: { lastUsedAt: 'DESC' } })
+  const activeSessions = await findWithDecryption(
+    em,
+    CustomerUserSession,
+    {
+      user: user.id as any,
+      deletedAt: null,
+      expiresAt: { $gt: new Date() },
+    } as any,
+    { orderBy: { lastUsedAt: 'DESC' } },
+    { tenantId: auth.tenantId, organizationId: auth.orgId },
+  )
 
   const sessions = activeSessions.map((session) => ({
     id: session.id,
@@ -113,35 +128,83 @@ export async function PUT(req: Request, { params }: { params: { id: string } }) 
 
   const em = container.resolve('em') as import('@mikro-orm/postgresql').EntityManager
 
-  const user = await em.findOne(CustomerUser, {
-    id: params.id,
-    tenantId: auth.tenantId,
-    deletedAt: null,
-  })
+  const user = await findOneWithDecryption(
+    em,
+    CustomerUser,
+    { id: params.id, tenantId: auth.tenantId, deletedAt: null } as any,
+    undefined,
+    { tenantId: auth.tenantId, organizationId: auth.orgId },
+  )
   if (!user) {
     return NextResponse.json({ ok: false, error: 'User not found' }, { status: 404 })
   }
 
-  const updates: Record<string, unknown> = {}
+  // Optimistic lock: refuse a stale overwrite so two admins editing the same
+  // customer user in parallel cannot silently clobber each other (#2055). The
+  // check is strictly additive — a no-op when the client sends no expected-version header.
+  try {
+    enforceCommandOptimisticLock({
+      resourceKind: 'customer_accounts.user',
+      resourceId: user.id,
+      current: user.updatedAt ?? null,
+      request: req,
+    })
+  } catch (err) {
+    if (isCrudHttpError(err)) return NextResponse.json(err.body, { status: err.status })
+    throw err
+  }
+
+  // Reject a customerEntityId the caller does not own before persisting it.
+  // Without this check a mislinked company FK cross-links the user into another
+  // org/company's portal context and persists indefinitely (#2693). A null value
+  // (unlink) needs no ownership check.
+  if (parsed.data.customerEntityId) {
+    const owned = await isOwnedCompanyEntity(em, parsed.data.customerEntityId, {
+      tenantId: auth.tenantId,
+      organizationId: auth.orgId,
+    })
+    if (!owned) {
+      return NextResponse.json({ ok: false, error: 'Company not found' }, { status: 400 })
+    }
+  }
+
+  // Always bump updated_at so the optimistic-lock version advances on every save.
+  // `nativeUpdate` bypasses MikroORM's `onUpdate` hook, so set it explicitly — without
+  // this the version never changes and concurrent edits cannot be detected (#2055).
+  const nextUpdatedAt = new Date()
+  const updates: Record<string, unknown> = { updatedAt: nextUpdatedAt }
   if (parsed.data.displayName !== undefined) updates.displayName = parsed.data.displayName
   if (parsed.data.isActive !== undefined) updates.isActive = parsed.data.isActive
   if (parsed.data.lockedUntil !== undefined) updates.lockedUntil = parsed.data.lockedUntil ? new Date(parsed.data.lockedUntil) : null
   if (parsed.data.personEntityId !== undefined) updates.personEntityId = parsed.data.personEntityId
   if (parsed.data.customerEntityId !== undefined) updates.customerEntityId = parsed.data.customerEntityId
 
-  if (Object.keys(updates).length > 0) {
-    await em.nativeUpdate(CustomerUser, { id: user.id }, updates)
-  }
+  await em.nativeUpdate(CustomerUser, { id: user.id }, updates)
 
   let rolesChanged = false
   if (parsed.data.roleIds !== undefined) {
-    const validRoles: InstanceType<typeof CustomerRole>[] = []
-    for (const roleId of parsed.data.roleIds) {
-      const role = await em.findOne(CustomerRole, { id: roleId, tenantId: auth.tenantId, deletedAt: null })
-      if (!role) {
-        return NextResponse.json({ ok: false, error: `Role ${roleId} not found` }, { status: 400 })
-      }
-      validRoles.push(role)
+    const requestedRoleIds = parsed.data.roleIds
+    // Scope role resolution to the caller's organization too — CustomerRole is
+    // org-scoped, so a tenant-only filter would let an admin link roles from
+    // another org in the same tenant (#2693).
+    const validRoles = requestedRoleIds.length > 0
+      ? await findWithDecryption(
+          em,
+          CustomerRole,
+          {
+            id: { $in: requestedRoleIds } as any,
+            tenantId: auth.tenantId,
+            organizationId: auth.orgId,
+            deletedAt: null,
+          } as any,
+          undefined,
+          { tenantId: auth.tenantId, organizationId: auth.orgId },
+        )
+      : []
+    if (validRoles.length !== requestedRoleIds.length) {
+      const foundIds = new Set(validRoles.map((role) => role.id))
+      const missingId = requestedRoleIds.find((roleId) => !foundIds.has(roleId))
+      return NextResponse.json({ ok: false, error: `Role ${missingId} not found` }, { status: 400 })
     }
 
     await em.nativeDelete(CustomerUserRole, { user: user.id } as Record<string, unknown>)
@@ -165,13 +228,14 @@ export async function PUT(req: Request, { params }: { params: { id: string } }) 
 
   void emitCustomerAccountsEvent('customer_accounts.user.updated', {
     id: user.id,
+    recipientUserId: user.id,
     email: user.email,
     tenantId: auth.tenantId,
     organizationId: auth.orgId,
     updatedBy: auth.sub,
   }).catch(() => undefined)
 
-  return NextResponse.json({ ok: true })
+  return NextResponse.json({ ok: true, updatedAt: nextUpdatedAt.toISOString() })
 }
 
 export async function DELETE(req: Request, { params }: { params: { id: string } }) {
@@ -189,13 +253,29 @@ export async function DELETE(req: Request, { params }: { params: { id: string } 
 
   const em = container.resolve('em') as import('@mikro-orm/postgresql').EntityManager
 
-  const user = await em.findOne(CustomerUser, {
-    id: params.id,
-    tenantId: auth.tenantId,
-    deletedAt: null,
-  })
+  const user = await findOneWithDecryption(
+    em,
+    CustomerUser,
+    { id: params.id, tenantId: auth.tenantId, deletedAt: null } as any,
+    undefined,
+    { tenantId: auth.tenantId, organizationId: auth.orgId },
+  )
   if (!user) {
     return NextResponse.json({ ok: false, error: 'User not found' }, { status: 404 })
+  }
+
+  // Optimistic lock: refuse a stale delete (e.g. deleting a record another admin
+  // already modified). Strictly additive — a no-op without the expected-version header.
+  try {
+    enforceCommandOptimisticLock({
+      resourceKind: 'customer_accounts.user',
+      resourceId: user.id,
+      current: user.updatedAt ?? null,
+      request: req,
+    })
+  } catch (err) {
+    if (isCrudHttpError(err)) return NextResponse.json(err.body, { status: err.status })
+    throw err
   }
 
   const customerUserService = container.resolve('customerUserService') as CustomerUserService

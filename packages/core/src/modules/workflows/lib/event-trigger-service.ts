@@ -6,9 +6,12 @@
  */
 
 import type { EntityManager } from '@mikro-orm/core'
+import type { EntityManager as PostgreSqlEntityManager } from '@mikro-orm/postgresql'
 import type { AwilixContainer } from 'awilix'
 import type { CacheService } from '@open-mercato/cache'
 import { matchEventPattern } from '@open-mercato/shared/lib/events/patterns'
+import { findWithDecryption } from '@open-mercato/shared/lib/encryption/find'
+import { testLinearRegex } from '@open-mercato/shared/lib/regex/linear'
 import {
   WorkflowEventTrigger,
   WorkflowDefinition,
@@ -74,6 +77,9 @@ const TRIGGER_CACHE_TTL = 5 * 60 * 1000
 // Filter Evaluation
 // ============================================================================
 
+const MAX_WORKFLOW_REGEX_PATTERN_LENGTH = 200
+const MAX_WORKFLOW_REGEX_INPUT_LENGTH = 10_000
+
 /**
  * Get a nested value from an object using dot notation.
  */
@@ -90,6 +96,111 @@ function getNestedValue(obj: unknown, path: string): unknown {
   }
 
   return current
+}
+
+function getQuantifierEnd(pattern: string, index: number): number | null {
+  const char = pattern[index]
+  if (char === '*' || char === '+' || char === '?') return index
+  if (char !== '{') return null
+
+  const closeIndex = pattern.indexOf('}', index + 1)
+  if (closeIndex === -1) return null
+
+  const body = pattern.slice(index + 1, closeIndex)
+  return /^[0-9]+(?:,[0-9]*)?$/.test(body) ? closeIndex : null
+}
+
+interface RegexGroupFrame {
+  hasAlternation: boolean
+  hasQuantifier: boolean
+}
+
+function isSafeWorkflowRegexPattern(pattern: string): boolean {
+  if (pattern.length > MAX_WORKFLOW_REGEX_PATTERN_LENGTH) return false
+
+  const groupStack: RegexGroupFrame[] = [{ hasAlternation: false, hasQuantifier: false }]
+  let inCharClass = false
+  let lastClosedGroup: RegexGroupFrame | null = null
+  let lastAtomWasQuantified = false
+
+  for (let index = 0; index < pattern.length; index += 1) {
+    const char = pattern[index]
+
+    if (char === '\\') {
+      const next = pattern[index + 1]
+      if (!inCharClass && (/[1-9]/.test(next ?? '') || (next === 'k' && pattern[index + 2] === '<'))) {
+        return false
+      }
+      index += 1
+      lastClosedGroup = null
+      lastAtomWasQuantified = false
+      continue
+    }
+
+    if (inCharClass) {
+      if (char === ']') {
+        inCharClass = false
+        lastAtomWasQuantified = false
+      }
+      lastClosedGroup = null
+      continue
+    }
+
+    if (char === '[') {
+      inCharClass = true
+      lastClosedGroup = null
+      lastAtomWasQuantified = false
+      continue
+    }
+
+    if (char === '(') {
+      if (pattern[index + 1] === '?') {
+        if (pattern[index + 2] !== ':') return false
+        index += 2
+      }
+
+      groupStack.push({ hasAlternation: false, hasQuantifier: false })
+      lastClosedGroup = null
+      lastAtomWasQuantified = false
+      continue
+    }
+
+    if (char === ')') {
+      if (groupStack.length === 1) return false
+      lastClosedGroup = groupStack.pop()!
+      lastAtomWasQuantified = false
+      continue
+    }
+
+    if (char === '|') {
+      groupStack[groupStack.length - 1].hasAlternation = true
+      lastClosedGroup = null
+      lastAtomWasQuantified = false
+      continue
+    }
+
+    const quantifierEnd = getQuantifierEnd(pattern, index)
+    if (quantifierEnd !== null) {
+      if (lastAtomWasQuantified) return false
+      if (lastClosedGroup?.hasAlternation || lastClosedGroup?.hasQuantifier) return false
+
+      groupStack[groupStack.length - 1].hasQuantifier = true
+      lastClosedGroup = null
+      lastAtomWasQuantified = true
+      index = quantifierEnd
+
+      if (pattern[index + 1] === '?') {
+        index += 1
+      }
+
+      continue
+    }
+
+    lastClosedGroup = null
+    lastAtomWasQuantified = false
+  }
+
+  return groupStack.length === 1 && !inCharClass
 }
 
 /**
@@ -147,11 +258,14 @@ function evaluateCondition(condition: TriggerFilterCondition, payload: Record<st
 
     case 'regex':
       if (typeof value !== 'string' || typeof expected !== 'string') return false
-      try {
-        const regex = new RegExp(expected)
-        return regex.test(value)
-      } catch {
-        return false
+      if (value.length > MAX_WORKFLOW_REGEX_INPUT_LENGTH) return false
+      if (!isSafeWorkflowRegexPattern(expected)) return false
+      {
+        const result = testLinearRegex(expected, value, {
+          maxPatternLength: MAX_WORKFLOW_REGEX_PATTERN_LENGTH,
+          maxInputLength: MAX_WORKFLOW_REGEX_INPUT_LENGTH,
+        })
+        return result.ok ? result.matched : false
       }
 
     default:
@@ -199,8 +313,26 @@ export function mapEventToContext(
 // Trigger Loading with Caching
 // ============================================================================
 
-// In-memory cache for triggers (per tenant/org)
-const triggerCache = new Map<string, CachedTriggers>()
+// In-memory cache for triggers (per tenant/org).
+// Park the Map on globalThis so the same compiled module loaded under two
+// paths (a Next.js server chunk vs. a worker resolving the file through a
+// different import root) shares one cache. Without this,
+// `invalidateTriggerCache(...)` called from the PUT /api/workflows/definitions
+// route clears its own copy while the wildcard event-trigger subscriber keeps
+// reading a stale copy populated before the trigger was added — newly added
+// triggers stay invisible for up to TRIGGER_CACHE_TTL. Mirrors the same
+// workaround used by the modules registry and `getDiRegistrars()`.
+const GLOBAL_TRIGGER_CACHE_KEY = '__openMercatoWorkflowTriggerCache__'
+
+function getTriggerCache(): Map<string, CachedTriggers> {
+  const existing = (globalThis as any)[GLOBAL_TRIGGER_CACHE_KEY] as
+    | Map<string, CachedTriggers>
+    | undefined
+  if (existing) return existing
+  const created = new Map<string, CachedTriggers>()
+  ;(globalThis as any)[GLOBAL_TRIGGER_CACHE_KEY] = created
+  return created
+}
 
 function getCacheKey(tenantId: string, organizationId: string): string {
   return `${tenantId}:${organizationId}`
@@ -215,7 +347,9 @@ async function loadLegacyTriggers(
   tenantId: string,
   organizationId: string
 ): Promise<UnifiedTrigger[]> {
-  const legacyTriggers = await em.find(
+  const postgresEm = em as unknown as PostgreSqlEntityManager
+  const legacyTriggers = await findWithDecryption(
+    postgresEm,
     WorkflowEventTrigger,
     {
       tenantId,
@@ -225,16 +359,19 @@ async function loadLegacyTriggers(
     },
     {
       orderBy: { priority: 'DESC', createdAt: 'ASC' },
-    }
+    },
+    { tenantId, organizationId },
   )
 
   // Get definitions for these triggers to get workflowId
   const definitionIds = [...new Set(legacyTriggers.map(t => t.workflowDefinitionId))]
-  const definitions = definitionIds.length > 0 ? await em.find(WorkflowDefinition, {
+  const definitions = definitionIds.length > 0 ? await findWithDecryption(postgresEm, WorkflowDefinition, {
     id: { $in: definitionIds },
+    tenantId,
+    organizationId,
     enabled: true,
     deletedAt: null,
-  }) : []
+  }, {}, { tenantId, organizationId }) : []
   const definitionMap = new Map(definitions.map(d => [d.id, d]))
 
   return legacyTriggers
@@ -269,15 +406,19 @@ async function loadEmbeddedTriggers(
   tenantId: string,
   organizationId: string
 ): Promise<UnifiedTrigger[]> {
+  const postgresEm = em as unknown as PostgreSqlEntityManager
   // Load all enabled definitions that may have triggers
-  const definitions = await em.find(
+  const definitions = await findWithDecryption(
+    postgresEm,
     WorkflowDefinition,
     {
       tenantId,
       organizationId,
       enabled: true,
       deletedAt: null,
-    }
+    },
+    {},
+    { tenantId, organizationId },
   )
 
   const triggers: UnifiedTrigger[] = []
@@ -322,9 +463,10 @@ export async function loadTriggersForTenant(
   cacheService?: CacheService
 ): Promise<UnifiedTrigger[]> {
   const cacheKey = getCacheKey(tenantId, organizationId)
+  const cache = getTriggerCache()
 
   // Check in-memory cache
-  const cached = triggerCache.get(cacheKey)
+  const cached = cache.get(cacheKey)
   if (cached && Date.now() - cached.cachedAt < TRIGGER_CACHE_TTL) {
     return cached.triggers
   }
@@ -340,7 +482,7 @@ export async function loadTriggersForTenant(
     .sort((a, b) => b.priority - a.priority)
 
   // Update cache
-  triggerCache.set(cacheKey, {
+  cache.set(cacheKey, {
     triggers: allTriggers,
     cachedAt: Date.now(),
   })
@@ -355,15 +497,16 @@ export async function loadTriggersForTenant(
  * - Workflow definitions with embedded triggers are created/updated/deleted
  */
 export function invalidateTriggerCache(tenantId: string, organizationId?: string): void {
+  const cache = getTriggerCache()
   if (organizationId) {
     // Invalidate specific org
     const cacheKey = getCacheKey(tenantId, organizationId)
-    triggerCache.delete(cacheKey)
+    cache.delete(cacheKey)
   } else {
     // Invalidate all orgs for tenant
-    for (const key of triggerCache.keys()) {
+    for (const key of cache.keys()) {
       if (key.startsWith(`${tenantId}:`)) {
-        triggerCache.delete(key)
+        cache.delete(key)
       }
     }
   }

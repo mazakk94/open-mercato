@@ -4,6 +4,13 @@ import * as React from 'react'
 import { Button } from '@open-mercato/ui/primitives/button'
 import { Input } from '@open-mercato/ui/primitives/input'
 import { Label } from '@open-mercato/ui/primitives/label'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@open-mercato/ui/primitives/select'
 import { Textarea } from '@open-mercato/ui/primitives/textarea'
 import { Trash2, Plus, ChevronUp, ChevronDown } from 'lucide-react'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
@@ -181,18 +188,21 @@ export function ActivitiesEditor({ value = [], onChange, error }: ActivitiesEdit
                   <Label htmlFor={`activity-${index}-type`} className="text-xs">
                     {t('workflows.activities.activityType')} *
                   </Label>
-                  <select
-                    id={`activity-${index}-type`}
+                  <Select
                     value={activity.activityType}
-                    onChange={(e) => updateActivity(index, 'activityType', e.target.value)}
-                    className="mt-1 w-full px-3 py-2 border border-gray-300 rounded-md text-sm"
+                    onValueChange={(value) => updateActivity(index, 'activityType', value)}
                   >
-                    {ACTIVITY_TYPES.map((type) => (
-                      <option key={type.value} value={type.value}>
-                        {t(`workflows.activities.types.${type.value}`)}
-                      </option>
-                    ))}
-                  </select>
+                    <SelectTrigger id={`activity-${index}-type`} className="mt-1">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {ACTIVITY_TYPES.map((type) => (
+                        <SelectItem key={type.value} value={type.value}>
+                          {t(`workflows.activities.types.${type.value}`)}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
                 </div>
                 <div>
                   <Label htmlFor={`activity-${index}-timeout`} className="text-xs">
@@ -263,6 +273,45 @@ export function ActivitiesEditor({ value = [], onChange, error }: ActivitiesEdit
                 </div>
               </div>
 
+              {activity.activityType === 'WAIT' && (
+                <div className="space-y-3">
+                  <div>
+                    <Label htmlFor={`activity-${index}-duration`} className="text-xs">
+                      {t('workflows.activities.waitDuration')}
+                    </Label>
+                    <Input
+                      id={`activity-${index}-duration`}
+                      value={activity.config?.duration || ''}
+                      onChange={(e) => updateActivity(index, 'config', { ...activity.config, duration: e.target.value, until: undefined })}
+                      placeholder={t('workflows.activities.waitDurationPlaceholder')}
+                      disabled={!!activity.config?.until}
+                      className="mt-1"
+                    />
+                    <p className="text-xs text-muted-foreground mt-1">
+                      {t('workflows.activities.waitDurationDescription')}
+                    </p>
+                  </div>
+                  <div className="text-xs text-center text-muted-foreground">{t('workflows.activities.waitOr')}</div>
+                  <div>
+                    <Label htmlFor={`activity-${index}-until`} className="text-xs">
+                      {t('workflows.activities.waitUntil')}
+                    </Label>
+                    <Input
+                      id={`activity-${index}-until`}
+                      type="datetime-local"
+                      value={activity.config?.until ? activity.config.until.slice(0, 16) : ''}
+                      onChange={(e) => updateActivity(index, 'config', { ...activity.config, until: e.target.value ? new Date(e.target.value).toISOString() : undefined, duration: undefined })}
+                      disabled={!!activity.config?.duration}
+                      className="mt-1"
+                    />
+                    <p className="text-xs text-muted-foreground mt-1">
+                      {t('workflows.activities.waitUntilDescription')}
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {activity.activityType !== 'WAIT' && (
               <div>
                 <Label htmlFor={`activity-${index}-config`} className="text-xs">
                   {t('workflows.activities.config')} (JSON)
@@ -283,6 +332,7 @@ export function ActivitiesEditor({ value = [], onChange, error }: ActivitiesEdit
                   className="mt-1 font-mono text-xs"
                 />
               </div>
+              )}
             </div>
           </div>
         ))}

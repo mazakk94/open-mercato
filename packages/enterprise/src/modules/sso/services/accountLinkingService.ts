@@ -4,6 +4,7 @@ import { findOneWithDecryption } from '@open-mercato/shared/lib/encryption/find'
 import { computeEmailHash } from '@open-mercato/core/modules/auth/lib/emailHash'
 import { SsoConfig, SsoIdentity, SsoRoleGrant, ScimToken } from '../data/entities'
 import { emitSsoEvent } from '../events'
+import { EmailNotVerifiedError } from '../lib/errors'
 import type { SsoIdentityPayload } from '../lib/types'
 
 export class AccountLinkingService {
@@ -21,7 +22,7 @@ export class AccountLinkingService {
     }
 
     if (idpPayload.emailVerified === false) {
-      throw new Error('IdP explicitly reported email as unverified — cannot link or provision account')
+      throw new EmailNotVerifiedError('IdP explicitly reported email as unverified — cannot link or provision account')
     }
 
     const emailDomain = idpPayload.email.split('@')[1]?.toLowerCase()
@@ -120,7 +121,7 @@ export class AccountLinkingService {
       createdAt: now,
       updatedAt: now,
     } as RequiredEntityData<SsoIdentity>)
-    await this.em.persistAndFlush(identity)
+    await this.em.persist(identity).flush()
 
     void emitSsoEvent('sso.identity.linked', {
       id: identity.id,
@@ -147,7 +148,7 @@ export class AccountLinkingService {
         isConfirmed: true,
         createdAt: new Date(),
       })
-      await txEm.persistAndFlush(user)
+      await txEm.persist(user).flush()
 
       await this.assignRolesFromSso(txEm, user, config, tenantId, idpPayload.groups)
 
@@ -167,7 +168,7 @@ export class AccountLinkingService {
         createdAt: now,
         updatedAt: now,
       } as RequiredEntityData<SsoIdentity>)
-      await txEm.persistAndFlush(identity)
+      await txEm.persist(identity).flush()
 
       void emitSsoEvent('sso.identity.created', {
         id: identity.id,
@@ -290,7 +291,7 @@ export class AccountLinkingService {
     if (existingLink) return
 
     const userRole = em.create(UserRole, { user, role, createdAt: new Date() })
-    await em.persistAndFlush(userRole)
+    await em.persist(userRole).flush()
   }
 }
 

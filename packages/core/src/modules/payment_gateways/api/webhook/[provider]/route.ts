@@ -2,6 +2,8 @@ import { NextResponse } from 'next/server'
 import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
 import { findWithDecryption } from '@open-mercato/shared/lib/encryption/find'
 import { readJsonSafe } from '@open-mercato/shared/lib/http/readJsonSafe'
+import { checkRateLimit, getClientIp, RATE_LIMIT_ERROR_FALLBACK } from '@open-mercato/shared/lib/ratelimit/helpers'
+import type { RateLimiterService } from '@open-mercato/shared/lib/ratelimit/service'
 import type { EntityManager } from '@mikro-orm/postgresql'
 import { getWebhookHandler } from '@open-mercato/shared/modules/payment_gateways/types'
 import type { IntegrationLogService } from '../../../../integrations/lib/log-service'
@@ -17,20 +19,12 @@ export const metadata = {
   POST: { requireAuth: false },
 }
 
-function readScopeFromEventData(data: Record<string, unknown>): { organizationId: string; tenantId: string } | null {
-  const metadata = data.metadata
-  if (!metadata || typeof metadata !== 'object') return null
+const WEBHOOK_VERIFICATION_FAILED = 'Webhook verification failed'
 
-  const metadataRecord = metadata as Record<string, unknown>
-  const organizationId = typeof metadataRecord.organizationId === 'string'
-    ? metadataRecord.organizationId.trim()
-    : ''
-  const tenantId = typeof metadataRecord.tenantId === 'string'
-    ? metadataRecord.tenantId.trim()
-    : ''
-
-  if (!organizationId || !tenantId) return null
-  return { organizationId, tenantId }
+const paymentGatewayWebhookRateLimitConfig = {
+  points: 60,
+  duration: 60,
+  keyPrefix: 'payment_gateways:webhook',
 }
 
 export async function POST(req: Request, { params }: { params: Promise<{ provider: string }> | { provider: string } }) {
@@ -41,6 +35,9 @@ export async function POST(req: Request, { params }: { params: Promise<{ provide
   if (!registration) {
     return NextResponse.json({ error: `No webhook handler for provider: ${providerKey}` }, { status: 404 })
   }
+
+  const rateLimitResponse = await checkProviderWebhookRateLimit(container, req, providerKey)
+  if (rateLimitResponse) return rateLimitResponse
 
   const rawBody = await req.text()
   const headers: Record<string, string> = {}
@@ -56,6 +53,13 @@ export async function POST(req: Request, { params }: { params: Promise<{ provide
   const sessionIdHint = registration.readSessionIdHint?.(payload) ?? null
 
   try {
+    // The webhook endpoint is unauthenticated. Tenant/organization scope MUST come from a
+    // GatewayTransaction whose per-tenant credentials successfully verify the inbound
+    // signature — NEVER from attacker-controlled payload metadata. If no candidate
+    // transaction can be located by the provider-reported session id, or no candidate's
+    // credentials can verify the signature, we fail closed with 401. This prevents
+    // forged webhooks (e.g. mock gateway PoC) from mutating another tenant's payment
+    // state via `event.data.metadata.{organizationId,tenantId}`.
     const candidates = sessionIdHint
       ? await findWithDecryption(
         em,
@@ -87,35 +91,16 @@ export async function POST(req: Request, { params }: { params: Promise<{ provide
       }
     }
 
-    if (!event) {
-      try {
-        event = await registration.handler({ rawBody, headers, credentials: {} })
-      } catch (error: unknown) {
-        throw lastVerificationError ?? error
-      }
-    }
-    if (!event) {
-      throw new Error('Webhook verification failed')
+    if (!event || !transaction || !matchedScope) {
+      throw lastVerificationError ?? new Error('Webhook verification failed: no matching transaction')
     }
 
-    if (!transaction && sessionIdHint) {
-      const derivedScope = readScopeFromEventData(event.data)
-      if (derivedScope) {
-        transaction = await service.findTransactionBySessionId(sessionIdHint, derivedScope, providerKey)
-        matchedScope = transaction
-          ? { organizationId: transaction.organizationId, tenantId: transaction.tenantId }
-          : derivedScope
-      }
-    }
-
-    const scope = transaction
-      ? { organizationId: transaction.organizationId, tenantId: transaction.tenantId }
-      : matchedScope ?? readScopeFromEventData(event.data)
+    const scope = matchedScope
 
     const jobPayload = {
       providerKey,
       event,
-      transactionId: transaction?.id ?? null,
+      transactionId: transaction.id,
       scope,
     }
 
@@ -137,8 +122,32 @@ export async function POST(req: Request, { params }: { params: Promise<{ provide
 
     return NextResponse.json({ received: true, queued: true }, { status: 202 })
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : 'Webhook verification failed'
-    return NextResponse.json({ error: message }, { status: 401 })
+    console.warn(`[payment_gateways] Webhook verification failed for provider "${providerKey}"`, err)
+    return NextResponse.json({ error: WEBHOOK_VERIFICATION_FAILED }, { status: 401 })
+  }
+}
+
+async function checkProviderWebhookRateLimit(
+  container: { resolve: (name: string) => unknown },
+  req: Request,
+  providerKey: string,
+): Promise<NextResponse | null> {
+  const rateLimiterService = tryResolve<RateLimiterService>(container, 'rateLimiterService')
+  if (!rateLimiterService) return null
+
+  return checkRateLimit(
+    rateLimiterService,
+    paymentGatewayWebhookRateLimitConfig,
+    `${providerKey}:${getClientIp(req, rateLimiterService.trustProxyDepth) ?? 'unknown'}`,
+    RATE_LIMIT_ERROR_FALLBACK,
+  )
+}
+
+function tryResolve<T>(container: { resolve: (name: string) => unknown }, name: string): T | null {
+  try {
+    return container.resolve(name) as T
+  } catch {
+    return null
   }
 }
 

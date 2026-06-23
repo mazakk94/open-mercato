@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from "next/server";
-import { promises as fs } from "fs";
 import type { OpenApiRouteDoc } from "@open-mercato/shared/lib/openapi";
 import { getAuthFromRequest } from "@open-mercato/shared/lib/auth/server";
 import { createRequestContainer } from "@open-mercato/shared/lib/di/container";
@@ -7,11 +6,15 @@ import {
   Attachment,
   AttachmentPartition,
 } from "@open-mercato/core/modules/attachments/data/entities";
-import { resolveAttachmentAbsolutePath } from "@open-mercato/core/modules/attachments/lib/storage";
 import type { EntityManager } from "@mikro-orm/postgresql";
-import { checkAttachmentAccess } from "@open-mercato/core/modules/attachments/lib/access";
+import { checkAttachmentAccess, isSuperAdminAuth } from "@open-mercato/core/modules/attachments/lib/access";
 import { z } from "zod";
 import { attachmentsTag, attachmentErrorSchema } from "../../openapi";
+import {
+  buildAttachmentContentDisposition,
+  canRenderInlineAttachment,
+} from "@open-mercato/core/modules/attachments/lib/security";
+import { StorageDriverFactory } from '../../../lib/drivers';
 
 export const metadata = {
   GET: { requireAuth: false },
@@ -31,8 +34,16 @@ export async function GET(
   const auth = await getAuthFromRequest(req);
   const { resolve } = await createRequestContainer();
   const em = resolve("em") as EntityManager;
+  const storageDriverFactory =
+    (resolve("storageDriverFactory") as StorageDriverFactory | null) ??
+    new StorageDriverFactory(em);
 
-  const attachment = await em.findOne(Attachment, { id });
+  const findFilter: Record<string, unknown> = { id };
+  if (auth && !isSuperAdminAuth(auth)) {
+    if (auth.tenantId) findFilter.tenantId = auth.tenantId;
+    if (auth.orgId) findFilter.organizationId = auth.orgId;
+  }
+  const attachment = await em.findOne(Attachment, findFilter);
   if (!attachment) {
     return NextResponse.json(
       { error: "Attachment not found" },
@@ -55,32 +66,37 @@ export async function GET(
     return NextResponse.json({ error: message }, { status: access.status });
   }
 
-  const filePath = resolveAttachmentAbsolutePath(
-    attachment.partitionCode,
-    attachment.storagePath,
-    attachment.storageDriver,
-  );
+  const driver = await storageDriverFactory.resolveForPartition(attachment.partitionCode, {
+    tenantId: attachment.tenantId ?? '',
+    organizationId: attachment.organizationId ?? '',
+  });
   let buffer: Buffer;
   try {
-    buffer = await fs.readFile(filePath);
+    const result = await driver.read(attachment.partitionCode, attachment.storagePath);
+    buffer = result.buffer;
   } catch {
     return NextResponse.json({ error: "File not available" }, { status: 404 });
   }
 
   const url = new URL(req.url);
   const forceDownload = url.searchParams.get("download") === "1";
+  const renderInline = !forceDownload && canRenderInlineAttachment(attachment.mimeType);
   const headers: Record<string, string> = {
-    "Content-Type": attachment.mimeType || "application/octet-stream",
     "Cache-Control": partition.isPublic
       ? "public, max-age=86400"
       : "private, max-age=60",
+    "Content-Security-Policy": "default-src 'none'; sandbox",
+    "Content-Type": renderInline
+      ? attachment.mimeType || "application/octet-stream"
+      : "application/octet-stream",
+    "Content-Disposition": buildAttachmentContentDisposition(
+      attachment.fileName,
+      renderInline ? "inline" : "attachment",
+    ),
+    "X-Content-Type-Options": "nosniff",
   };
   if (attachment.fileSize > 0) {
     headers["Content-Length"] = String(attachment.fileSize);
-  }
-  if (forceDownload) {
-    headers["Content-Disposition"] =
-      `attachment; filename="${encodeURIComponent(attachment.fileName)}"`;
   }
 
   const responseBody = new Uint8Array(buffer);

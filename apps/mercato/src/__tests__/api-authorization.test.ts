@@ -75,14 +75,67 @@ const mockedRouteModule = {
   },
 }
 
+const publicRouteModule = {
+  GET: createResponseHandler('PUBLIC GET'),
+  metadata: {
+    GET: {
+      requireAuth: false,
+    },
+  },
+}
+
+const missingMetadataRouteModule = {
+  GET: createResponseHandler('MISSING METADATA GET'),
+}
+
+const emptyMetadataRouteModule = {
+  GET: createResponseHandler('EMPTY METADATA GET'),
+  metadata: {},
+}
+
+const topLevelPublicRouteModule = {
+  POST: createResponseHandler('TOP LEVEL PUBLIC POST'),
+  metadata: { requireAuth: false },
+}
+
 function getMockedApiRoutes(): ApiRouteManifestEntry[] {
-  return [{
-    moduleId: 'example',
-    kind: 'route-file',
-    path: '/example/test',
-    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
-    load: async () => mockedRouteModule,
-  }]
+  return [
+    {
+      moduleId: 'example',
+      kind: 'route-file',
+      path: '/example/test',
+      methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
+      load: async () => mockedRouteModule,
+    },
+    {
+      moduleId: 'example',
+      kind: 'route-file',
+      path: '/example/public',
+      methods: ['GET'],
+      load: async () => publicRouteModule,
+    },
+    {
+      moduleId: 'example',
+      kind: 'route-file',
+      path: '/example/missing-metadata',
+      methods: ['GET'],
+      load: async () => missingMetadataRouteModule,
+    },
+    {
+      moduleId: 'example',
+      kind: 'route-file',
+      path: '/example/empty-metadata',
+      methods: ['GET'],
+      load: async () => emptyMetadataRouteModule,
+    },
+    {
+      moduleId: 'example',
+      kind: 'route-file',
+      path: '/example/top-level-public',
+      methods: ['POST'],
+      load: async () => topLevelPublicRouteModule,
+    },
+  ]
 }
 
 // Mock manifest-based API routing
@@ -192,14 +245,14 @@ describe('API Route Authorization', () => {
       expect(await response.json()).toEqual({ error: 'Unauthorized' })
     })
 
-    it('should deny access with insufficient role', async () => {
+    it('should allow access regardless of role when required features pass (requireRoles is advisory only)', async () => {
       mockResolveAuthFromRequestDetailed.mockResolvedValue(authenticatedAuth(['user']))
 
       const request = new NextRequest('http://localhost:3001/api/example/test')
       const response = await GET(request, { params: Promise.resolve({ slug: ['example', 'test'] }) })
 
-      expect(response.status).toBe(403)
-      await expect(response.json()).resolves.toMatchObject({ error: 'Forbidden' })
+      expect(response.status).toBe(200)
+      expect(await response.text()).toBe('GET success')
     })
 
     it('should deny access when required features are missing (rbac returns false)', async () => {
@@ -211,6 +264,32 @@ describe('API Route Authorization', () => {
 
       expect(response.status).toBe(403)
       await expect(response.json()).resolves.toMatchObject({ error: 'Forbidden' })
+    })
+
+    it('should enforce top-level metadata for route files when method metadata is absent', async () => {
+      const originalMetadata = mockedRouteModule.metadata
+      mockedRouteModule.metadata = {
+        requireAuth: true,
+        requireFeatures: ['example.todos.view'],
+      } as RouteMetadata & typeof mockedRouteModule.metadata
+
+      try {
+        mockResolveAuthFromRequestDetailed.mockResolvedValue(authenticatedAuth(['admin'], 'admin@test.com'))
+        mockRbac.userHasAllFeatures.mockResolvedValueOnce(false)
+
+        const request = new NextRequest('http://localhost:3001/api/example/test')
+        const response = await GET(request, { params: Promise.resolve({ slug: ['example', 'test'] }) })
+
+        expect(response.status).toBe(403)
+        await expect(response.json()).resolves.toMatchObject({ error: 'Forbidden' })
+        expect(mockRbac.userHasAllFeatures).toHaveBeenCalledWith(
+          'user1',
+          ['example.todos.view'],
+          expect.objectContaining({ tenantId: 'tenant1' }),
+        )
+      } finally {
+        mockedRouteModule.metadata = originalMetadata
+      }
     })
   })
 
@@ -239,14 +318,14 @@ describe('API Route Authorization', () => {
       expect(text).toBe('POST success')
     })
 
-    it('should deny access with insufficient role', async () => {
+    it('should allow access regardless of role when required features pass (requireRoles is advisory only)', async () => {
       mockResolveAuthFromRequestDetailed.mockResolvedValue(authenticatedAuth(['user']))
 
       const request = new NextRequest('http://localhost:3001/api/example/test', { method: 'POST' })
       const response = await POST(request, { params: Promise.resolve({ slug: ['example', 'test'] }) })
 
-      expect(response.status).toBe(403)
-      await expect(response.json()).resolves.toMatchObject({ error: 'Forbidden' })
+      expect(response.status).toBe(200)
+      expect(await response.text()).toBe('POST success')
     })
 
     it('should deny access when required features are missing on POST', async () => {
@@ -273,6 +352,74 @@ describe('API Route Authorization', () => {
     })
   })
 
+  describe('GET /example/public', () => {
+    it('should allow anonymous access only when requireAuth is explicitly false', async () => {
+      mockResolveAuthFromRequestDetailed.mockResolvedValue({ auth: null, status: 'missing' })
+
+      const request = new NextRequest('http://localhost:3001/api/example/public')
+      const response = await GET(request, { params: Promise.resolve({ slug: ['example', 'public'] }) })
+
+      expect(response.status).toBe(200)
+      expect(await response.text()).toBe('PUBLIC GET success')
+    })
+  })
+
+  describe('GET /example/missing-metadata', () => {
+    it('should deny anonymous access when route metadata is missing (secure by default)', async () => {
+      mockResolveAuthFromRequestDetailed.mockResolvedValue({ auth: null, status: 'missing' })
+
+      const request = new NextRequest('http://localhost:3001/api/example/missing-metadata')
+      const response = await GET(request, { params: Promise.resolve({ slug: ['example', 'missing-metadata'] }) })
+
+      expect(response.status).toBe(401)
+      expect(await response.json()).toEqual({ error: 'Unauthorized' })
+    })
+
+    it('should allow authenticated access when route metadata is missing', async () => {
+      mockResolveAuthFromRequestDetailed.mockResolvedValue(authenticatedAuth(['user']))
+
+      const request = new NextRequest('http://localhost:3001/api/example/missing-metadata')
+      const response = await GET(request, { params: Promise.resolve({ slug: ['example', 'missing-metadata'] }) })
+
+      expect(response.status).toBe(200)
+      expect(await response.text()).toBe('MISSING METADATA GET success')
+    })
+  })
+
+  describe('GET /example/empty-metadata', () => {
+    it('should deny anonymous access when metadata is an empty object (secure by default)', async () => {
+      mockResolveAuthFromRequestDetailed.mockResolvedValue({ auth: null, status: 'missing' })
+
+      const request = new NextRequest('http://localhost:3001/api/example/empty-metadata')
+      const response = await GET(request, { params: Promise.resolve({ slug: ['example', 'empty-metadata'] }) })
+
+      expect(response.status).toBe(401)
+      expect(await response.json()).toEqual({ error: 'Unauthorized' })
+    })
+
+    it('should allow authenticated access when metadata is an empty object', async () => {
+      mockResolveAuthFromRequestDetailed.mockResolvedValue(authenticatedAuth(['user']))
+
+      const request = new NextRequest('http://localhost:3001/api/example/empty-metadata')
+      const response = await GET(request, { params: Promise.resolve({ slug: ['example', 'empty-metadata'] }) })
+
+      expect(response.status).toBe(200)
+      expect(await response.text()).toBe('EMPTY METADATA GET success')
+    })
+  })
+
+  describe('POST /example/top-level-public', () => {
+    it('should allow anonymous access when top-level requireAuth is false (login/signup pattern)', async () => {
+      mockResolveAuthFromRequestDetailed.mockResolvedValue({ auth: null, status: 'missing' })
+
+      const request = new NextRequest('http://localhost:3001/api/example/top-level-public', { method: 'POST' })
+      const response = await POST(request, { params: Promise.resolve({ slug: ['example', 'top-level-public'] }) })
+
+      expect(response.status).toBe(200)
+      expect(await response.text()).toBe('TOP LEVEL PUBLIC POST success')
+    })
+  })
+
   describe('PATCH /example/test', () => {
     it('should allow access with user role', async () => {
       mockResolveAuthFromRequestDetailed.mockResolvedValue(authenticatedAuth(['user']))
@@ -296,14 +443,17 @@ describe('API Route Authorization', () => {
       expect(await response.text()).toBe('DELETE success')
     })
 
-    it('should deny access with admin role (requires superuser)', async () => {
+    it('should allow any authenticated user when only deprecated requireRoles is set (no feature gate)', async () => {
+      // DELETE declares only `requireRoles: ['superuser']`. Because role-name guards are
+      // deprecated and advisory-only, a non-superuser authenticated caller is now allowed
+      // through — privileged endpoints MUST add a `requireFeatures` gate instead.
       mockResolveAuthFromRequestDetailed.mockResolvedValue(authenticatedAuth(['admin'], 'admin@test.com'))
 
       const request = new NextRequest('http://localhost:3001/api/example/test', { method: 'DELETE' })
       const response = await DELETE(request, { params: Promise.resolve({ slug: ['example', 'test'] }) })
 
-      expect(response.status).toBe(403)
-      await expect(response.json()).resolves.toMatchObject({ error: 'Forbidden' })
+      expect(response.status).toBe(200)
+      expect(await response.text()).toBe('DELETE success')
     })
   })
 
@@ -318,24 +468,24 @@ describe('API Route Authorization', () => {
   })
 
   describe('Edge cases', () => {
-    it('should handle empty roles array', async () => {
+    it('should not deny on an empty roles array when required features pass', async () => {
       mockResolveAuthFromRequestDetailed.mockResolvedValue(authenticatedAuth([]))
 
       const request = new NextRequest('http://localhost:3001/api/example/test')
       const response = await GET(request, { params: Promise.resolve({ slug: ['example', 'test'] }) })
 
-      expect(response.status).toBe(403)
-      await expect(response.json()).resolves.toMatchObject({ error: 'Forbidden' })
+      expect(response.status).toBe(200)
+      expect(await response.text()).toBe('GET success')
     })
 
-    it('should handle undefined roles', async () => {
+    it('should not deny on undefined roles when required features pass', async () => {
       mockResolveAuthFromRequestDetailed.mockResolvedValue(authenticatedAuth(undefined))
 
       const request = new NextRequest('http://localhost:3001/api/example/test')
       const response = await GET(request, { params: Promise.resolve({ slug: ['example', 'test'] }) })
 
-      expect(response.status).toBe(403)
-      await expect(response.json()).resolves.toMatchObject({ error: 'Forbidden' })
+      expect(response.status).toBe(200)
+      expect(await response.text()).toBe('GET success')
     })
 
     it('should handle empty requireRoles array', async () => {
@@ -359,6 +509,47 @@ describe('API Route Authorization', () => {
       const setCookie = response.headers.get('set-cookie') || ''
       expect(setCookie).toContain('auth_token=;')
       expect(setCookie).toContain('session_token=;')
+    })
+  })
+
+  describe('Deprecated requireRoles is advisory only (security: role names are spoofable)', () => {
+    it('does not grant access via a spoofed role when the required feature is missing', async () => {
+      // GET declares `requireRoles: ['admin']` + `requireFeatures: ['example.todos.view']`.
+      // A tenant admin who renames/creates a role literally named "admin" must NOT pass:
+      // role-name matching is ignored, and the missing feature grant still denies.
+      mockResolveAuthFromRequestDetailed.mockResolvedValue(authenticatedAuth(['admin'], 'spoofer@test.com'))
+      mockRbac.userHasAllFeatures.mockResolvedValueOnce(false)
+
+      const request = new NextRequest('http://localhost:3001/api/example/test')
+      const response = await GET(request, { params: Promise.resolve({ slug: ['example', 'test'] }) })
+
+      expect(response.status).toBe(403)
+      await expect(response.json()).resolves.toMatchObject({ error: 'Forbidden' })
+    })
+
+    it('does not include requiredRoles in the 403 body (role guard no longer participates)', async () => {
+      mockResolveAuthFromRequestDetailed.mockResolvedValue(authenticatedAuth(['admin'], 'admin@test.com'))
+      mockRbac.userHasAllFeatures.mockResolvedValueOnce(false)
+
+      const request = new NextRequest('http://localhost:3001/api/example/test')
+      const response = await GET(request, { params: Promise.resolve({ slug: ['example', 'test'] }) })
+
+      const body = await response.json()
+      expect(body).not.toHaveProperty('requiredRoles')
+      expect(body).toMatchObject({ error: 'Forbidden', requiredFeatures: ['example.todos.view'] })
+    })
+
+    it('allows an authenticated caller whose roles do not match the deprecated requireRoles list', async () => {
+      // DELETE declares only `requireRoles: ['superuser']`. A caller without that role name
+      // is now allowed through because the role guard is advisory only — there is no feature
+      // gate, so any authenticated user passes. (Privileged routes MUST add `requireFeatures`.)
+      mockResolveAuthFromRequestDetailed.mockResolvedValue(authenticatedAuth(['viewer'], 'viewer@test.com'))
+
+      const request = new NextRequest('http://localhost:3001/api/example/test', { method: 'DELETE' })
+      const response = await DELETE(request, { params: Promise.resolve({ slug: ['example', 'test'] }) })
+
+      expect(response.status).toBe(200)
+      expect(await response.text()).toBe('DELETE success')
     })
   })
 })

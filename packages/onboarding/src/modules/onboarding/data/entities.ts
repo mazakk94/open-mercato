@@ -1,4 +1,4 @@
-import { Entity, PrimaryKey, Property, Unique } from '@mikro-orm/core'
+import { Entity, PrimaryKey, Property, Unique } from '@mikro-orm/decorators/legacy'
 
 type OnboardingStatus = 'pending' | 'processing' | 'completed' | 'expired'
 
@@ -59,6 +59,9 @@ export class OnboardingRequest {
 
   @Property({ name: 'last_email_sent_at', type: Date, nullable: true })
   lastEmailSentAt?: Date | null
+
+  @Property({ name: 'preparation_started_at', type: Date, nullable: true })
+  preparationStartedAt?: Date | null
 
   @Property({ name: 'preparation_completed_at', type: Date, nullable: true })
   preparationCompletedAt?: Date | null

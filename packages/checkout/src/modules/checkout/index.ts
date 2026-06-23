@@ -1,5 +1,5 @@
 import type { ModuleInfo } from '@open-mercato/shared/modules/registry'
-import './commands'
+import './commands/index'
 
 export const metadata: ModuleInfo = {
   name: 'checkout',
@@ -7,7 +7,7 @@ export const metadata: ModuleInfo = {
   version: '0.1.0',
   description: 'Pay links, checkout templates, public payment pages, and checkout transaction tracking.',
   author: 'Open Mercato Team',
-  license: 'Proprietary',
+  license: 'MIT',
   ejectable: true,
 }
 

@@ -8,6 +8,13 @@ import { normalizeCustomFieldValues } from '@open-mercato/shared/lib/custom-fiel
 import { apiCall } from '@open-mercato/ui/backend/utils/apiCall'
 import { LookupSelect, type LookupSelectItem } from '@open-mercato/ui/backend/inputs'
 import { Button } from '@open-mercato/ui/primitives/button'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@open-mercato/ui/primitives/select'
 import { AttachmentsSection, TagsSection, type TagOption, type TagsSectionLabels } from '@open-mercato/ui/backend/detail'
 import { E } from '#generated/entities.ids.generated'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
@@ -25,6 +32,7 @@ export type TeamMemberFormValues = {
   roleIds?: string[]
   tags?: string[]
   isActive?: boolean
+  updatedAt?: string | null
 } & Record<string, unknown>
 
 export type TeamMemberFormProps = {
@@ -177,6 +185,32 @@ export function TeamMemberForm(props: TeamMemberFormProps) {
   }, [scopeVersion])
 
   React.useEffect(() => {
+    if (!resolvedTeamId) return
+    if (teamOptions.some((option) => option.value === resolvedTeamId)) return
+    const selectedTeamId = resolvedTeamId
+    let cancelled = false
+    async function loadSelectedTeam() {
+      try {
+        const call = await apiCall<TeamsResponse>(`/api/staff/teams?ids=${encodeURIComponent(selectedTeamId)}&pageSize=1`)
+        const entry = Array.isArray(call.result?.items) ? call.result.items[0] : null
+        const entryId = typeof entry?.id === 'string' ? entry.id : null
+        const entryName = typeof entry?.name === 'string' ? entry.name : null
+        if (!entryId || !entryName) return
+        if (!cancelled) {
+          setTeamOptions((prev) => {
+            if (prev.some((option) => option.value === entryId)) return prev
+            return [{ value: entryId, label: entryName }, ...prev]
+          })
+        }
+      } catch {
+        if (!cancelled) setTeamOptions((prev) => prev)
+      }
+    }
+    loadSelectedTeam()
+    return () => { cancelled = true }
+  }, [resolvedTeamId, teamOptions])
+
+  React.useEffect(() => {
     if (!resolvedUserId) return
     const userId = resolvedUserId
     if (userOptions.some((option) => option.id === resolvedUserId)) return
@@ -275,6 +309,8 @@ export function TeamMemberForm(props: TeamMemberFormProps) {
         type: 'custom',
         component: ({ value, setValue, setFormValue, values, disabled }) => {
           const currentValue = typeof value === 'string' ? value : ''
+          const selectedOption = teamOptions.find((option) => option.value === currentValue)
+          const optionsKey = teamOptions.map((option) => `${option.value}:${option.label}`).join('\0')
           return (
             <div className="space-y-2">
               <div className="flex items-center justify-between gap-3">
@@ -292,12 +328,12 @@ export function TeamMemberForm(props: TeamMemberFormProps) {
                   {translate('staff.teamMembers.form.actions.createTeam', 'Create new team')}
                 </Button>
               </div>
-              <select
-                className="w-full h-9 rounded border px-2 text-sm"
+              <Select
+                key={`team:${currentValue}:${optionsKey}`}
                 value={currentValue}
-                onChange={(event) => {
-                  const nextValue = event.target.value || undefined
-                  const nextTeamId = event.target.value || null
+                onValueChange={(value) => {
+                  const nextValue = value || undefined
+                  const nextTeamId = value || null
                   setValue(nextValue)
                   setSelectedTeamId(nextTeamId)
                   if (!setFormValue) return
@@ -310,16 +346,21 @@ export function TeamMemberForm(props: TeamMemberFormProps) {
                     setFormValue('roleIds', nextRoleIds)
                   }
                 }}
-                data-crud-focus-target=""
                 disabled={disabled}
               >
-                <option value="">{translate('ui.forms.select.emptyOption', '—')}</option>
-                {teamOptions.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
+                <SelectTrigger data-crud-focus-target="">
+                  <SelectValue placeholder={translate('ui.forms.select.emptyOption', '—')}>
+                    {selectedOption?.label}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  {teamOptions.map((option) => (
+                    <SelectItem key={option.value} value={option.value}>
+                      {option.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </div>
           )
         },
@@ -413,9 +454,12 @@ export function TeamMemberForm(props: TeamMemberFormProps) {
     ]
 
     if (!tagsSection) {
+      // The tags field lives in its own card whose group title already reads
+      // "Tags" (see groups below). Leave the field label empty so the heading
+      // is not rendered twice in the team member edit view.
       baseFields.splice(5, 0, {
         id: 'tags',
-        label: translate('staff.teamMembers.form.fields.tags', 'Tags'),
+        label: '',
         type: 'tags',
         placeholder: translate('staff.teamMembers.form.fields.tags.placeholder', 'Add tags'),
       })
@@ -506,6 +550,7 @@ export function TeamMemberForm(props: TeamMemberFormProps) {
       groups={groups}
       entityId={E.staff.staff_team_member}
       initialValues={initialValues}
+      optimisticLockUpdatedAt={initialValues.updatedAt}
       onSubmit={onSubmit}
       onDelete={onDelete}
       isLoading={isLoading}

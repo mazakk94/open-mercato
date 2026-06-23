@@ -231,6 +231,94 @@ describe('SearchService', () => {
       expect(results).toHaveLength(1)
       expect(results[0].source).toBe('fallback')
     })
+
+    it('should drop cross-organization results for scoped multi-org searches', async () => {
+      const strategy = createMockStrategy({
+        id: 'test',
+        search: jest.fn().mockResolvedValue([
+          createMockResult({ recordId: 'rec-a', organizationId: 'org-A' }),
+          createMockResult({ recordId: 'rec-b', organizationId: 'org-B' }),
+          createMockResult({ recordId: 'rec-c', organizationId: 'org-C' }),
+          createMockResult({ recordId: 'rec-unknown', organizationId: undefined }),
+        ]),
+      })
+      const service = new SearchService({
+        strategies: [strategy],
+        defaultStrategies: ['test'],
+      })
+
+      const results = await service.search('test', {
+        tenantId: 'tenant-123',
+        organizationIds: ['org-A', 'org-B'],
+      })
+
+      expect(results.map((result) => result.recordId)).toEqual(['rec-a', 'rec-b'])
+    })
+
+    it('should fail closed for an empty organization allowlist', async () => {
+      const strategy = createMockStrategy({
+        id: 'test',
+        search: jest.fn().mockResolvedValue([
+          createMockResult({ recordId: 'rec-a', organizationId: 'org-A' }),
+        ]),
+      })
+      const service = new SearchService({
+        strategies: [strategy],
+        defaultStrategies: ['test'],
+      })
+
+      const results = await service.search('test', {
+        tenantId: 'tenant-123',
+        organizationIds: [],
+      })
+
+      expect(results).toEqual([])
+      expect(strategy.search).not.toHaveBeenCalled()
+    })
+
+    it('should enrich results when navigation metadata is missing even if presenter title exists', async () => {
+      const strategy = createMockStrategy({
+        id: 'test',
+        search: jest.fn().mockResolvedValue([
+          createMockResult({
+            presenter: { title: 'Needs Link' },
+            url: undefined,
+            links: [],
+          }),
+        ]),
+      })
+      const presenterEnricher = jest.fn().mockResolvedValue([
+        createMockResult({
+          presenter: { title: 'Needs Link' },
+          url: '/backend/test/rec-123',
+          links: [{ href: '/backend/test/rec-123/edit', label: 'Edit', kind: 'secondary' }],
+        }),
+      ])
+      const service = new SearchService({
+        strategies: [strategy],
+        defaultStrategies: ['test'],
+        presenterEnricher,
+      })
+
+      const results = await service.search('test', { tenantId: 'tenant-123' })
+
+      expect(presenterEnricher).toHaveBeenCalledWith(
+        expect.arrayContaining([
+          expect.objectContaining({
+            recordId: 'rec-123',
+            presenter: { title: 'Needs Link' },
+            url: undefined,
+            links: [],
+          }),
+        ]),
+        'tenant-123',
+        undefined,
+      )
+      expect(results[0].url).toBe('/backend/test/rec-123')
+      expect(results[0].links).toEqual([
+        { href: '/backend/test/rec-123/edit', label: 'Edit', kind: 'secondary' },
+      ])
+    })
   })
 
   describe('index', () => {
@@ -266,6 +354,52 @@ describe('SearchService', () => {
 
       expect(availableStrategy.index).toHaveBeenCalled()
       expect(unavailableStrategy.index).not.toHaveBeenCalled()
+    })
+
+    // issue #3103: a strategy index failure must surface to the caller so the
+    // queue worker re-throws and the job is retried instead of silently completing.
+    it('should reject when a strategy index fails (so the queue can retry)', async () => {
+      const strategy = createMockStrategy({
+        id: 'vector',
+        index: jest.fn().mockRejectedValue(new Error('sorry, too many clients already')),
+      })
+      const service = new SearchService({ strategies: [strategy] })
+
+      await expect(service.index(createMockRecord())).rejects.toThrow(
+        'Search index failed for 1 strategy(ies): vector (sorry, too many clients already)'
+      )
+    })
+
+    it('should still reject when only one of several strategies fails', async () => {
+      const ok = createMockStrategy({ id: 'tokens', index: jest.fn().mockResolvedValue(undefined) })
+      const failing = createMockStrategy({
+        id: 'vector',
+        index: jest.fn().mockRejectedValue(new Error('embedding provider blip')),
+      })
+      const service = new SearchService({ strategies: [ok, failing] })
+
+      await expect(service.index(createMockRecord())).rejects.toThrow(
+        'Search index failed for 1 strategy(ies): vector (embedding provider blip)'
+      )
+      // Successful strategies still commit their work.
+      expect(ok.index).toHaveBeenCalled()
+    })
+
+    it('should preserve the original strategy errors on the thrown AggregateError', async () => {
+      const cause = new Error('sorry, too many clients already')
+      const strategy = createMockStrategy({ id: 'vector', index: jest.fn().mockRejectedValue(cause) })
+      const service = new SearchService({ strategies: [strategy] })
+
+      await expect(service.index(createMockRecord())).rejects.toMatchObject({
+        errors: [cause],
+      })
+    })
+
+    it('should resolve when all strategies succeed', async () => {
+      const strategy = createMockStrategy({ id: 'tokens', index: jest.fn().mockResolvedValue(undefined) })
+      const service = new SearchService({ strategies: [strategy] })
+
+      await expect(service.index(createMockRecord())).resolves.toBeUndefined()
     })
   })
 
@@ -306,6 +440,36 @@ describe('SearchService', () => {
       expect(strategy.bulkIndex).not.toHaveBeenCalled()
       expect(strategy.index).not.toHaveBeenCalled()
     })
+
+    it('should throw error when strategy bulkIndex fails', async () => {
+      const strategy = createMockStrategy({
+        id: 'failing-strategy',
+        bulkIndex: jest.fn().mockRejectedValue(new Error('Index strategy failed')),
+      })
+      const service = new SearchService({ strategies: [strategy] })
+      const records = [createMockRecord({ recordId: 'rec-1' })]
+
+      await expect(service.bulkIndex(records)).rejects.toThrow(
+        'Bulk indexing failed for 1 strategy(ies): failing-strategy (Index strategy failed)'
+      )
+    })
+
+    it('should throw error when multiple strategies fail', async () => {
+      const strategy1 = createMockStrategy({
+        id: 'failing1',
+        bulkIndex: jest.fn().mockRejectedValue(new Error('First failure')),
+      })
+      const strategy2 = createMockStrategy({
+        id: 'failing2',
+        bulkIndex: jest.fn().mockRejectedValue(new Error('Second failure')),
+      })
+      const service = new SearchService({ strategies: [strategy1, strategy2] })
+      const records = [createMockRecord({ recordId: 'rec-1' })]
+
+      await expect(service.bulkIndex(records)).rejects.toThrow(
+        'Bulk indexing failed for 2 strategy(ies): failing1 (First failure), failing2 (Second failure)'
+      )
+    })
   })
 
   describe('delete', () => {
@@ -320,6 +484,19 @@ describe('SearchService', () => {
 
       expect(strategy1.delete).toHaveBeenCalledWith('test:entity', 'rec-123', 'tenant-123')
       expect(strategy2.delete).toHaveBeenCalledWith('test:entity', 'rec-123', 'tenant-123')
+    })
+
+    // issue #3103: deletes must also surface failures so removals are retried.
+    it('should reject when a strategy delete fails (so the queue can retry)', async () => {
+      const strategy = createMockStrategy({
+        id: 'fulltext',
+        delete: jest.fn().mockRejectedValue(new Error('connection reset')),
+      })
+      const service = new SearchService({ strategies: [strategy] })
+
+      await expect(service.delete('test:entity', 'rec-123', 'tenant-123')).rejects.toThrow(
+        'Search delete failed for 1 strategy(ies): fulltext (connection reset)'
+      )
     })
   })
 
@@ -339,7 +516,190 @@ describe('SearchService', () => {
 
       await service.purge('test:entity', 'tenant-123')
 
-      expect(strategyWithPurge.purge).toHaveBeenCalledWith('test:entity', 'tenant-123')
+      // organizationId is forwarded as undefined for a tenant-wide purge (issue #2935)
+      expect(strategyWithPurge.purge).toHaveBeenCalledWith('test:entity', 'tenant-123', undefined)
+    })
+
+    // issue #3103: purge failures must surface so the reindex job is retried.
+    it('should reject when a strategy purge fails (so the queue can retry)', async () => {
+      const strategy = createMockStrategy({
+        id: 'tokens',
+        purge: jest.fn().mockRejectedValue(new Error('sorry, too many clients already')),
+      })
+      const service = new SearchService({ strategies: [strategy] })
+
+      await expect(service.purge('test:entity', 'tenant-123')).rejects.toThrow(
+        'Search purge failed for 1 strategy(ies): tokens (sorry, too many clients already)'
+      )
+    })
+  })
+
+  describe('availability checks (issue #1404)', () => {
+    it('runs strategy availability probes in parallel, not sequentially', async () => {
+      const probeTimings: Record<string, { start: number; end: number }> = {}
+      const makeSlowStrategy = (id: string, delayMs: number) =>
+        createMockStrategy({
+          id,
+          isAvailable: jest.fn().mockImplementation(async () => {
+            const start = Date.now()
+            await new Promise((resolve) => setTimeout(resolve, delayMs))
+            probeTimings[id] = { start, end: Date.now() }
+            return true
+          }),
+          search: jest.fn().mockResolvedValue([]),
+        })
+
+      const slowA = makeSlowStrategy('slow-a', 60)
+      const slowB = makeSlowStrategy('slow-b', 60)
+      const slowC = makeSlowStrategy('slow-c', 60)
+      const service = new SearchService({
+        strategies: [slowA, slowB, slowC],
+        defaultStrategies: ['slow-a', 'slow-b', 'slow-c'],
+        availabilityCacheTtlMs: 0,
+      })
+
+      const start = Date.now()
+      await service.search('q', { tenantId: 't-1' })
+      const elapsed = Date.now() - start
+      const timings = Object.values(probeTimings)
+      const latestStart = Math.max(...timings.map((timing) => timing.start))
+      const earliestEnd = Math.min(...timings.map((timing) => timing.end))
+
+      // Sequential probes would not overlap. Parallel probes must overlap in time,
+      // and total elapsed time should stay well below a fully sequential run.
+      expect(timings).toHaveLength(3)
+      expect(latestStart).toBeLessThan(earliestEnd)
+      expect(elapsed).toBeLessThan(450)
+      expect(slowA.isAvailable).toHaveBeenCalledTimes(1)
+      expect(slowB.isAvailable).toHaveBeenCalledTimes(1)
+      expect(slowC.isAvailable).toHaveBeenCalledTimes(1)
+    })
+
+    it('caches positive availability checks within the TTL window', async () => {
+      const strategy = createMockStrategy({
+        id: 'cached',
+        isAvailable: jest.fn().mockResolvedValue(true),
+        search: jest.fn().mockResolvedValue([]),
+      })
+      const service = new SearchService({
+        strategies: [strategy],
+        defaultStrategies: ['cached'],
+        availabilityCacheTtlMs: 60_000,
+      })
+
+      await service.search('q', { tenantId: 't-1' })
+      await service.search('q', { tenantId: 't-1' })
+      await service.search('q', { tenantId: 't-1' })
+
+      expect(strategy.isAvailable).toHaveBeenCalledTimes(1)
+    })
+
+    it('caches negative availability checks within the TTL window', async () => {
+      const strategy = createMockStrategy({
+        id: 'down',
+        isAvailable: jest.fn().mockResolvedValue(false),
+        search: jest.fn().mockResolvedValue([]),
+      })
+      const service = new SearchService({
+        strategies: [strategy],
+        defaultStrategies: ['down'],
+        availabilityCacheTtlMs: 60_000,
+      })
+
+      await service.search('q', { tenantId: 't-1' })
+      await service.search('q', { tenantId: 't-1' })
+
+      expect(strategy.isAvailable).toHaveBeenCalledTimes(1)
+    })
+
+    it('caches thrown availability errors as unavailable within the TTL window', async () => {
+      const strategy = createMockStrategy({
+        id: 'flaky',
+        isAvailable: jest.fn().mockRejectedValue(new Error('boom')),
+        search: jest.fn().mockResolvedValue([]),
+      })
+      const service = new SearchService({
+        strategies: [strategy],
+        defaultStrategies: ['flaky'],
+        availabilityCacheTtlMs: 60_000,
+      })
+
+      const r1 = await service.search('q', { tenantId: 't-1' })
+      const r2 = await service.search('q', { tenantId: 't-1' })
+
+      expect(r1).toEqual([])
+      expect(r2).toEqual([])
+      expect(strategy.isAvailable).toHaveBeenCalledTimes(1)
+      expect(strategy.search).not.toHaveBeenCalled()
+    })
+
+    it('coalesces concurrent probes of the same strategy onto a single in-flight call', async () => {
+      let resolveProbe: ((value: boolean) => void) | undefined
+      const strategy = createMockStrategy({
+        id: 'coalesced',
+        isAvailable: jest.fn().mockImplementation(
+          () =>
+            new Promise<boolean>((resolve) => {
+              resolveProbe = resolve
+            }),
+        ),
+        search: jest.fn().mockResolvedValue([]),
+      })
+      const service = new SearchService({
+        strategies: [strategy],
+        defaultStrategies: ['coalesced'],
+        availabilityCacheTtlMs: 0,
+      })
+
+      const p1 = service.search('q', { tenantId: 't-1' })
+      const p2 = service.search('q', { tenantId: 't-1' })
+      const p3 = service.isStrategyAvailable('coalesced')
+
+      // Wait a tick so all three callers register their probes.
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      resolveProbe?.(true)
+      await Promise.all([p1, p2, p3])
+
+      expect(strategy.isAvailable).toHaveBeenCalledTimes(1)
+    })
+
+    it('invalidates the availability cache on demand', async () => {
+      const strategy = createMockStrategy({
+        id: 'invalidated',
+        isAvailable: jest.fn().mockResolvedValue(true),
+        search: jest.fn().mockResolvedValue([]),
+      })
+      const service = new SearchService({
+        strategies: [strategy],
+        defaultStrategies: ['invalidated'],
+        availabilityCacheTtlMs: 60_000,
+      })
+
+      await service.search('q', { tenantId: 't-1' })
+      service.invalidateAvailabilityCache('invalidated')
+      await service.search('q', { tenantId: 't-1' })
+
+      expect(strategy.isAvailable).toHaveBeenCalledTimes(2)
+    })
+
+    it('invalidates cached availability when a strategy is unregistered and re-registered', async () => {
+      const strategy = createMockStrategy({
+        id: 'reregistered',
+        isAvailable: jest.fn().mockResolvedValue(true),
+        search: jest.fn().mockResolvedValue([]),
+      })
+      const service = new SearchService({
+        strategies: [strategy],
+        defaultStrategies: ['reregistered'],
+        availabilityCacheTtlMs: 60_000,
+      })
+
+      await service.search('q', { tenantId: 't-1' })
+      service.unregisterStrategy('reregistered')
+      service.registerStrategy(strategy)
+      await service.search('q', { tenantId: 't-1' })
+
+      expect(strategy.isAvailable).toHaveBeenCalledTimes(2)
     })
   })
 })

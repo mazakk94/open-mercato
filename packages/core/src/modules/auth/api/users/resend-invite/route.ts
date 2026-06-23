@@ -12,9 +12,13 @@ import { rateLimitErrorSchema } from '@open-mercato/shared/lib/ratelimit/helpers
 import { readEndpointRateLimitConfig } from '@open-mercato/shared/lib/ratelimit/config'
 import { checkAuthRateLimit } from '@open-mercato/core/modules/auth/lib/rateLimitCheck'
 import { validateCrudMutationGuard, runCrudMutationGuardAfterSuccess } from '@open-mercato/shared/lib/crud/mutation-guard'
-import { INVITE_TOKEN_TTL_MS, resolveInviteBaseUrl } from '@open-mercato/core/modules/auth/lib/inviteToken'
+import { INVITE_TOKEN_TTL_MS } from '@open-mercato/core/modules/auth/lib/inviteToken'
+import { getSecurityEmailBaseUrl, mapSecurityEmailUrlError } from '@open-mercato/shared/lib/url'
+import { generateAuthToken, hashAuthToken } from '@open-mercato/core/modules/auth/lib/tokenHash'
+import { assertActorCanAccessUserTarget } from '@open-mercato/core/modules/auth/lib/grantChecks'
+import type { RbacService } from '@open-mercato/core/modules/auth/services/rbacService'
+import { isCrudHttpError } from '@open-mercato/shared/lib/crud/errors'
 import type { EntityManager } from '@mikro-orm/postgresql'
-import crypto from 'node:crypto'
 
 const resendInviteRateLimitConfig = readEndpointRateLimitConfig('RESEND_INVITE', {
   points: 3, duration: 300, blockDuration: 300, keyPrefix: 'resend-invite',
@@ -79,6 +83,23 @@ export async function POST(req: Request) {
     console.error('[auth.users.resend-invite] Failed to resolve rbac:', err)
   }
 
+  if (auth.sub) {
+    try {
+      await assertActorCanAccessUserTarget({
+        em,
+        rbacService: container.resolve('rbacService') as RbacService,
+        actorUserId: auth.sub,
+        tenantId: auth.tenantId ?? null,
+        organizationId: auth.orgId ?? null,
+        targetUserId: parsed.data.id,
+        actorIsSuperAdmin: isSuperAdmin,
+      })
+    } catch (err) {
+      if (isCrudHttpError(err)) return NextResponse.json(err.body, { status: err.status })
+      throw err
+    }
+  }
+
   const where: Record<string, unknown> = { id: parsed.data.id, deletedAt: null }
   if (!isSuperAdmin) {
     if (!auth.tenantId) return NextResponse.json({ error: 'User not found' }, { status: 404 })
@@ -106,19 +127,31 @@ export async function POST(req: Request) {
     return NextResponse.json(guardResult.body, { status: guardResult.status })
   }
 
+  let base: string
+  try {
+    base = getSecurityEmailBaseUrl(req.url)
+  } catch (error) {
+    const mapped = mapSecurityEmailUrlError(error, {
+      scope: 'auth.users.resend-invite',
+      configMessage: 'Invitation email is not configured',
+    })
+    if (mapped) return NextResponse.json(mapped.body, { status: mapped.status })
+    throw error
+  }
+
   await em.nativeUpdate(
     PasswordReset,
     { user: user.id, usedAt: null } as any,
     { usedAt: new Date() },
   )
 
-  const token = crypto.randomBytes(32).toString('hex')
+  const rawToken = generateAuthToken()
+  const tokenHash = hashAuthToken(rawToken)
   const expiresAt = new Date(Date.now() + INVITE_TOKEN_TTL_MS)
-  const row = em.create(PasswordReset, { user, token, expiresAt, createdAt: new Date() })
-  await em.persistAndFlush(row)
+  const row = em.create(PasswordReset, { user, token: tokenHash, expiresAt, createdAt: new Date() })
+  await em.persist(row).flush()
 
-  const base = resolveInviteBaseUrl(req.url)
-  const inviteUrl = `${base}/reset/${token}`
+  const inviteUrl = `${base}/reset/${rawToken}`
 
   const { translate } = await resolveTranslations()
   const subject = translate('auth.email.invite.subject', 'You have been invited')
@@ -174,10 +207,12 @@ export const openApi: OpenApiRouteDoc = {
         { status: 200, description: 'Invite email sent', schema: responseSchema },
       ],
       errors: [
+        { status: 400, description: 'Invalid request origin', schema: errorSchema },
         { status: 404, description: 'User not found', schema: errorSchema },
         { status: 409, description: 'User already has a password', schema: errorSchema },
         { status: 422, description: 'Validation error', schema: validationErrorSchema },
         { status: 429, description: 'Rate limit exceeded', schema: rateLimitErrorSchema },
+        { status: 500, description: 'Invitation email origin is not configured', schema: errorSchema },
       ],
     },
   },

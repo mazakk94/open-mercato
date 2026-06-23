@@ -13,9 +13,9 @@ node_modules/
 .turbo
 
 # testing
-/coverage
-/test-results
-/playwright-report
+coverage/
+test-results/
+playwright-report/
 
 # next.js
 .next/
@@ -60,7 +60,8 @@ next-env.d.ts
 .tsbuild/
 
 # generated files
-.mercato/
+.mercato/*
+!.mercato/railway.json
 generated/
 src/generated/
 .test-cache.json
@@ -71,8 +72,8 @@ src/generated/
 
 # uploads and app data
 public/uploads/*
-storage/
-data/
+/storage/
+/data/
 
 # local package managers
 package-lock.json

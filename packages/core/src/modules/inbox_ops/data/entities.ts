@@ -1,11 +1,5 @@
-import {
-  Entity,
-  PrimaryKey,
-  Property,
-  Index,
-  Unique,
-  OptionalProps,
-} from '@mikro-orm/core'
+import { OptionalProps } from '@mikro-orm/core'
+import { Entity, Index, PrimaryKey, Property, Unique } from '@mikro-orm/decorators/legacy'
 
 // ---------------------------------------------------------------------------
 // Shared Types
@@ -87,6 +81,13 @@ export class InboxSettings {
 
   @Property({ name: 'inbox_address', type: 'text' })
   inboxAddress!: string
+
+  // Per-tenant inbound-webhook secret. When set, custom-provider webhook
+  // signatures for this inbox MUST verify against THIS secret (not the global
+  // INBOX_OPS_WEBHOOK_SECRET), binding the shared signing key to a single
+  // tenant and preventing cross-tenant injection by a holder of the global key.
+  @Property({ name: 'webhook_secret', type: 'text', nullable: true })
+  webhookSecret?: string | null
 
   @Property({ name: 'is_active', type: 'boolean', default: true })
   isActive: boolean = true

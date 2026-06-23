@@ -10,12 +10,45 @@ import type {
 } from './types'
 import { mergeAndRankResults } from './lib/merger'
 import { searchError } from './lib/debug'
+import { needsSearchResultEnrichment } from './lib/search-result-enrichment'
 
 /**
  * Default merge configuration.
  */
 const DEFAULT_MERGE_CONFIG: ResultMergeConfig = {
   duplicateHandling: 'highest_score',
+}
+
+/**
+ * Cache TTL for strategy availability checks.
+ * Short window so connectivity changes (Meilisearch up/down) propagate quickly,
+ * long enough to skip per-request RTT to remote backends on hot paths.
+ */
+const STRATEGY_AVAILABILITY_CACHE_TTL_MS = 2_000
+
+function normalizeOrganizationFilter(options: SearchOptions): string[] | null {
+  const single = typeof options.organizationId === 'string' ? options.organizationId.trim() : ''
+  if (single) return [single]
+  if (!Array.isArray(options.organizationIds)) return null
+
+  const values = Array.from(new Set(
+    options.organizationIds
+      .map((value) => (typeof value === 'string' ? value.trim() : ''))
+      .filter((value) => value.length > 0),
+  ))
+  return values
+}
+
+function filterResultsByOrganizationScope(results: SearchResult[], options: SearchOptions): SearchResult[] {
+  const organizationIds = normalizeOrganizationFilter(options)
+  if (!organizationIds) return results
+  if (organizationIds.length === 0) return []
+
+  const allowed = new Set(organizationIds)
+  return results.filter((result) => {
+    const organizationId = typeof result.organizationId === 'string' ? result.organizationId.trim() : ''
+    return organizationId.length > 0 && allowed.has(organizationId)
+  })
 }
 
 /**
@@ -48,6 +81,9 @@ export class SearchService {
   private readonly fallbackStrategy: SearchStrategyId | undefined
   private readonly mergeConfig: ResultMergeConfig
   private readonly presenterEnricher?: PresenterEnricherFn
+  private readonly availabilityCache = new Map<SearchStrategyId, { value: boolean; expiresAt: number }>()
+  private readonly availabilityInflight = new Map<SearchStrategyId, Promise<boolean>>()
+  private readonly availabilityCacheTtlMs: number
 
   constructor(options: SearchServiceOptions = {}) {
     this.strategies = new Map()
@@ -58,6 +94,7 @@ export class SearchService {
     this.fallbackStrategy = options.fallbackStrategy
     this.mergeConfig = options.mergeConfig ?? DEFAULT_MERGE_CONFIG
     this.presenterEnricher = options.presenterEnricher
+    this.availabilityCacheTtlMs = options.availabilityCacheTtlMs ?? STRATEGY_AVAILABILITY_CACHE_TTL_MS
   }
 
   /**
@@ -75,6 +112,11 @@ export class SearchService {
    * @returns Merged and ranked search results
    */
   async search(query: string, options: SearchOptions): Promise<SearchResult[]> {
+    const organizationIds = normalizeOrganizationFilter(options)
+    if (organizationIds && organizationIds.length === 0) {
+      return []
+    }
+
     const strategyIds = options.strategies ?? this.defaultStrategies
     const activeStrategies = await this.getAvailableStrategies(strategyIds)
 
@@ -114,9 +156,10 @@ export class SearchService {
 
     // Merge and rank results
     const merged = mergeAndRankResults(allResults, this.mergeConfig)
+    const scoped = filterResultsByOrganizationScope(merged, options)
 
-    // Enrich results missing presenter data
-    return this.enrichResultsWithPresenter(merged, options.tenantId, options.organizationId)
+    // Enrich results missing presenter or navigation metadata
+    return this.enrichResultsWithPresenter(scoped, options.tenantId, options.organizationId)
   }
 
   /**
@@ -131,18 +174,7 @@ export class SearchService {
     // If no enricher configured, return as-is
     if (!this.presenterEnricher) return results
 
-    // Check if any results need enrichment (missing or encrypted presenter)
-    const needsEnrichment = (r: SearchResult) => {
-      if (!r.presenter?.title) return true
-      // Also enrich if presenter looks encrypted (format: iv:ciphertext:authTag:v1)
-      const title = r.presenter.title
-      if (typeof title === 'string' && title.includes(':')) {
-        const parts = title.split(':')
-        if (parts.length >= 3 && parts[parts.length - 1] === 'v1') return true
-      }
-      return false
-    }
-    const hasMissing = results.some(needsEnrichment)
+    const hasMissing = results.some(needsSearchResultEnrichment)
     if (!hasMissing) return results
 
     // Use the configured presenter enricher
@@ -170,19 +202,10 @@ export class SearchService {
       strategies.map((strategy) => this.executeStrategyIndex(strategy, record)),
     )
 
-    // Log any failures
-    for (let i = 0; i < results.length; i++) {
-      const result = results[i]
-      if (result.status === 'rejected') {
-        const strategy = strategies[i]
-        searchError('SearchService', 'Strategy index failed', {
-          strategyId: strategy?.id,
-          entityId: record.entityId,
-          recordId: record.recordId,
-          error: result.reason instanceof Error ? result.reason.message : result.reason,
-        })
-      }
-    }
+    this.throwOnStrategyFailures('index', strategies, results, {
+      entityId: record.entityId,
+      recordId: record.recordId,
+    })
   }
 
   /**
@@ -199,19 +222,7 @@ export class SearchService {
       strategies.map((strategy) => this.executeStrategyDelete(strategy, entityId, recordId, tenantId)),
     )
 
-    // Log any failures
-    for (let i = 0; i < results.length; i++) {
-      const result = results[i]
-      if (result.status === 'rejected') {
-        const strategy = strategies[i]
-        searchError('SearchService', 'Strategy delete failed', {
-          strategyId: strategy?.id,
-          entityId,
-          recordId,
-          error: result.reason instanceof Error ? result.reason.message : result.reason,
-        })
-      }
-    }
+    this.throwOnStrategyFailures('delete', strategies, results, { entityId, recordId })
   }
 
   /**
@@ -234,17 +245,31 @@ export class SearchService {
       }),
     )
 
-    // Log any failures
+    // Collect failures and throw if any occurred
+    const failures: Array<{ strategyId: string; error: string }> = []
     for (let i = 0; i < results.length; i++) {
       const result = results[i]
       if (result.status === 'rejected') {
         const strategy = strategies[i]
+        const errorMessage = result.reason instanceof Error ? result.reason.message : result.reason
+        failures.push({
+          strategyId: strategy?.id || 'unknown',
+          error: errorMessage,
+        })
         searchError('SearchService', 'Strategy bulkIndex failed', {
           strategyId: strategy?.id,
           recordCount: records.length,
-          error: result.reason instanceof Error ? result.reason.message : result.reason,
+          error: errorMessage,
         })
       }
+    }
+
+    if (failures.length > 0) {
+      throw new Error(
+        `Bulk indexing failed for ${failures.length} strategy(ies): ${failures
+          .map((f) => `${f.strategyId} (${f.error})`)
+          .join(', ')}`
+      )
     }
   }
 
@@ -254,30 +279,66 @@ export class SearchService {
    * @param entityId - Entity type to purge
    * @param tenantId - Tenant for isolation
    */
-  async purge(entityId: string, tenantId: string): Promise<void> {
+  async purge(entityId: string, tenantId: string, organizationId?: string | null): Promise<void> {
     const strategies = await this.getAvailableStrategies()
 
     const results = await Promise.allSettled(
       strategies.map((strategy) => {
         if (strategy.purge) {
-          return strategy.purge(entityId, tenantId)
+          return strategy.purge(entityId, tenantId, organizationId)
         }
         return Promise.resolve()
       }),
     )
 
-    // Log any failures
+    this.throwOnStrategyFailures('purge', strategies, results, { entityId })
+  }
+
+  /**
+   * Inspect the settled results of a per-strategy write operation, log every
+   * rejection, and re-throw an aggregated error when any strategy failed.
+   *
+   * Write operations (index/delete/purge) must surface failures to the caller
+   * so the queue worker re-throws and the job is retried. Swallowing rejections
+   * here causes silent, permanent index gaps on transient failures such as
+   * Postgres connection-pool exhaustion (issue #3103). Successful strategies
+   * still commit their work; only the aggregated failure propagates.
+   */
+  private throwOnStrategyFailures(
+    operation: 'index' | 'delete' | 'purge',
+    strategies: SearchStrategy[],
+    results: PromiseSettledResult<unknown>[],
+    context: { entityId: string; recordId?: string },
+  ): void {
+    const failures: Array<{ strategyId: string; reason: unknown }> = []
+
     for (let i = 0; i < results.length; i++) {
       const result = results[i]
       if (result.status === 'rejected') {
         const strategy = strategies[i]
-        searchError('SearchService', 'Strategy purge failed', {
+        failures.push({ strategyId: strategy?.id || 'unknown', reason: result.reason })
+        searchError('SearchService', `Strategy ${operation} failed`, {
           strategyId: strategy?.id,
-          entityId,
+          entityId: context.entityId,
+          recordId: context.recordId,
           error: result.reason instanceof Error ? result.reason.message : result.reason,
         })
       }
     }
+
+    if (failures.length === 0) return
+
+    const summary = `Search ${operation} failed for ${failures.length} strategy(ies): ${failures
+      .map((failure) => {
+        const message = failure.reason instanceof Error ? failure.reason.message : String(failure.reason)
+        return `${failure.strategyId} (${message})`
+      })
+      .join(', ')}`
+
+    throw new AggregateError(
+      failures.map((failure) => failure.reason),
+      summary,
+    )
   }
 
   /**
@@ -287,6 +348,8 @@ export class SearchService {
    */
   registerStrategy(strategy: SearchStrategy): void {
     this.strategies.set(strategy.id, strategy)
+    this.availabilityCache.delete(strategy.id)
+    this.availabilityInflight.delete(strategy.id)
   }
 
   /**
@@ -296,6 +359,23 @@ export class SearchService {
    */
   unregisterStrategy(strategyId: SearchStrategyId): void {
     this.strategies.delete(strategyId)
+    this.availabilityCache.delete(strategyId)
+    this.availabilityInflight.delete(strategyId)
+  }
+
+  /**
+   * Invalidate the strategy availability cache.
+   * Call after manual reconnects or env changes when callers must observe the
+   * current backend state immediately rather than waiting for TTL expiry.
+   */
+  invalidateAvailabilityCache(strategyId?: SearchStrategyId): void {
+    if (strategyId) {
+      this.availabilityCache.delete(strategyId)
+      this.availabilityInflight.delete(strategyId)
+      return
+    }
+    this.availabilityCache.clear()
+    this.availabilityInflight.clear()
   }
 
   /**
@@ -330,32 +410,71 @@ export class SearchService {
   async isStrategyAvailable(strategyId: SearchStrategyId): Promise<boolean> {
     const strategy = this.strategies.get(strategyId)
     if (!strategy) return false
-    return strategy.isAvailable()
+    return this.checkStrategyAvailability(strategy)
+  }
+
+  /**
+   * Resolve a strategy's availability via the short-lived TTL cache.
+   * Coalesces concurrent callers onto a single in-flight probe to avoid
+   * thundering-herd on remote backends.
+   */
+  private async checkStrategyAvailability(strategy: SearchStrategy): Promise<boolean> {
+    const now = Date.now()
+    const cached = this.availabilityCache.get(strategy.id)
+    if (cached && cached.expiresAt > now) return cached.value
+
+    const inflight = this.availabilityInflight.get(strategy.id)
+    if (inflight) return inflight
+
+    const probe = (async () => {
+      try {
+        const value = await strategy.isAvailable()
+        this.availabilityCache.set(strategy.id, {
+          value,
+          expiresAt: Date.now() + this.availabilityCacheTtlMs,
+        })
+        return value
+      } catch {
+        this.availabilityCache.set(strategy.id, {
+          value: false,
+          expiresAt: Date.now() + this.availabilityCacheTtlMs,
+        })
+        return false
+      } finally {
+        this.availabilityInflight.delete(strategy.id)
+      }
+    })()
+    this.availabilityInflight.set(strategy.id, probe)
+    return probe
   }
 
   /**
    * Get available strategies from the requested list.
    * Filters out strategies that are not registered or not available.
+   * Probes run in parallel and reuse a short-lived per-strategy availability
+   * cache, so hot paths pay the max latency of the slowest probe (or zero
+   * when cached) instead of the sum of all probes.
    */
   private async getAvailableStrategies(ids?: SearchStrategyId[]): Promise<SearchStrategy[]> {
     const targetIds = ids ?? Array.from(this.strategies.keys())
-    const available: SearchStrategy[] = []
-
+    const candidates: SearchStrategy[] = []
     for (const id of targetIds) {
       const strategy = this.strategies.get(id)
-      if (strategy) {
-        try {
-          const isAvailable = await strategy.isAvailable()
-          if (isAvailable) {
-            available.push(strategy)
-          }
-        } catch {
-          // Strategy availability check failed, skip it
-        }
+      if (strategy) candidates.push(strategy)
+    }
+
+    const probes = await Promise.allSettled(
+      candidates.map((strategy) => this.checkStrategyAvailability(strategy)),
+    )
+
+    const available: SearchStrategy[] = []
+    for (let i = 0; i < probes.length; i++) {
+      const probe = probes[i]
+      if (probe.status === 'fulfilled' && probe.value) {
+        available.push(candidates[i])
       }
     }
 
-    // Sort by priority (higher priority first)
     return available.sort((a, b) => b.priority - a.priority)
   }
 

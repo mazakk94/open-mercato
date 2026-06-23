@@ -209,6 +209,7 @@ export async function GET(req: Request): Promise<Response> {
   const encoder = new TextEncoder()
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null
   let connection: SseConnection | null = null
+  const onAbort = () => cleanup()
 
   const stream = new ReadableStream({
     start(controller) {
@@ -225,6 +226,14 @@ export async function GET(req: Request): Promise<Response> {
         close: () => controller.close(),
       }
       connections.add(connection)
+
+      // Flush an initial comment so the runtime sends the response headers and
+      // first body byte immediately. Without it, the streamed Response stays
+      // unflushed until the first heartbeat (30s) or matching event, which
+      // delays the browser EventSource `open` event — clients that gate work on
+      // a "connected" signal would otherwise stall for up to 30s after mount.
+      // Comment lines (`:` prefix) are ignored by EventSource message parsing.
+      controller.enqueue(encoder.encode(': connected\n\n'))
 
       // Start heartbeat to keep connection alive
       heartbeatTimer = setInterval(() => {
@@ -249,10 +258,12 @@ export async function GET(req: Request): Promise<Response> {
       connections.delete(connection)
       connection = null
     }
+    // Detach from the request signal so reconnect churn does not accumulate
+    // listeners and closures on long-lived AbortSignals.
+    req.signal.removeEventListener('abort', onAbort)
   }
 
-  // Clean up when client disconnects
-  req.signal.addEventListener('abort', cleanup)
+  req.signal.addEventListener('abort', onAbort, { once: true })
 
   return new Response(stream, {
     status: 200,

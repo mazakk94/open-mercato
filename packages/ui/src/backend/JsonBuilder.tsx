@@ -3,7 +3,18 @@
 import * as React from 'react'
 import { Button } from '../primitives/button'
 import { IconButton } from '../primitives/icon-button'
+import { Input } from '../primitives/input'
+import { InlineInput } from '../primitives/inline-input'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '../primitives/select'
 import { Plus, Trash2, ChevronRight, ChevronDown, Code, LayoutList } from 'lucide-react'
+import { useConfirmDialog } from './confirm-dialog'
+import type { ConfirmDialogOptions } from './confirm-dialog'
 
 function cn(...classes: (string | undefined | null | false)[]) {
     return classes.filter(Boolean).join(' ')
@@ -18,10 +29,29 @@ export type JsonBuilderProps = {
 
 type JsonNodeType = 'string' | 'number' | 'boolean' | 'object' | 'array' | 'null'
 
+type ConfirmFn = (options?: ConfirmDialogOptions) => Promise<boolean>
+
 function getJsonType(value: any): JsonNodeType {
     if (value === null) return 'null'
     if (Array.isArray(value)) return 'array'
     return typeof value as JsonNodeType
+}
+
+function defaultValueForType(type: JsonNodeType): any {
+    switch (type) {
+        case 'string': return ""
+        case 'number': return 0
+        case 'boolean': return false
+        case 'object': return {}
+        case 'array': return []
+        case 'null': return null
+    }
+}
+
+function toRawString(value: any): string {
+    if (value === null || value === undefined) return '{}'
+    if (typeof value === 'object') return JSON.stringify(value, null, 2)
+    return String(value)
 }
 
 export function JsonBuilder({
@@ -31,28 +61,32 @@ export function JsonBuilder({
     error
 }: JsonBuilderProps) {
     const [mode, setMode] = React.useState<'raw' | 'builder'>('raw')
-    const [rawString, setRawString] = React.useState(() => {
-        if (value === null) return '{}'
-        return typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value || '{}')
-    })
+    const [rawString, setRawString] = React.useState(() => toRawString(value))
+    const [rawDirty, setRawDirty] = React.useState(false)
     const [parseError, setParseError] = React.useState<string | null>(null)
+    const { confirm, ConfirmDialogElement } = useConfirmDialog()
 
     React.useEffect(() => {
-        if (value === null) {
-            if (!disabled) {
-                onChange({})
-            }
-            setRawString('{}')
-            setParseError(null)
-            return
-        }
-        if (typeof value === 'object') {
-            setRawString(JSON.stringify(value, null, 2))
-            setParseError(null)
+        if (value === null && !disabled) {
+            onChange({})
         }
     }, [value, disabled, onChange])
 
+    // Mirror external value changes (e.g. async record load, builder edits) into
+    // the raw textarea only while the user has NOT started typing in it. Once the
+    // textarea is dirty it becomes the source of truth, so re-deriving it from
+    // `value` on every keystroke — the parent's onChange identity changes each
+    // render — would clobber typing and make Raw JSON uneditable (issue #2817).
+    React.useEffect(() => {
+        if (rawDirty) return
+        if (value !== null && typeof value === 'object') {
+            setRawString(JSON.stringify(value, null, 2))
+            setParseError(null)
+        }
+    }, [value, rawDirty])
+
     const handleRawChange = (str: string) => {
+        setRawDirty(true)
         setRawString(str)
         try {
             if (str.trim() === '') {
@@ -67,6 +101,15 @@ export function JsonBuilder({
             onChange(str)
             setParseError("Invalid JSON")
         }
+    }
+
+    const switchToRaw = () => {
+        // Re-sync the textarea from the current value and let it mirror external
+        // changes again until the user edits it.
+        setRawDirty(false)
+        setRawString(toRawString(value))
+        setParseError(null)
+        setMode('raw')
     }
 
     const switchToBuilder = () => {
@@ -88,7 +131,7 @@ export function JsonBuilder({
                     variant="ghost"
                     size="sm"
                     className={cn(mode === 'raw' && "bg-muted text-foreground")}
-                    onClick={() => setMode('raw')}
+                    onClick={switchToRaw}
                 >
                     <Code className="w-4 h-4" />
                     Raw JSON
@@ -117,7 +160,7 @@ export function JsonBuilder({
                             } catch { }
                         }}
                         placeholder='{"key": "value"}'
-                        className="w-full rounded border px-3 py-2 min-h-[300px] text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        className="w-full rounded border px-3 py-2 min-h-[300px] text-sm font-mono focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                         disabled={disabled}
                     />
                     {parseError && (
@@ -131,6 +174,7 @@ export function JsonBuilder({
                             data={value}
                             onChange={onChange}
                             readOnly={disabled}
+                            confirm={confirm}
                             isRoot
                         />
                     ) : (
@@ -142,6 +186,7 @@ export function JsonBuilder({
             )}
 
             {error && <div className="text-xs text-red-600">{error}</div>}
+            {ConfirmDialogElement}
         </div>
     )
 }
@@ -153,24 +198,39 @@ interface JsonNodeProps {
     readOnly?: boolean
     label?: string
     isRoot?: boolean
+    confirm?: ConfirmFn
 }
 
-function JsonNode({ data, onChange, onDelete, readOnly, label, isRoot }: JsonNodeProps) {
+function JsonNode({ data, onChange, onDelete, readOnly, label, isRoot, confirm }: JsonNodeProps) {
     const type = getJsonType(data)
     const isContainer = type === 'object' || type === 'array'
     const [collapsed, setCollapsed] = React.useState(false)
 
-    const handleTypeChange = (newType: JsonNodeType) => {
-        let newVal: any = ''
-        switch (newType) {
-            case 'string': newVal = ""; break;
-            case 'number': newVal = 0; break;
-            case 'boolean': newVal = false; break;
-            case 'object': newVal = {}; break;
-            case 'array': newVal = []; break;
-            case 'null': newVal = null; break;
+    const handleTypeChange = async (newType: JsonNodeType) => {
+        if (newType === type) return
+        // Switching away from a non-empty container discards its contents. Ask
+        // for confirmation first so configured properties aren't lost silently
+        // (issue #2817). The Select is controlled by the derived type, so when
+        // the user cancels we simply leave the data untouched and the control
+        // snaps back to its previous value.
+        const itemCount = type === 'object'
+            ? Object.keys(data).length
+            : type === 'array'
+                ? (data as any[]).length
+                : 0
+        if (itemCount > 0 && confirm) {
+            const noun = type === 'object'
+                ? `${itemCount} ${itemCount === 1 ? 'property' : 'properties'}`
+                : `${itemCount} ${itemCount === 1 ? 'item' : 'items'}`
+            const confirmed = await confirm({
+                title: 'Change value type?',
+                text: `Changing the type from ${type} to ${newType} will discard the ${noun} currently configured. This cannot be undone.`,
+                confirmText: 'Discard and change',
+                variant: 'destructive',
+            })
+            if (!confirmed) return
         }
-        onChange(newVal)
+        onChange(defaultValueForType(newType))
     }
 
     const handleAddKey = () => {
@@ -239,47 +299,57 @@ function JsonNode({ data, onChange, onDelete, readOnly, label, isRoot }: JsonNod
                 <div className="flex-1 flex gap-2 items-center flex-wrap">
 
                     {!readOnly && (
-                        <select
+                        <Select
                             value={type}
-                            onChange={(e) => handleTypeChange(e.target.value as JsonNodeType)}
-                            className="text-xs border rounded px-1 py-0.5 bg-muted text-foreground focus:ring-1 focus:ring-blue-500"
+                            onValueChange={(next) => { void handleTypeChange(next as JsonNodeType) }}
                         >
-                            <option value="string">String</option>
-                            <option value="number">Number</option>
-                            <option value="boolean">Boolean</option>
-                            <option value="object">Object</option>
-                            <option value="array">Array</option>
-                            <option value="null">Null</option>
-                        </select>
+                            <SelectTrigger size="sm" className="w-auto min-w-[6rem]">
+                                <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                                <SelectItem value="string">String</SelectItem>
+                                <SelectItem value="number">Number</SelectItem>
+                                <SelectItem value="boolean">Boolean</SelectItem>
+                                <SelectItem value="object">Object</SelectItem>
+                                <SelectItem value="array">Array</SelectItem>
+                                <SelectItem value="null">Null</SelectItem>
+                            </SelectContent>
+                        </Select>
                     )}
 
                     {type === 'string' && (
-                        <input
-                            className="flex-1 min-w-0 sm:min-w-[120px] text-sm border rounded px-2 py-0.5 focus:outline-none focus:border-blue-500"
+                        <Input
+                            size="sm"
+                            className="flex-1 min-w-0 sm:min-w-[120px]"
                             value={data}
                             onChange={e => onChange(e.target.value)}
                             disabled={readOnly}
                         />
                     )}
                     {type === 'number' && (
-                        <input
+                        <Input
                             type="number"
-                            className="flex-1 w-full sm:w-[100px] text-sm border rounded px-2 py-0.5 focus:outline-none focus:border-blue-500"
+                            size="sm"
+                            className="flex-1 w-full sm:w-[100px]"
                             value={data}
                             onChange={e => onChange(parseFloat(e.target.value) || 0)}
                             disabled={readOnly}
                         />
                     )}
                     {type === 'boolean' && (
-                        <select
-                            className="flex-1 w-full sm:w-[100px] text-sm border rounded px-2 py-0.5 focus:outline-none focus:border-blue-500"
+                        <Select
                             value={String(data)}
-                            onChange={e => onChange(e.target.value === 'true')}
+                            onValueChange={(next) => onChange(next === 'true')}
                             disabled={readOnly}
                         >
-                            <option value="true">true</option>
-                            <option value="false">false</option>
-                        </select>
+                            <SelectTrigger size="sm" className="flex-1 w-full sm:w-[100px]">
+                                <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                                <SelectItem value="true">true</SelectItem>
+                                <SelectItem value="false">false</SelectItem>
+                            </SelectContent>
+                        </Select>
                     )}
                     {type === 'null' && <span className="text-xs text-muted-foreground">null</span>}
                     {isContainer && (
@@ -309,8 +379,9 @@ function JsonNode({ data, onChange, onDelete, readOnly, label, isRoot }: JsonNod
                         <div key={idx} className="flex">
                             <div className="pt-2">
                                 {/* Key Renamer */}
-                                <input
-                                    className="w-full sm:w-[100px] text-xs font-mono border-b border-transparent hover:border-gray-300 focus:border-blue-500 bg-transparent focus:outline-none text-right pr-1"
+                                <InlineInput
+                                    className="w-full sm:w-[100px]"
+                                    inputClassName="text-right text-xs font-mono pr-1"
                                     value={key}
                                     onChange={(e) => handleKeyRename(key, e.target.value)}
                                     disabled={readOnly}
@@ -322,6 +393,7 @@ function JsonNode({ data, onChange, onDelete, readOnly, label, isRoot }: JsonNod
                                     onChange={(v) => handleChildChange(key, v)}
                                     onDelete={() => handleChildDelete(key)}
                                     readOnly={readOnly}
+                                    confirm={confirm}
                                 />
                             </div>
                         </div>
@@ -335,6 +407,7 @@ function JsonNode({ data, onChange, onDelete, readOnly, label, isRoot }: JsonNod
                             onChange={(v) => handleChildChange(idx, v)}
                             onDelete={() => handleChildDelete(idx)}
                             readOnly={readOnly}
+                            confirm={confirm}
                         />
                     ))}
 

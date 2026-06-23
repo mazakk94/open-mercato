@@ -1,6 +1,7 @@
-import { MeiliSearch } from 'meilisearch'
+import { Meilisearch } from 'meilisearch'
 import type { EntityId } from '@open-mercato/shared/modules/entities'
 import type { SearchFieldPolicy } from '@open-mercato/shared/modules/search'
+import { resolveTimeoutMs } from '@open-mercato/shared/lib/http/fetchWithTimeout'
 import type {
   FullTextSearchDriver,
   FullTextSearchDocument,
@@ -17,8 +18,18 @@ export type MeilisearchDriverOptions = {
   apiKey?: string
   indexPrefix?: string
   defaultLimit?: number
+  timeoutMs?: number
   encryptionMapResolver?: (entityId: EntityId) => Promise<EncryptionMapEntry[]>
   fieldPolicyResolver?: (entityId: EntityId) => SearchFieldPolicy | undefined
+}
+
+const DEFAULT_MEILISEARCH_REQUEST_TIMEOUT_MS = 30_000
+
+function resolveMeilisearchTimeoutMs(explicit?: number): number {
+  if (typeof explicit === 'number') return resolveTimeoutMs(explicit, DEFAULT_MEILISEARCH_REQUEST_TIMEOUT_MS)
+  const raw = process.env.MEILISEARCH_REQUEST_TIMEOUT_MS
+  const parsed = raw ? Number.parseInt(raw, 10) : undefined
+  return resolveTimeoutMs(parsed, DEFAULT_MEILISEARCH_REQUEST_TIMEOUT_MS)
 }
 
 export function createMeilisearchDriver(
@@ -28,16 +39,17 @@ export function createMeilisearchDriver(
   const apiKey = options?.apiKey ?? process.env.MEILISEARCH_API_KEY ?? ''
   const indexPrefix = options?.indexPrefix ?? process.env.MEILISEARCH_INDEX_PREFIX ?? 'om'
   const defaultLimit = options?.defaultLimit ?? 20
+  const requestTimeoutMs = resolveMeilisearchTimeoutMs(options?.timeoutMs)
   const encryptionMapResolver = options?.encryptionMapResolver
   const fieldPolicyResolver = options?.fieldPolicyResolver
 
-  let client: MeiliSearch | null = null
+  let client: Meilisearch | null = null
   const initializedIndexes = new Set<string>()
   const initializingIndexes = new Map<string, Promise<void>>()
 
-  function getClient(): MeiliSearch {
+  function getClient(): Meilisearch {
     if (!client) {
-      client = new MeiliSearch({ host, apiKey })
+      client = new Meilisearch({ host, apiKey, timeout: requestTimeoutMs })
     }
     return client
   }
@@ -54,8 +66,21 @@ export function createMeilisearchDriver(
   function buildFilters(options: FullTextSearchQuery): string[] {
     const filters: string[] = []
 
-    if (options.organizationId) {
-      filters.push(`_organizationId = "${escapeFilterValue(options.organizationId)}"`)
+    const organizationId = typeof options.organizationId === 'string' ? options.organizationId.trim() : ''
+    if (organizationId) {
+      filters.push(`_organizationId = "${escapeFilterValue(organizationId)}"`)
+    } else if (Array.isArray(options.organizationIds)) {
+      const organizationIds = Array.from(new Set(
+        options.organizationIds
+          .map((value) => (typeof value === 'string' ? value.trim() : ''))
+          .filter((value) => value.length > 0),
+      ))
+      if (organizationIds.length === 0) {
+        filters.push('_organizationId = "__open_mercato_no_matching_organization__"')
+      } else {
+        const orgFilter = organizationIds.map((id) => `"${escapeFilterValue(id)}"`).join(', ')
+        filters.push(`_organizationId IN [${orgFilter}]`)
+      }
     }
 
     if (options.entityTypes?.length) {
@@ -204,6 +229,7 @@ export function createMeilisearchDriver(
           recordId: hit._id as string,
           entityId: hit._entityId as EntityId,
           score: (hit._rankingScore as number) ?? 0.5,
+          organizationId: hit._organizationId as string | null | undefined,
           presenter: hit._presenter as FullTextSearchHit['presenter'],
           url: hit._url as string | undefined,
           links: hit._links as FullTextSearchHit['links'],
@@ -270,14 +296,20 @@ export function createMeilisearchDriver(
       }
     },
 
-    async purge(entityId: EntityId, tenantId: string): Promise<void> {
+    async purge(entityId: EntityId, tenantId: string, organizationId?: string | null): Promise<void> {
       const meiliClient = getClient()
       const indexName = buildIndexName(tenantId)
+      const normalizedOrganizationId =
+        typeof organizationId === 'string' && organizationId.trim().length > 0 ? organizationId.trim() : null
+      const filter =
+        normalizedOrganizationId !== null
+          ? `_entityId = "${escapeFilterValue(entityId)}" AND _organizationId = "${escapeFilterValue(normalizedOrganizationId)}"`
+          : `_entityId = "${escapeFilterValue(entityId)}"`
 
       try {
         const index = meiliClient.index(indexName)
         await index.deleteDocuments({
-          filter: `_entityId = "${entityId}"`,
+          filter,
         })
       } catch (error: unknown) {
         const meilisearchError = error as { code?: string }

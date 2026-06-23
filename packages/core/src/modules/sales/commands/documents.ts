@@ -4,12 +4,14 @@ import { randomUUID } from "crypto";
 import { z } from "zod";
 import { registerCommand } from "@open-mercato/shared/lib/commands";
 import type { CommandHandler } from "@open-mercato/shared/lib/commands";
+import { withAtomicFlush } from "@open-mercato/shared/lib/commands/flush";
 import {
   buildChanges,
   emitCrudSideEffects,
   requireId,
   type CrudEventsConfig,
 } from "@open-mercato/shared/lib/commands/helpers";
+import { LockMode } from "@mikro-orm/core";
 import type { EntityManager } from "@mikro-orm/postgresql";
 import type { EventBus } from "@open-mercato/events";
 import type { DataEngine } from "@open-mercato/shared/lib/data/engine";
@@ -37,6 +39,10 @@ import {
   SalesShipmentItem,
   SalesPayment,
   SalesPaymentAllocation,
+  SalesInvoice,
+  SalesInvoiceLine,
+  SalesCreditMemo,
+  SalesCreditMemoLine,
   SalesDocumentAddress,
   SalesNote,
   SalesChannel,
@@ -61,24 +67,38 @@ import {
   CustomerPersonProfile,
 } from "../../customers/data/entities";
 import {
+  enforceAdjustmentSign,
+  validateReturnAdjustmentWithinRemaining,
+  RETURN_ADJUSTMENT_EXCEEDS_REMAINING_GROSS_MESSAGE,
+  RETURN_ADJUSTMENT_EXCEEDS_REMAINING_NET_MESSAGE,
   quoteCreateSchema,
   quoteLineCreateSchema,
   quoteAdjustmentCreateSchema,
   orderCreateSchema,
   orderLineCreateSchema,
   orderAdjustmentCreateSchema,
+  invoiceCreateSchema,
+  invoiceUpdateSchema,
+  creditMemoCreateSchema,
+  creditMemoUpdateSchema,
+  customerSnapshotSchema,
   type QuoteCreateInput,
   type QuoteLineCreateInput,
   type QuoteAdjustmentCreateInput,
   type OrderCreateInput,
   type OrderLineCreateInput,
   type OrderAdjustmentCreateInput,
+  type InvoiceCreateInput,
+  type CreditMemoCreateInput,
 } from "../data/validators";
 import {
   ensureOrganizationScope,
   ensureTenantScope,
   extractUndoPayload,
   toNumericString,
+  enforceSalesDocumentOptimisticLock,
+  SALES_RESOURCE_KIND_ORDER,
+  SALES_RESOURCE_KIND_QUOTE,
 } from "./shared";
 import {
   loadShipmentSnapshot,
@@ -422,6 +442,115 @@ type QuoteConvertUndoPayload = {
   order?: OrderGraphSnapshot | null;
 };
 
+type InvoiceGraphSnapshot = {
+  invoice: {
+    id: string;
+    organizationId: string;
+    tenantId: string;
+    invoiceNumber: string;
+    orderId: string | null;
+    statusEntryId: string | null;
+    status: string | null;
+    issueDate: string | Date | null;
+    dueDate: string | Date | null;
+    currencyCode: string;
+    subtotalNetAmount: string;
+    subtotalGrossAmount: string;
+    discountTotalAmount: string;
+    taxTotalAmount: string;
+    grandTotalNetAmount: string;
+    grandTotalGrossAmount: string;
+    paidTotalAmount: string;
+    outstandingAmount: string;
+    metadata: Record<string, unknown> | null;
+    customFieldSetId: string | null;
+    customFields: Record<string, unknown> | null;
+  };
+  lines: InvoiceLineSnapshot[];
+};
+
+type InvoiceLineSnapshot = {
+  id: string;
+  orderLineId: string | null;
+  lineNumber: number;
+  kind: string;
+  name: string | null;
+  sku: string | null;
+  description: string | null;
+  quantity: string;
+  quantityUnit: string | null;
+  normalizedQuantity: string;
+  normalizedUnit: string | null;
+  uomSnapshot: Record<string, unknown> | null;
+  currencyCode: string;
+  unitPriceNet: string;
+  unitPriceGross: string;
+  discountAmount: string;
+  discountPercent: string;
+  taxRate: string;
+  taxAmount: string;
+  totalNetAmount: string;
+  totalGrossAmount: string;
+  metadata: Record<string, unknown> | null;
+};
+
+type CreditMemoGraphSnapshot = {
+  creditMemo: {
+    id: string;
+    organizationId: string;
+    tenantId: string;
+    creditMemoNumber: string;
+    orderId: string | null;
+    invoiceId: string | null;
+    statusEntryId: string | null;
+    status: string | null;
+    reason: string | null;
+    issueDate: string | Date | null;
+    currencyCode: string;
+    subtotalNetAmount: string;
+    subtotalGrossAmount: string;
+    taxTotalAmount: string;
+    grandTotalNetAmount: string;
+    grandTotalGrossAmount: string;
+    metadata: Record<string, unknown> | null;
+    customFieldSetId: string | null;
+    customFields: Record<string, unknown> | null;
+  };
+  lines: CreditMemoLineSnapshot[];
+};
+
+type CreditMemoLineSnapshot = {
+  id: string;
+  orderLineId: string | null;
+  lineNumber: number;
+  name: string | null;
+  sku: string | null;
+  description: string | null;
+  quantity: string;
+  quantityUnit: string | null;
+  normalizedQuantity: string;
+  normalizedUnit: string | null;
+  uomSnapshot: Record<string, unknown> | null;
+  currencyCode: string;
+  unitPriceNet: string;
+  unitPriceGross: string;
+  taxRate: string;
+  taxAmount: string;
+  totalNetAmount: string;
+  totalGrossAmount: string;
+  metadata: Record<string, unknown> | null;
+};
+
+type InvoiceUndoPayload = {
+  before?: InvoiceGraphSnapshot | null;
+  after?: InvoiceGraphSnapshot | null;
+};
+
+type CreditMemoUndoPayload = {
+  before?: CreditMemoGraphSnapshot | null;
+  after?: CreditMemoGraphSnapshot | null;
+};
+
 const currencyCodeSchema = z
   .string()
   .trim()
@@ -446,7 +575,7 @@ export const documentUpdateSchema = z
     id: z.string().uuid(),
     customerEntityId: z.string().uuid().nullable().optional(),
     customerContactId: z.string().uuid().nullable().optional(),
-    customerSnapshot: z.record(z.string(), z.unknown()).nullable().optional(),
+    customerSnapshot: customerSnapshotSchema.nullable().optional(),
     metadata: z.record(z.string(), z.unknown()).nullable().optional(),
     customerReference: z.string().nullable().optional(),
     externalReference: z.string().nullable().optional(),
@@ -590,11 +719,13 @@ async function resolveAddressSnapshot(
   addressId?: string | null,
 ): Promise<Record<string, unknown> | null> {
   if (!addressId) return null;
-  const address = await em.findOne(CustomerAddress, {
-    id: addressId,
-    organizationId,
-    tenantId,
-  });
+  const address = await findOneWithDecryption(
+    em,
+    CustomerAddress,
+    { id: addressId, organizationId, tenantId },
+    undefined,
+    { tenantId, organizationId },
+  );
   if (!address) return null;
 
   return {
@@ -946,6 +1077,7 @@ async function applyDocumentUpdate({
     const statusValue = await resolveDictionaryEntryValue(
       em,
       input.statusEntryId,
+      { tenantId },
     );
     if (input.statusEntryId && !statusValue) {
       throw new CrudHttpError(400, {
@@ -1156,17 +1288,22 @@ async function loadQuoteSnapshot(
   em: EntityManager,
   id: string,
 ): Promise<QuoteGraphSnapshot | null> {
-  const quote = await em.findOne(SalesQuote, { id, deletedAt: null });
+  const quote = await findOneWithDecryption(em, SalesQuote, { id, deletedAt: null });
   if (!quote) return null;
-  const lines = await em.find(
+  const decryptionScope = { tenantId: quote.tenantId, organizationId: quote.organizationId };
+  const lines = await findWithDecryption(
+    em,
     SalesQuoteLine,
-    { quote: quote },
+    { quote },
     { orderBy: { lineNumber: "asc" } },
+    decryptionScope,
   );
-  const adjustments = await em.find(
+  const adjustments = await findWithDecryption(
+    em,
     SalesQuoteAdjustment,
-    { quote: quote },
+    { quote },
     { orderBy: { position: "asc" } },
+    decryptionScope,
   );
   const [
     addresses,
@@ -1176,8 +1313,20 @@ async function loadQuoteSnapshot(
     lineCustomFields,
     adjustmentCustomFields,
   ] = await Promise.all([
-    em.find(SalesDocumentAddress, { documentId: id, documentKind: "quote" }),
-    em.find(SalesNote, { contextType: "quote", contextId: id }),
+    findWithDecryption(
+      em,
+      SalesDocumentAddress,
+      { documentId: id, documentKind: "quote" },
+      undefined,
+      { tenantId: quote.tenantId, organizationId: quote.organizationId },
+    ),
+    findWithDecryption(
+      em,
+      SalesNote,
+      { contextType: "quote", contextId: id },
+      undefined,
+      { tenantId: quote.tenantId, organizationId: quote.organizationId },
+    ),
     findWithDecryption(
       em,
       SalesDocumentTagAssignment,
@@ -1410,17 +1559,22 @@ async function loadOrderSnapshot(
   em: EntityManager,
   id: string,
 ): Promise<OrderGraphSnapshot | null> {
-  const order = await em.findOne(SalesOrder, { id, deletedAt: null });
+  const order = await findOneWithDecryption(em, SalesOrder, { id, deletedAt: null });
   if (!order) return null;
-  const lines = await em.find(
+  const decryptionScope = { tenantId: order.tenantId, organizationId: order.organizationId };
+  const lines = await findWithDecryption(
+    em,
     SalesOrderLine,
-    { order: order },
+    { order },
     { orderBy: { lineNumber: "asc" } },
+    decryptionScope,
   );
-  const adjustments = await em.find(
+  const adjustments = await findWithDecryption(
+    em,
     SalesOrderAdjustment,
-    { order: order },
+    { order },
     { orderBy: { position: "asc" } },
+    decryptionScope,
   );
   const [
     addresses,
@@ -1432,8 +1586,20 @@ async function loadOrderSnapshot(
     lineCustomFields,
     adjustmentCustomFields,
   ] = await Promise.all([
-    em.find(SalesDocumentAddress, { documentId: id, documentKind: "order" }),
-    em.find(SalesNote, { contextType: "order", contextId: id }),
+    findWithDecryption(
+      em,
+      SalesDocumentAddress,
+      { documentId: id, documentKind: "order" },
+      undefined,
+      { tenantId: order.tenantId, organizationId: order.organizationId },
+    ),
+    findWithDecryption(
+      em,
+      SalesNote,
+      { contextType: "order", contextId: id },
+      undefined,
+      { tenantId: order.tenantId, organizationId: order.organizationId },
+    ),
     findWithDecryption(
       em,
       SalesDocumentTagAssignment,
@@ -1694,6 +1860,143 @@ async function loadOrderSnapshot(
     tags: tagSnapshots,
     shipments: shipmentSnapshots,
     payments: paymentSnapshots,
+  };
+}
+
+async function loadInvoiceSnapshot(
+  em: EntityManager,
+  id: string,
+): Promise<InvoiceGraphSnapshot | null> {
+  const invoice = await em.findOne(SalesInvoice, { id, deletedAt: null });
+  if (!invoice) return null;
+  const lines = await em.find(
+    SalesInvoiceLine,
+    { invoice: invoice },
+    { orderBy: { lineNumber: "asc" } },
+  );
+  const [invoiceCustomFields] = await Promise.all([
+    loadCustomFieldValues({
+      em,
+      entityId: E.sales.sales_invoice,
+      recordIds: [invoice.id],
+      tenantIdByRecord: { [invoice.id]: invoice.tenantId },
+      organizationIdByRecord: { [invoice.id]: invoice.organizationId },
+    }),
+  ]);
+  return {
+    invoice: {
+      id: invoice.id,
+      organizationId: invoice.organizationId,
+      tenantId: invoice.tenantId,
+      invoiceNumber: invoice.invoiceNumber,
+      orderId: invoice.orderId ?? null,
+      statusEntryId: invoice.statusEntryId ?? null,
+      status: invoice.status ?? null,
+      issueDate: invoice.issueDate ?? null,
+      dueDate: invoice.dueDate ?? null,
+      currencyCode: invoice.currencyCode,
+      subtotalNetAmount: String(invoice.subtotalNetAmount),
+      subtotalGrossAmount: String(invoice.subtotalGrossAmount),
+      discountTotalAmount: String(invoice.discountTotalAmount),
+      taxTotalAmount: String(invoice.taxTotalAmount),
+      grandTotalNetAmount: String(invoice.grandTotalNetAmount),
+      grandTotalGrossAmount: String(invoice.grandTotalGrossAmount),
+      paidTotalAmount: String(invoice.paidTotalAmount),
+      outstandingAmount: String(invoice.outstandingAmount),
+      metadata: invoice.metadata ?? null,
+      customFieldSetId: invoice.customFieldSetId ?? null,
+      customFields: invoiceCustomFields[invoice.id] ?? null,
+    },
+    lines: lines.map((line) => ({
+      id: line.id,
+      orderLineId: line.orderLineId ?? null,
+      lineNumber: line.lineNumber,
+      kind: line.kind ?? "product",
+      name: line.name ?? null,
+      sku: line.sku ?? null,
+      description: line.description ?? null,
+      quantity: String(line.quantity),
+      quantityUnit: line.quantityUnit ?? null,
+      normalizedQuantity: String(line.normalizedQuantity),
+      normalizedUnit: line.normalizedUnit ?? null,
+      uomSnapshot: line.uomSnapshot ?? null,
+      currencyCode: line.currencyCode,
+      unitPriceNet: String(line.unitPriceNet),
+      unitPriceGross: String(line.unitPriceGross),
+      discountAmount: String(line.discountAmount),
+      discountPercent: String(line.discountPercent),
+      taxRate: String(line.taxRate),
+      taxAmount: String(line.taxAmount),
+      totalNetAmount: String(line.totalNetAmount),
+      totalGrossAmount: String(line.totalGrossAmount),
+      metadata: line.metadata ?? null,
+    })),
+  };
+}
+
+async function loadCreditMemoSnapshot(
+  em: EntityManager,
+  id: string,
+): Promise<CreditMemoGraphSnapshot | null> {
+  const creditMemo = await em.findOne(SalesCreditMemo, { id, deletedAt: null });
+  if (!creditMemo) return null;
+  const lines = await em.find(
+    SalesCreditMemoLine,
+    { creditMemo: creditMemo },
+    { orderBy: { lineNumber: "asc" } },
+  );
+  const [creditMemoCustomFields] = await Promise.all([
+    loadCustomFieldValues({
+      em,
+      entityId: E.sales.sales_credit_memo,
+      recordIds: [creditMemo.id],
+      tenantIdByRecord: { [creditMemo.id]: creditMemo.tenantId },
+      organizationIdByRecord: { [creditMemo.id]: creditMemo.organizationId },
+    }),
+  ]);
+  return {
+    creditMemo: {
+      id: creditMemo.id,
+      organizationId: creditMemo.organizationId,
+      tenantId: creditMemo.tenantId,
+      creditMemoNumber: creditMemo.creditMemoNumber,
+      orderId: creditMemo.orderId ?? null,
+      invoiceId: creditMemo.invoiceId ?? null,
+      statusEntryId: creditMemo.statusEntryId ?? null,
+      status: creditMemo.status ?? null,
+      reason: creditMemo.reason ?? null,
+      issueDate: creditMemo.issueDate ?? null,
+      currencyCode: creditMemo.currencyCode,
+      subtotalNetAmount: String(creditMemo.subtotalNetAmount),
+      subtotalGrossAmount: String(creditMemo.subtotalGrossAmount),
+      taxTotalAmount: String(creditMemo.taxTotalAmount),
+      grandTotalNetAmount: String(creditMemo.grandTotalNetAmount),
+      grandTotalGrossAmount: String(creditMemo.grandTotalGrossAmount),
+      metadata: creditMemo.metadata ?? null,
+      customFieldSetId: creditMemo.customFieldSetId ?? null,
+      customFields: creditMemoCustomFields[creditMemo.id] ?? null,
+    },
+    lines: lines.map((line) => ({
+      id: line.id,
+      orderLineId: line.orderLineId ?? null,
+      lineNumber: line.lineNumber,
+      name: line.name ?? null,
+      sku: line.sku ?? null,
+      description: line.description ?? null,
+      quantity: String(line.quantity),
+      quantityUnit: line.quantityUnit ?? null,
+      normalizedQuantity: String(line.normalizedQuantity),
+      normalizedUnit: line.normalizedUnit ?? null,
+      uomSnapshot: line.uomSnapshot ?? null,
+      currencyCode: line.currencyCode,
+      unitPriceNet: String(line.unitPriceNet),
+      unitPriceGross: String(line.unitPriceGross),
+      taxRate: String(line.taxRate),
+      taxAmount: String(line.taxAmount),
+      totalNetAmount: String(line.totalNetAmount),
+      totalGrossAmount: String(line.totalGrossAmount),
+      metadata: line.metadata ?? null,
+    })),
   };
 }
 
@@ -2729,7 +3032,7 @@ async function applyOrderLineResults(params: {
   const resolveStatus = async (entryId?: string | null) => {
     if (!entryId) return null;
     if (statusCache.has(entryId)) return statusCache.get(entryId) ?? null;
-    const value = await resolveDictionaryEntryValue(em, entryId);
+    const value = await resolveDictionaryEntryValue(em, entryId, { tenantId: order.tenantId });
     statusCache.set(entryId, value);
     return value;
   };
@@ -2803,7 +3106,7 @@ async function applyQuoteLineResults(params: {
   const resolveStatus = async (entryId?: string | null) => {
     if (!entryId) return null;
     if (statusCache.has(entryId)) return statusCache.get(entryId) ?? null;
-    const value = await resolveDictionaryEntryValue(em, entryId);
+    const value = await resolveDictionaryEntryValue(em, entryId, { tenantId: quote.tenantId });
     statusCache.set(entryId, value);
     return value;
   };
@@ -2870,7 +3173,7 @@ async function replaceQuoteLines(
   const resolveStatus = async (entryId?: string | null) => {
     if (!entryId) return null;
     if (statusCache.has(entryId)) return statusCache.get(entryId) ?? null;
-    const value = await resolveDictionaryEntryValue(em, entryId);
+    const value = await resolveDictionaryEntryValue(em, entryId, { tenantId: quote.tenantId });
     statusCache.set(entryId, value);
     return value;
   };
@@ -2998,7 +3301,7 @@ async function replaceOrderLines(
   const resolveStatus = async (entryId?: string | null) => {
     if (!entryId) return null;
     if (statusCache.has(entryId)) return statusCache.get(entryId) ?? null;
-    const value = await resolveDictionaryEntryValue(em, entryId);
+    const value = await resolveDictionaryEntryValue(em, entryId, { tenantId: order.tenantId });
     statusCache.set(entryId, value);
     return value;
   };
@@ -4149,6 +4452,7 @@ const createQuoteCommand: CommandHandler<
     const quoteStatus = await resolveDictionaryEntryValue(
       em,
       parsed.statusEntryId ?? null,
+      { tenantId: parsed.tenantId },
     );
     const quoteId = randomUUID();
     const quote = em.create(SalesQuote, {
@@ -4265,7 +4569,6 @@ const createQuoteCommand: CommandHandler<
       createdAt: new Date(),
       updatedAt: new Date(),
     });
-    em.persist(quote);
 
     const lineInputs = (parsed.lines ?? []).map((line, index) =>
       quoteLineCreateSchema.parse({
@@ -4335,32 +4638,48 @@ const createQuoteCommand: CommandHandler<
       context: calculationContext,
     });
 
-    await replaceQuoteLines(em, quote, calculation, normalizedLineInputs);
-    await replaceQuoteAdjustments(em, quote, calculation, adjustmentInputs);
-    applyQuoteTotals(quote, calculation.totals, calculation.lines.length);
     let eventBus: EventBus | null = null;
     try {
       eventBus = ctx.container.resolve("eventBus") as EventBus;
     } catch {
       eventBus = null;
     }
-    await emitTotalsCalculated(eventBus, {
-      documentKind: "quote",
-      documentId: quote.id,
-      organizationId: quote.organizationId,
-      tenantId: quote.tenantId,
-      customerId: quote.customerEntityId ?? null,
-      totals: calculation.totals,
-      lineCount: calculation.lines.length,
-    });
-    await syncSalesDocumentTags(em, {
-      documentId: quote.id,
-      kind: "quote",
-      organizationId: quote.organizationId,
-      tenantId: quote.tenantId,
-      tagIds: parsed.tags,
-    });
-    await em.flush();
+    // Persist the quote header, lines, adjustments, totals and tags atomically.
+    // replace*/setRecordCustomFields flush mid-build, so without a transaction a
+    // later failure (e.g. tag sync) would leave a half-built quote committed (#2336).
+    await withAtomicFlush(
+      em,
+      [
+        async () => {
+          em.persist(quote);
+          await replaceQuoteLines(em, quote, calculation, normalizedLineInputs);
+          await replaceQuoteAdjustments(
+            em,
+            quote,
+            calculation,
+            adjustmentInputs,
+          );
+          applyQuoteTotals(quote, calculation.totals, calculation.lines.length);
+          await emitTotalsCalculated(eventBus, {
+            documentKind: "quote",
+            documentId: quote.id,
+            organizationId: quote.organizationId,
+            tenantId: quote.tenantId,
+            customerId: quote.customerEntityId ?? null,
+            totals: calculation.totals,
+            lineCount: calculation.lines.length,
+          });
+          await syncSalesDocumentTags(em, {
+            documentId: quote.id,
+            kind: "quote",
+            organizationId: quote.organizationId,
+            tenantId: quote.tenantId,
+            tagIds: parsed.tags,
+          });
+        },
+      ],
+      { transaction: true },
+    );
 
     // Create notification for users with sales.quotes.manage feature
     try {
@@ -4494,11 +4813,23 @@ const deleteQuoteCommand: CommandHandler<
       throw new CrudHttpError(404, { error: "Sales quote not found" });
     ensureQuoteScope(ctx, quote.organizationId, quote.tenantId);
     const [addresses, notes, tags, adjustments, lines] = await Promise.all([
-      em.find(SalesDocumentAddress, {
-        documentId: quote.id,
-        documentKind: "quote",
-      }),
-      em.find(SalesNote, { contextType: "quote", contextId: quote.id }),
+      findWithDecryption(
+        em,
+        SalesDocumentAddress,
+        {
+          documentId: quote.id,
+          documentKind: "quote",
+        },
+        undefined,
+        { tenantId: quote.tenantId, organizationId: quote.organizationId },
+      ),
+      findWithDecryption(
+        em,
+        SalesNote,
+        { contextType: "quote", contextId: quote.id },
+        undefined,
+        { tenantId: quote.tenantId, organizationId: quote.organizationId },
+      ),
       em.find(SalesDocumentTagAssignment, {
         documentId: quote.id,
         documentKind: "quote",
@@ -4506,22 +4837,31 @@ const deleteQuoteCommand: CommandHandler<
       em.find(SalesQuoteAdjustment, { quote: quote.id }),
       em.find(SalesQuoteLine, { quote: quote.id }),
     ]);
-    await em.nativeDelete(SalesDocumentAddress, {
-      documentId: quote.id,
-      documentKind: "quote",
-    });
-    await em.nativeDelete(SalesNote, {
-      contextType: "quote",
-      contextId: quote.id,
-    });
-    await em.nativeDelete(SalesDocumentTagAssignment, {
-      documentId: quote.id,
-      documentKind: "quote",
-    });
-    await em.nativeDelete(SalesQuoteAdjustment, { quote: quote.id });
-    await em.nativeDelete(SalesQuoteLine, { quote: quote.id });
-    em.remove(quote);
-    await em.flush();
+    // Delete the quote and its cascade atomically so a mid-cascade failure
+    // cannot leave a partially-deleted quote committed (#2336).
+    await withAtomicFlush(
+      em,
+      [
+        async () => {
+          await em.nativeDelete(SalesDocumentAddress, {
+            documentId: quote.id,
+            documentKind: "quote",
+          });
+          await em.nativeDelete(SalesNote, {
+            contextType: "quote",
+            contextId: quote.id,
+          });
+          await em.nativeDelete(SalesDocumentTagAssignment, {
+            documentId: quote.id,
+            documentKind: "quote",
+          });
+          await em.nativeDelete(SalesQuoteAdjustment, { quote: quote.id });
+          await em.nativeDelete(SalesQuoteLine, { quote: quote.id });
+          em.remove(quote);
+        },
+      ],
+      { transaction: true },
+    );
     const dataEngine = ctx.container.resolve<DataEngine>("dataEngine");
     await Promise.all([
       queueDeletionSideEffects(dataEngine, quote, E.sales.sales_quote),
@@ -4602,6 +4942,7 @@ const updateQuoteCommand: CommandHandler<
     if (!quote)
       throw new CrudHttpError(404, { error: "Sales quote not found" });
     ensureQuoteScope(ctx, quote.organizationId, quote.tenantId);
+    enforceSalesDocumentOptimisticLock(ctx, quote, SALES_RESOURCE_KIND_QUOTE);
     const shouldInvalidateSentToken = (quote.status ?? null) === "sent";
     if (shouldInvalidateSentToken) {
       quote.acceptanceToken = null;
@@ -4615,107 +4956,132 @@ const updateQuoteCommand: CommandHandler<
       parsed.paymentMethodSnapshot !== undefined ||
       parsed.paymentMethodCode !== undefined ||
       parsed.currencyCode !== undefined;
-    await applyDocumentUpdate({
-      kind: "quote",
-      entity: quote,
-      input: parsed,
+    // Apply the scalar update, optional sent-token reset, and totals recalc
+    // atomically. applyDocumentUpdate/replace*/setRecordCustomFields flush
+    // mid-build, so without a transaction a later failure would leave a
+    // half-updated quote committed (#2336).
+    await withAtomicFlush(
       em,
-    });
-    await em.flush();
-    if (shouldInvalidateSentToken) {
-      quote.status = "draft";
-      quote.statusEntryId = await resolveStatusEntryIdByValue(em, {
-        tenantId: quote.tenantId,
-        organizationId: quote.organizationId,
-        value: "draft",
-      });
-    }
-    if (shouldRecalculateTotals) {
-      const [existingLines, adjustments] = await Promise.all([
-        em.find(SalesQuoteLine, { quote }, { orderBy: { lineNumber: "asc" } }),
-        em.find(
-          SalesQuoteAdjustment,
-          { quote },
-          { orderBy: { position: "asc" } },
-        ),
-      ]);
-      const lineSnapshots = existingLines.map(mapQuoteLineEntityToSnapshot);
-      const calcLines = lineSnapshots.map((line, index) =>
-        createLineSnapshotFromInput(
-          {
-            ...line,
-            organizationId: quote.organizationId,
-            tenantId: quote.tenantId,
-            quoteId: quote.id,
-            lineNumber: line.lineNumber ?? index + 1,
-            statusEntryId: (line as any).statusEntryId ?? null,
-            catalogSnapshot: (line as any).catalogSnapshot ?? null,
-            promotionSnapshot: (line as any).promotionSnapshot ?? null,
-          },
-          line.lineNumber ?? index + 1,
-        ),
-      );
-      const adjustmentDrafts = adjustments.map(mapQuoteAdjustmentToDraft);
-      const salesCalculationService =
-        ctx.container.resolve<SalesCalculationService>(
-          "salesCalculationService",
-        );
-      const calculationContext = buildCalculationContext({
-        tenantId: quote.tenantId,
-        organizationId: quote.organizationId,
-        currencyCode: quote.currencyCode,
-        shippingSnapshot: quote.shippingMethodSnapshot,
-        paymentSnapshot: quote.paymentMethodSnapshot,
-        shippingMethodId: quote.shippingMethodId ?? null,
-        paymentMethodId: quote.paymentMethodId ?? null,
-        shippingMethodCode: quote.shippingMethodCode ?? null,
-        paymentMethodCode: quote.paymentMethodCode ?? null,
-      });
-      const calculation = await salesCalculationService.calculateDocumentTotals(
-        {
-          documentKind: "quote",
-          lines: calcLines,
-          adjustments: adjustmentDrafts,
-          context: calculationContext,
+      [
+        async () => {
+          await applyDocumentUpdate({
+            kind: "quote",
+            entity: quote,
+            input: parsed,
+            em,
+          });
+          if (shouldInvalidateSentToken) {
+            quote.status = "draft";
+            quote.statusEntryId = await resolveStatusEntryIdByValue(em, {
+              tenantId: quote.tenantId,
+              organizationId: quote.organizationId,
+              value: "draft",
+            });
+          }
         },
-      );
-      const adjustmentInputs = adjustmentDrafts.map((adj, index) => ({
-        organizationId: quote.organizationId,
-        tenantId: quote.tenantId,
-        quoteId: quote.id,
-        scope: adj.scope ?? "order",
-        kind: adj.kind ?? "custom",
-        code: adj.code ?? undefined,
-        label: adj.label ?? undefined,
-        calculatorKey: adj.calculatorKey ?? undefined,
-        promotionId: adj.promotionId ?? undefined,
-        rate: adj.rate ?? undefined,
-        amountNet: adj.amountNet ?? undefined,
-        amountGross: adj.amountGross ?? undefined,
-        currencyCode: adj.currencyCode ?? quote.currencyCode,
-        metadata: adj.metadata ?? undefined,
-        position: adj.position ?? index,
-      }));
-      await replaceQuoteAdjustments(em, quote, calculation, adjustmentInputs);
-      applyQuoteTotals(quote, calculation.totals, calculation.lines.length);
-      let eventBus: EventBus | null = null;
-      try {
-        eventBus = ctx.container.resolve("eventBus") as EventBus;
-      } catch {
-        eventBus = null;
-      }
-      await emitTotalsCalculated(eventBus, {
-        documentKind: "quote",
-        documentId: quote.id,
-        organizationId: quote.organizationId,
-        tenantId: quote.tenantId,
-        customerId: quote.customerEntityId ?? null,
-        totals: calculation.totals,
-        lineCount: calculation.lines.length,
-      });
-    }
-    quote.updatedAt = new Date();
-    await em.flush();
+        // Scalar mutations above are persisted by withAtomicFlush's per-phase
+        // flush boundary before the recalc reads below run any query on the same
+        // EntityManager. MikroORM v7 would otherwise silently discard pending
+        // scalar changes on `quote` when the `em.find` line/adjustment lookups
+        // reset the changeset (see SPEC-018).
+        async () => {
+          if (shouldRecalculateTotals) {
+            const [existingLines, adjustments] = await Promise.all([
+              em.find(
+                SalesQuoteLine,
+                { quote },
+                { orderBy: { lineNumber: "asc" } },
+              ),
+              em.find(
+                SalesQuoteAdjustment,
+                { quote },
+                { orderBy: { position: "asc" } },
+              ),
+            ]);
+            const lineSnapshots = existingLines.map(mapQuoteLineEntityToSnapshot);
+            const calcLines = lineSnapshots.map((line, index) =>
+              createLineSnapshotFromInput(
+                {
+                  ...line,
+                  organizationId: quote.organizationId,
+                  tenantId: quote.tenantId,
+                  quoteId: quote.id,
+                  lineNumber: line.lineNumber ?? index + 1,
+                  statusEntryId: (line as any).statusEntryId ?? null,
+                  catalogSnapshot: (line as any).catalogSnapshot ?? null,
+                  promotionSnapshot: (line as any).promotionSnapshot ?? null,
+                },
+                line.lineNumber ?? index + 1,
+              ),
+            );
+            const adjustmentDrafts = adjustments.map(mapQuoteAdjustmentToDraft);
+            const salesCalculationService =
+              ctx.container.resolve<SalesCalculationService>(
+                "salesCalculationService",
+              );
+            const calculationContext = buildCalculationContext({
+              tenantId: quote.tenantId,
+              organizationId: quote.organizationId,
+              currencyCode: quote.currencyCode,
+              shippingSnapshot: quote.shippingMethodSnapshot,
+              paymentSnapshot: quote.paymentMethodSnapshot,
+              shippingMethodId: quote.shippingMethodId ?? null,
+              paymentMethodId: quote.paymentMethodId ?? null,
+              shippingMethodCode: quote.shippingMethodCode ?? null,
+              paymentMethodCode: quote.paymentMethodCode ?? null,
+            });
+            const calculation =
+              await salesCalculationService.calculateDocumentTotals({
+                documentKind: "quote",
+                lines: calcLines,
+                adjustments: adjustmentDrafts,
+                context: calculationContext,
+              });
+            const adjustmentInputs = adjustmentDrafts.map((adj, index) => ({
+              organizationId: quote.organizationId,
+              tenantId: quote.tenantId,
+              quoteId: quote.id,
+              scope: adj.scope ?? "order",
+              kind: adj.kind ?? "custom",
+              code: adj.code ?? undefined,
+              label: adj.label ?? undefined,
+              calculatorKey: adj.calculatorKey ?? undefined,
+              promotionId: adj.promotionId ?? undefined,
+              rate: adj.rate ?? undefined,
+              amountNet: adj.amountNet ?? undefined,
+              amountGross: adj.amountGross ?? undefined,
+              currencyCode: adj.currencyCode ?? quote.currencyCode,
+              metadata: adj.metadata ?? undefined,
+              position: adj.position ?? index,
+            }));
+            await replaceQuoteAdjustments(
+              em,
+              quote,
+              calculation,
+              adjustmentInputs,
+            );
+            applyQuoteTotals(quote, calculation.totals, calculation.lines.length);
+            let eventBus: EventBus | null = null;
+            try {
+              eventBus = ctx.container.resolve("eventBus") as EventBus;
+            } catch {
+              eventBus = null;
+            }
+            await emitTotalsCalculated(eventBus, {
+              documentKind: "quote",
+              documentId: quote.id,
+              organizationId: quote.organizationId,
+              tenantId: quote.tenantId,
+              customerId: quote.customerEntityId ?? null,
+              totals: calculation.totals,
+              lineCount: calculation.lines.length,
+            });
+          }
+          quote.updatedAt = new Date();
+        },
+      ],
+      { transaction: true },
+    );
     const resourceKind =
       deriveResourceFromCommandId(updateQuoteCommand.id) ?? "sales.quote";
     await invalidateCrudCache(
@@ -4818,106 +5184,132 @@ const updateOrderCommand: CommandHandler<
       parsed.paymentMethodSnapshot !== undefined ||
       parsed.paymentMethodCode !== undefined ||
       parsed.currencyCode !== undefined;
-    await applyDocumentUpdate({
-      kind: "order",
-      entity: order,
-      input: parsed,
+    // Apply the scalar update, totals recalc, and status-change note atomically.
+    // applyDocumentUpdate/replace*/setRecordCustomFields flush mid-build, so
+    // without a transaction a later failure would leave a half-updated order
+    // committed (#2336).
+    await withAtomicFlush(
       em,
-    });
-    await em.flush();
-    if (shouldRecalculateTotals) {
-      const [existingLines, adjustments] = await Promise.all([
-        em.find(SalesOrderLine, { order }, { orderBy: { lineNumber: "asc" } }),
-        em.find(
-          SalesOrderAdjustment,
-          { order },
-          { orderBy: { position: "asc" } },
-        ),
-      ]);
-      const lineSnapshots = existingLines.map(mapOrderLineEntityToSnapshot);
-      const calcLines = lineSnapshots.map((line, index) =>
-        createLineSnapshotFromInput(
-          {
-            ...line,
-            organizationId: order.organizationId,
-            tenantId: order.tenantId,
-            orderId: order.id,
-            lineNumber: line.lineNumber ?? index + 1,
-            statusEntryId: (line as any).statusEntryId ?? null,
-            catalogSnapshot: (line as any).catalogSnapshot ?? null,
-            promotionSnapshot: (line as any).promotionSnapshot ?? null,
-          },
-          line.lineNumber ?? index + 1,
-        ),
-      );
-      const adjustmentDrafts = adjustments.map(mapOrderAdjustmentToDraft);
-      const salesCalculationService =
-        ctx.container.resolve<SalesCalculationService>(
-          "salesCalculationService",
-        );
-      const calculationContext = buildCalculationContext({
-        tenantId: order.tenantId,
-        organizationId: order.organizationId,
-        currencyCode: order.currencyCode,
-        shippingSnapshot: order.shippingMethodSnapshot,
-        paymentSnapshot: order.paymentMethodSnapshot,
-        shippingMethodId: order.shippingMethodId ?? null,
-        paymentMethodId: order.paymentMethodId ?? null,
-        shippingMethodCode: order.shippingMethodCode ?? null,
-        paymentMethodCode: order.paymentMethodCode ?? null,
-      });
-      const calculation = await salesCalculationService.calculateDocumentTotals(
-        {
-          documentKind: "order",
-          lines: calcLines,
-          adjustments: adjustmentDrafts,
-          context: calculationContext,
-          existingTotals: resolveExistingPaymentTotals(order),
+      [
+        async () => {
+          await applyDocumentUpdate({
+            kind: "order",
+            entity: order,
+            input: parsed,
+            em,
+          });
         },
-      );
-      const adjustmentInputs = adjustmentDrafts.map((adj, index) => ({
-        organizationId: order.organizationId,
-        tenantId: order.tenantId,
-        orderId: order.id,
-        scope: adj.scope ?? "order",
-        kind: adj.kind ?? "custom",
-        code: adj.code ?? undefined,
-        label: adj.label ?? undefined,
-        calculatorKey: adj.calculatorKey ?? undefined,
-        promotionId: adj.promotionId ?? undefined,
-        rate: adj.rate ?? undefined,
-        amountNet: adj.amountNet ?? undefined,
-        amountGross: adj.amountGross ?? undefined,
-        currencyCode: adj.currencyCode ?? order.currencyCode,
-        metadata: adj.metadata ?? undefined,
-        position: adj.position ?? index,
-      }));
-      await replaceOrderAdjustments(em, order, calculation, adjustmentInputs);
-      applyOrderTotals(order, calculation.totals, calculation.lines.length);
-      let eventBus: EventBus | null = null;
-      try {
-        eventBus = ctx.container.resolve("eventBus") as EventBus;
-      } catch {
-        eventBus = null;
-      }
-      await emitTotalsCalculated(eventBus, {
-        documentKind: "order",
-        documentId: order.id,
-        organizationId: order.organizationId,
-        tenantId: order.tenantId,
-        customerId: order.customerEntityId ?? null,
-        totals: calculation.totals,
-        lineCount: calculation.lines.length,
-      });
-    }
-    statusChangeNote = await appendOrderStatusChangeNote({
-      em,
-      order,
-      previousStatus,
-      auth: ctx.auth ?? null,
-    });
-    order.updatedAt = new Date();
-    await em.flush();
+        // Scalar mutations above are persisted by withAtomicFlush's per-phase
+        // flush boundary before the recalc reads and the status-change-note
+        // lookup below run any query on the same EntityManager. MikroORM v7 would
+        // otherwise silently discard pending scalar changes on `order` when the
+        // `em.find` lines/adjustments or appendOrderStatusChangeNote queries
+        // reset the changeset (see SPEC-018).
+        async () => {
+          if (shouldRecalculateTotals) {
+            const [existingLines, adjustments] = await Promise.all([
+              em.find(
+                SalesOrderLine,
+                { order },
+                { orderBy: { lineNumber: "asc" } },
+              ),
+              em.find(
+                SalesOrderAdjustment,
+                { order },
+                { orderBy: { position: "asc" } },
+              ),
+            ]);
+            const lineSnapshots = existingLines.map(mapOrderLineEntityToSnapshot);
+            const calcLines = lineSnapshots.map((line, index) =>
+              createLineSnapshotFromInput(
+                {
+                  ...line,
+                  organizationId: order.organizationId,
+                  tenantId: order.tenantId,
+                  orderId: order.id,
+                  lineNumber: line.lineNumber ?? index + 1,
+                  statusEntryId: (line as any).statusEntryId ?? null,
+                  catalogSnapshot: (line as any).catalogSnapshot ?? null,
+                  promotionSnapshot: (line as any).promotionSnapshot ?? null,
+                },
+                line.lineNumber ?? index + 1,
+              ),
+            );
+            const adjustmentDrafts = adjustments.map(mapOrderAdjustmentToDraft);
+            const salesCalculationService =
+              ctx.container.resolve<SalesCalculationService>(
+                "salesCalculationService",
+              );
+            const calculationContext = buildCalculationContext({
+              tenantId: order.tenantId,
+              organizationId: order.organizationId,
+              currencyCode: order.currencyCode,
+              shippingSnapshot: order.shippingMethodSnapshot,
+              paymentSnapshot: order.paymentMethodSnapshot,
+              shippingMethodId: order.shippingMethodId ?? null,
+              paymentMethodId: order.paymentMethodId ?? null,
+              shippingMethodCode: order.shippingMethodCode ?? null,
+              paymentMethodCode: order.paymentMethodCode ?? null,
+            });
+            const calculation =
+              await salesCalculationService.calculateDocumentTotals({
+                documentKind: "order",
+                lines: calcLines,
+                adjustments: adjustmentDrafts,
+                context: calculationContext,
+                existingTotals: resolveExistingPaymentTotals(order),
+              });
+            const adjustmentInputs = adjustmentDrafts.map((adj, index) => ({
+              organizationId: order.organizationId,
+              tenantId: order.tenantId,
+              orderId: order.id,
+              scope: adj.scope ?? "order",
+              kind: adj.kind ?? "custom",
+              code: adj.code ?? undefined,
+              label: adj.label ?? undefined,
+              calculatorKey: adj.calculatorKey ?? undefined,
+              promotionId: adj.promotionId ?? undefined,
+              rate: adj.rate ?? undefined,
+              amountNet: adj.amountNet ?? undefined,
+              amountGross: adj.amountGross ?? undefined,
+              currencyCode: adj.currencyCode ?? order.currencyCode,
+              metadata: adj.metadata ?? undefined,
+              position: adj.position ?? index,
+            }));
+            await replaceOrderAdjustments(
+              em,
+              order,
+              calculation,
+              adjustmentInputs,
+            );
+            applyOrderTotals(order, calculation.totals, calculation.lines.length);
+            let eventBus: EventBus | null = null;
+            try {
+              eventBus = ctx.container.resolve("eventBus") as EventBus;
+            } catch {
+              eventBus = null;
+            }
+            await emitTotalsCalculated(eventBus, {
+              documentKind: "order",
+              documentId: order.id,
+              organizationId: order.organizationId,
+              tenantId: order.tenantId,
+              customerId: order.customerEntityId ?? null,
+              totals: calculation.totals,
+              lineCount: calculation.lines.length,
+            });
+          }
+          statusChangeNote = await appendOrderStatusChangeNote({
+            em,
+            order,
+            previousStatus,
+            auth: ctx.auth ?? null,
+          });
+          order.updatedAt = new Date();
+        },
+      ],
+      { transaction: true },
+    );
     if (statusChangeNote) {
       const dataEngine = ctx.container.resolve("dataEngine");
       await emitCrudSideEffects({
@@ -5025,9 +5417,9 @@ const createOrderCommand: CommandHandler<
     ensureOrderScope(ctx, parsed.organizationId, parsed.tenantId);
     const em = (ctx.container.resolve("em") as EntityManager).fork();
     const [status, fulfillmentStatus, paymentStatus] = await Promise.all([
-      resolveDictionaryEntryValue(em, parsed.statusEntryId ?? null),
-      resolveDictionaryEntryValue(em, parsed.fulfillmentStatusEntryId ?? null),
-      resolveDictionaryEntryValue(em, parsed.paymentStatusEntryId ?? null),
+      resolveDictionaryEntryValue(em, parsed.statusEntryId ?? null, { tenantId: parsed.tenantId }),
+      resolveDictionaryEntryValue(em, parsed.fulfillmentStatusEntryId ?? null, { tenantId: parsed.tenantId }),
+      resolveDictionaryEntryValue(em, parsed.paymentStatusEntryId ?? null, { tenantId: parsed.tenantId }),
     ]);
     const {
       customerSnapshot: resolvedCustomerSnapshot,
@@ -5173,8 +5565,6 @@ const createOrderCommand: CommandHandler<
       createdAt: new Date(),
       updatedAt: new Date(),
     });
-    em.persist(order);
-
     const lineInputs = (parsed.lines ?? []).map((line, index) =>
       orderLineCreateSchema.parse({
         ...line,
@@ -5244,32 +5634,48 @@ const createOrderCommand: CommandHandler<
       existingTotals: resolveExistingPaymentTotals(order),
     });
 
-    await replaceOrderLines(em, order, calculation, normalizedLineInputs);
-    await replaceOrderAdjustments(em, order, calculation, adjustmentInputs);
-    applyOrderTotals(order, calculation.totals, calculation.lines.length);
     let eventBus: EventBus | null = null;
     try {
       eventBus = ctx.container.resolve("eventBus") as EventBus;
     } catch {
       eventBus = null;
     }
-    await emitTotalsCalculated(eventBus, {
-      documentKind: "order",
-      documentId: order.id,
-      organizationId: order.organizationId,
-      tenantId: order.tenantId,
-      customerId: order.customerEntityId ?? null,
-      totals: calculation.totals,
-      lineCount: calculation.lines.length,
-    });
-    await syncSalesDocumentTags(em, {
-      documentId: order.id,
-      kind: "order",
-      organizationId: order.organizationId,
-      tenantId: order.tenantId,
-      tagIds: parsed.tags,
-    });
-    await em.flush();
+    // Persist the order header, lines, adjustments, totals and tags atomically.
+    // replace*/setRecordCustomFields flush mid-build, so without a transaction a
+    // later failure (e.g. tag sync) would leave a half-built order committed (#2336).
+    await withAtomicFlush(
+      em,
+      [
+        async () => {
+          em.persist(order);
+          await replaceOrderLines(em, order, calculation, normalizedLineInputs);
+          await replaceOrderAdjustments(
+            em,
+            order,
+            calculation,
+            adjustmentInputs,
+          );
+          applyOrderTotals(order, calculation.totals, calculation.lines.length);
+          await emitTotalsCalculated(eventBus, {
+            documentKind: "order",
+            documentId: order.id,
+            organizationId: order.organizationId,
+            tenantId: order.tenantId,
+            customerId: order.customerEntityId ?? null,
+            totals: calculation.totals,
+            lineCount: calculation.lines.length,
+          });
+          await syncSalesDocumentTags(em, {
+            documentId: order.id,
+            kind: "order",
+            organizationId: order.organizationId,
+            tenantId: order.tenantId,
+            tagIds: parsed.tags,
+          });
+        },
+      ],
+      { transaction: true },
+    );
 
     // Create notification for users with sales.orders.manage feature
     try {
@@ -5419,11 +5825,23 @@ const deleteOrderCommand: CommandHandler<
         : Promise.resolve([]),
       em.find(SalesPayment, { order: order.id }),
       em.find(SalesPaymentAllocation, { order: order.id }),
-      em.find(SalesDocumentAddress, {
-        documentId: order.id,
-        documentKind: "order",
-      }),
-      em.find(SalesNote, { contextType: "order", contextId: order.id }),
+      findWithDecryption(
+        em,
+        SalesDocumentAddress,
+        {
+          documentId: order.id,
+          documentKind: "order",
+        },
+        undefined,
+        { tenantId: order.tenantId, organizationId: order.organizationId },
+      ),
+      findWithDecryption(
+        em,
+        SalesNote,
+        { contextType: "order", contextId: order.id },
+        undefined,
+        { tenantId: order.tenantId, organizationId: order.organizationId },
+      ),
       em.find(SalesDocumentTagAssignment, {
         documentId: order.id,
         documentKind: "order",
@@ -5431,30 +5849,39 @@ const deleteOrderCommand: CommandHandler<
       em.find(SalesOrderAdjustment, { order: order.id }),
       em.find(SalesOrderLine, { order: order.id }),
     ]);
-    if (shipmentIds.length) {
-      await em.nativeDelete(SalesShipmentItem, {
-        shipment: { $in: shipmentIds },
-      });
-      await em.nativeDelete(SalesShipment, { id: { $in: shipmentIds } });
-    }
-    await em.nativeDelete(SalesPaymentAllocation, { order: order.id });
-    await em.nativeDelete(SalesPayment, { order: order.id });
-    await em.nativeDelete(SalesDocumentAddress, {
-      documentId: order.id,
-      documentKind: "order",
-    });
-    await em.nativeDelete(SalesNote, {
-      contextType: "order",
-      contextId: order.id,
-    });
-    await em.nativeDelete(SalesDocumentTagAssignment, {
-      documentId: order.id,
-      documentKind: "order",
-    });
-    await em.nativeDelete(SalesOrderAdjustment, { order: order.id });
-    await em.nativeDelete(SalesOrderLine, { order: order.id });
-    em.remove(order);
-    await em.flush();
+    // Delete the order and its cascade atomically so a mid-cascade failure
+    // cannot leave a partially-deleted order committed (#2336).
+    await withAtomicFlush(
+      em,
+      [
+        async () => {
+          if (shipmentIds.length) {
+            await em.nativeDelete(SalesShipmentItem, {
+              shipment: { $in: shipmentIds },
+            });
+            await em.nativeDelete(SalesShipment, { id: { $in: shipmentIds } });
+          }
+          await em.nativeDelete(SalesPaymentAllocation, { order: order.id });
+          await em.nativeDelete(SalesPayment, { order: order.id });
+          await em.nativeDelete(SalesDocumentAddress, {
+            documentId: order.id,
+            documentKind: "order",
+          });
+          await em.nativeDelete(SalesNote, {
+            contextType: "order",
+            contextId: order.id,
+          });
+          await em.nativeDelete(SalesDocumentTagAssignment, {
+            documentId: order.id,
+            documentKind: "order",
+          });
+          await em.nativeDelete(SalesOrderAdjustment, { order: order.id });
+          await em.nativeDelete(SalesOrderLine, { order: order.id });
+          em.remove(order);
+        },
+      ],
+      { transaction: true },
+    );
     const dataEngine = ctx.container.resolve<DataEngine>("dataEngine");
     await Promise.all([
       queueDeletionSideEffects(dataEngine, order, E.sales.sales_order),
@@ -5550,322 +5977,352 @@ const convertQuoteToOrderCommand: CommandHandler<
   },
   async execute(rawInput, ctx) {
     const payload = quoteConvertToOrderSchema.parse(rawInput ?? {});
-    const em = (ctx.container.resolve("em") as EntityManager).fork();
-    const quote = await em.findOne(SalesQuote, {
-      id: payload.quoteId,
-      deletedAt: null,
-    });
-    const { translate } = await resolveTranslations();
-    if (!quote)
-      throw new CrudHttpError(404, {
-        error: translate(
-          "sales.documents.detail.error",
-          "Document not found or inaccessible.",
-        ),
-      });
-    ensureQuoteScope(ctx, quote.organizationId, quote.tenantId);
-    const snapshot = await loadQuoteSnapshot(em, payload.quoteId);
-    if (!snapshot)
-      throw new CrudHttpError(404, {
-        error: translate(
-          "sales.documents.detail.error",
-          "Document not found or inaccessible.",
-        ),
-      });
-    const orderId = payload.orderId ?? quote.id;
-    const existingOrder = await em.findOne(SalesOrder, {
-      id: orderId,
-      deletedAt: null,
-    });
-    if (existingOrder) {
-      throw new CrudHttpError(409, {
-        error: translate(
-          "sales.documents.detail.convertExists",
-          "Order already exists for this quote.",
-        ),
-      });
-    }
-
-    const generator = ctx.container.resolve(
-      "salesDocumentNumberGenerator",
-    ) as SalesDocumentNumberGenerator;
-    const generatedNumber = (
-      await generator.generate({
-        kind: "order",
-        organizationId: snapshot.quote.organizationId,
-        tenantId: snapshot.quote.tenantId,
-      })
-    ).number;
-    const orderNumber =
-      typeof payload.orderNumber === "string" &&
-      payload.orderNumber.trim().length
-        ? payload.orderNumber.trim()
-        : generatedNumber;
-
-    const [quoteCustomFields, quoteLineCustomFields] = await Promise.all([
-      loadCustomFieldValues({
+    // When the caller supplies an existing transactional EntityManager, reuse it
+    // (and its row locks) so the quote status flip and the order materialization
+    // commit or roll back as one atomic unit — no out-of-band compensating write.
+    const callerEm = ctx.transactionalEm;
+    const rootEm =
+      callerEm ?? (ctx.container.resolve("em") as EntityManager).fork();
+    const transactionalEm = rootEm as EntityManager & {
+      transactional?: <TResult>(
+        callback: (trx: EntityManager) => Promise<TResult>,
+      ) => Promise<TResult>;
+    };
+    const runConversion = async (em: EntityManager) => {
+      const quote = await findOneWithDecryption(
         em,
-        entityId: E.sales.sales_quote,
-        recordIds: [snapshot.quote.id],
-        tenantIdByRecord: { [snapshot.quote.id]: snapshot.quote.tenantId },
-        organizationIdByRecord: {
-          [snapshot.quote.id]: snapshot.quote.organizationId,
+        SalesQuote,
+        {
+          id: payload.quoteId,
+          deletedAt: null,
         },
-      }),
-      snapshot.lines.length
-        ? loadCustomFieldValues({
-            em,
-            entityId: E.sales.sales_quote_line,
-            recordIds: snapshot.lines.map((line) => line.id),
-            tenantIdByRecord: Object.fromEntries(
-              snapshot.lines.map((line) => [line.id, snapshot.quote.tenantId]),
-            ),
-            organizationIdByRecord: Object.fromEntries(
-              snapshot.lines.map((line) => [
-                line.id,
-                snapshot.quote.organizationId,
-              ]),
-            ),
-          })
-        : Promise.resolve({}),
-    ]);
-
-    const order = em.create(SalesOrder, {
-      id: orderId,
-      organizationId: snapshot.quote.organizationId,
-      tenantId: snapshot.quote.tenantId,
-      orderNumber,
-      statusEntryId: snapshot.quote.statusEntryId ?? null,
-      status: snapshot.quote.status ?? null,
-      fulfillmentStatusEntryId: null,
-      fulfillmentStatus: null,
-      paymentStatusEntryId: null,
-      paymentStatus: null,
-      customerEntityId: snapshot.quote.customerEntityId ?? null,
-      customerContactId: snapshot.quote.customerContactId ?? null,
-      customerSnapshot: snapshot.quote.customerSnapshot
-        ? cloneJson(snapshot.quote.customerSnapshot)
-        : null,
-      billingAddressId: snapshot.quote.billingAddressId ?? null,
-      shippingAddressId: snapshot.quote.shippingAddressId ?? null,
-      billingAddressSnapshot: snapshot.quote.billingAddressSnapshot
-        ? cloneJson(snapshot.quote.billingAddressSnapshot)
-        : null,
-      shippingAddressSnapshot: snapshot.quote.shippingAddressSnapshot
-        ? cloneJson(snapshot.quote.shippingAddressSnapshot)
-        : null,
-      currencyCode: snapshot.quote.currencyCode,
-      exchangeRate: null,
-      taxStrategyKey: null,
-      discountStrategyKey: null,
-      taxInfo: snapshot.quote.taxInfo
-        ? cloneJson(snapshot.quote.taxInfo)
-        : null,
-      shippingMethodId: snapshot.quote.shippingMethodId ?? null,
-      shippingMethodCode: snapshot.quote.shippingMethodCode ?? null,
-      deliveryWindowId: snapshot.quote.deliveryWindowId ?? null,
-      deliveryWindowCode: snapshot.quote.deliveryWindowCode ?? null,
-      paymentMethodId: snapshot.quote.paymentMethodId ?? null,
-      paymentMethodCode: snapshot.quote.paymentMethodCode ?? null,
-      channelId: snapshot.quote.channelId ?? null,
-      placedAt: snapshot.quote.validFrom
-        ? new Date(snapshot.quote.validFrom)
-        : quote.createdAt,
-      expectedDeliveryAt: snapshot.quote.validUntil
-        ? new Date(snapshot.quote.validUntil)
-        : null,
-      dueAt: null,
-      comments: snapshot.quote.comments ?? null,
-      internalNotes: null,
-      shippingMethodSnapshot: snapshot.quote.shippingMethodSnapshot
-        ? cloneJson(snapshot.quote.shippingMethodSnapshot)
-        : null,
-      deliveryWindowSnapshot: snapshot.quote.deliveryWindowSnapshot
-        ? cloneJson(snapshot.quote.deliveryWindowSnapshot)
-        : null,
-      paymentMethodSnapshot: snapshot.quote.paymentMethodSnapshot
-        ? cloneJson(snapshot.quote.paymentMethodSnapshot)
-        : null,
-      metadata: snapshot.quote.metadata
-        ? cloneJson(snapshot.quote.metadata)
-        : null,
-      customFieldSetId: snapshot.quote.customFieldSetId ?? null,
-      subtotalNetAmount: snapshot.quote.subtotalNetAmount,
-      subtotalGrossAmount: snapshot.quote.subtotalGrossAmount,
-      discountTotalAmount: snapshot.quote.discountTotalAmount,
-      taxTotalAmount: snapshot.quote.taxTotalAmount,
-      shippingNetAmount: "0",
-      shippingGrossAmount: "0",
-      surchargeTotalAmount: "0",
-      grandTotalNetAmount: snapshot.quote.grandTotalNetAmount,
-      grandTotalGrossAmount: snapshot.quote.grandTotalGrossAmount,
-      paidTotalAmount: "0",
-      refundedTotalAmount: "0",
-      outstandingAmount: snapshot.quote.grandTotalGrossAmount,
-      totalsSnapshot: snapshot.quote.totalsSnapshot
-        ? cloneJson(snapshot.quote.totalsSnapshot)
-        : null,
-      lineItemCount: snapshot.quote.lineItemCount,
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    });
-    em.persist(order);
-
-    const orderLineMap = new Map<string, SalesOrderLine>();
-    snapshot.lines.forEach((line, index) => {
-      const orderLine = em.create(SalesOrderLine, {
-        id: line.id,
-        order,
-        organizationId: snapshot.quote.organizationId,
-        tenantId: snapshot.quote.tenantId,
-        lineNumber: line.lineNumber ?? index + 1,
-        kind: line.kind as SalesLineKind,
-        statusEntryId: (line as any).statusEntryId ?? null,
-        status: (line as any).status ?? null,
-        productId: line.productId ?? null,
-        productVariantId: line.productVariantId ?? null,
-        catalogSnapshot: line.catalogSnapshot
-          ? cloneJson(line.catalogSnapshot)
-          : null,
-        name: line.name ?? null,
-        description: line.description ?? null,
-        comment: line.comment ?? null,
-        quantity: line.quantity,
-        quantityUnit: line.quantityUnit ?? null,
-        normalizedQuantity: line.normalizedQuantity ?? line.quantity,
-        normalizedUnit: line.normalizedUnit ?? line.quantityUnit ?? null,
-        uomSnapshot: line.uomSnapshot ? cloneJson(line.uomSnapshot) : null,
-        reservedQuantity: "0",
-        fulfilledQuantity: "0",
-        invoicedQuantity: "0",
-        returnedQuantity: "0",
-        currencyCode: line.currencyCode,
-        unitPriceNet: line.unitPriceNet,
-        unitPriceGross: line.unitPriceGross,
-        discountAmount: line.discountAmount,
-        discountPercent: line.discountPercent,
-        taxRate: line.taxRate,
-        taxAmount: line.taxAmount,
-        totalNetAmount: line.totalNetAmount,
-        totalGrossAmount: line.totalGrossAmount,
-        configuration: line.configuration
-          ? cloneJson(line.configuration)
-          : null,
-        promotionCode: line.promotionCode ?? null,
-        promotionSnapshot: line.promotionSnapshot
-          ? cloneJson(line.promotionSnapshot)
-          : null,
-        metadata: line.metadata ? cloneJson(line.metadata) : null,
-        customFieldSetId: line.customFieldSetId ?? null,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      });
-      em.persist(orderLine);
-      orderLineMap.set(orderLine.id, orderLine);
-    });
-
-    snapshot.adjustments.forEach((adj, index) => {
-      const orderLineId = adj.quoteLineId ?? null;
-      const orderLine = orderLineId
-        ? (orderLineMap.get(orderLineId) ?? null)
-        : null;
-      const entity = em.create(SalesOrderAdjustment, {
-        id: adj.id,
-        order,
-        orderLine: orderLine ?? null,
-        organizationId: snapshot.quote.organizationId,
-        tenantId: snapshot.quote.tenantId,
-        scope: adj.scope,
-        kind: adj.kind as SalesAdjustmentKind,
-        code: adj.code ?? null,
-        label: adj.label ?? null,
-        calculatorKey: adj.calculatorKey ?? null,
-        promotionId: adj.promotionId ?? null,
-        rate: adj.rate,
-        amountNet: adj.amountNet,
-        amountGross: adj.amountGross,
-        currencyCode: adj.currencyCode ?? null,
-        metadata: adj.metadata ? cloneJson(adj.metadata) : null,
-        position: adj.position ?? index,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      });
-      em.persist(entity);
-    });
-
-    const [addresses, notes, tags] = await Promise.all([
-      em.find(SalesDocumentAddress, {
-        documentId: snapshot.quote.id,
-        documentKind: "quote",
-      }),
-      em.find(SalesNote, {
-        contextType: "quote",
-        contextId: snapshot.quote.id,
-      }),
-      em.find(SalesDocumentTagAssignment, {
-        documentId: snapshot.quote.id,
-        documentKind: "quote",
-      }),
-    ]);
-    addresses.forEach((entry) => {
-      entry.documentKind = "order";
-      entry.documentId = order.id;
-      entry.order = order;
-      entry.quote = null;
-      entry.updatedAt = new Date();
-    });
-    notes.forEach((note) => {
-      note.contextType = "order";
-      note.contextId = order.id;
-      note.order = order;
-      note.quote = null;
-      note.updatedAt = new Date();
-    });
-    tags.forEach((assignment) => {
-      assignment.documentKind = "order";
-      assignment.documentId = order.id;
-      assignment.order = order;
-      assignment.quote = null;
-      assignment.updatedAt = new Date();
-    });
-
-    const documentCustomValues = quoteCustomFields[snapshot.quote.id];
-    if (documentCustomValues && Object.keys(documentCustomValues).length) {
-      await setRecordCustomFields(em, {
-        entityId: E.sales.sales_order,
-        recordId: order.id,
-        organizationId: snapshot.quote.organizationId,
-        tenantId: snapshot.quote.tenantId,
-        values: documentCustomValues,
-      });
-    }
-    const lineCustomEntries = quoteLineCustomFields as Record<
-      string,
-      Record<string, unknown>
-    >;
-    if (lineCustomEntries && Object.keys(lineCustomEntries).length) {
-      for (const [lineId, values] of Object.entries(lineCustomEntries)) {
-        if (!values || !Object.keys(values).length) continue;
-        if (!orderLineMap.has(lineId)) continue;
-        await setRecordCustomFields(em, {
-          entityId: E.sales.sales_order_line,
-          recordId: lineId,
-          organizationId: snapshot.quote.organizationId,
-          tenantId: snapshot.quote.tenantId,
-          values,
+        { lockMode: LockMode.PESSIMISTIC_WRITE },
+      );
+      const { translate } = await resolveTranslations();
+      if (!quote)
+        throw new CrudHttpError(404, {
+          error: translate(
+            "sales.documents.detail.error",
+            "Document not found or inaccessible.",
+          ),
+        });
+      ensureQuoteScope(ctx, quote.organizationId, quote.tenantId);
+      enforceSalesDocumentOptimisticLock(ctx, quote, SALES_RESOURCE_KIND_QUOTE);
+      const snapshot = await loadQuoteSnapshot(em, payload.quoteId);
+      if (!snapshot)
+        throw new CrudHttpError(404, {
+          error: translate(
+            "sales.documents.detail.error",
+            "Document not found or inaccessible.",
+          ),
+        });
+      const orderId = payload.orderId ?? quote.id;
+      const existingOrder = await findOneWithDecryption(em, SalesOrder, {
+        id: orderId,
+        deletedAt: null,
+      }, undefined, { tenantId: quote.tenantId, organizationId: quote.organizationId });
+      if (existingOrder) {
+        throw new CrudHttpError(409, {
+          error: translate(
+            "sales.documents.detail.convertExists",
+            "Order already exists for this quote.",
+          ),
         });
       }
+
+      const generator = ctx.container.resolve(
+        "salesDocumentNumberGenerator",
+      ) as SalesDocumentNumberGenerator;
+      const generatedNumber = (
+        await generator.generate({
+          kind: "order",
+          organizationId: snapshot.quote.organizationId,
+          tenantId: snapshot.quote.tenantId,
+        })
+      ).number;
+      const orderNumber =
+        typeof payload.orderNumber === "string" &&
+        payload.orderNumber.trim().length
+          ? payload.orderNumber.trim()
+          : generatedNumber;
+
+      const [quoteCustomFields, quoteLineCustomFields] = await Promise.all([
+        loadCustomFieldValues({
+          em,
+          entityId: E.sales.sales_quote,
+          recordIds: [snapshot.quote.id],
+          tenantIdByRecord: { [snapshot.quote.id]: snapshot.quote.tenantId },
+          organizationIdByRecord: {
+            [snapshot.quote.id]: snapshot.quote.organizationId,
+          },
+        }),
+        snapshot.lines.length
+          ? loadCustomFieldValues({
+              em,
+              entityId: E.sales.sales_quote_line,
+              recordIds: snapshot.lines.map((line) => line.id),
+              tenantIdByRecord: Object.fromEntries(
+                snapshot.lines.map((line) => [line.id, snapshot.quote.tenantId]),
+              ),
+              organizationIdByRecord: Object.fromEntries(
+                snapshot.lines.map((line) => [
+                  line.id,
+                  snapshot.quote.organizationId,
+                ]),
+              ),
+            })
+          : Promise.resolve({}),
+      ]);
+
+      const order = em.create(SalesOrder, {
+        id: orderId,
+        organizationId: snapshot.quote.organizationId,
+        tenantId: snapshot.quote.tenantId,
+        orderNumber,
+        statusEntryId: snapshot.quote.statusEntryId ?? null,
+        status: snapshot.quote.status ?? null,
+        fulfillmentStatusEntryId: null,
+        fulfillmentStatus: null,
+        paymentStatusEntryId: null,
+        paymentStatus: null,
+        customerEntityId: snapshot.quote.customerEntityId ?? null,
+        customerContactId: snapshot.quote.customerContactId ?? null,
+        customerSnapshot: snapshot.quote.customerSnapshot
+          ? cloneJson(snapshot.quote.customerSnapshot)
+          : null,
+        billingAddressId: snapshot.quote.billingAddressId ?? null,
+        shippingAddressId: snapshot.quote.shippingAddressId ?? null,
+        billingAddressSnapshot: snapshot.quote.billingAddressSnapshot
+          ? cloneJson(snapshot.quote.billingAddressSnapshot)
+          : null,
+        shippingAddressSnapshot: snapshot.quote.shippingAddressSnapshot
+          ? cloneJson(snapshot.quote.shippingAddressSnapshot)
+          : null,
+        currencyCode: snapshot.quote.currencyCode,
+        exchangeRate: null,
+        taxStrategyKey: null,
+        discountStrategyKey: null,
+        taxInfo: snapshot.quote.taxInfo
+          ? cloneJson(snapshot.quote.taxInfo)
+          : null,
+        shippingMethodId: snapshot.quote.shippingMethodId ?? null,
+        shippingMethodCode: snapshot.quote.shippingMethodCode ?? null,
+        deliveryWindowId: snapshot.quote.deliveryWindowId ?? null,
+        deliveryWindowCode: snapshot.quote.deliveryWindowCode ?? null,
+        paymentMethodId: snapshot.quote.paymentMethodId ?? null,
+        paymentMethodCode: snapshot.quote.paymentMethodCode ?? null,
+        channelId: snapshot.quote.channelId ?? null,
+        placedAt: snapshot.quote.validFrom
+          ? new Date(snapshot.quote.validFrom)
+          : quote.createdAt,
+        expectedDeliveryAt: snapshot.quote.validUntil
+          ? new Date(snapshot.quote.validUntil)
+          : null,
+        dueAt: null,
+        comments: snapshot.quote.comments ?? null,
+        internalNotes: null,
+        shippingMethodSnapshot: snapshot.quote.shippingMethodSnapshot
+          ? cloneJson(snapshot.quote.shippingMethodSnapshot)
+          : null,
+        deliveryWindowSnapshot: snapshot.quote.deliveryWindowSnapshot
+          ? cloneJson(snapshot.quote.deliveryWindowSnapshot)
+          : null,
+        paymentMethodSnapshot: snapshot.quote.paymentMethodSnapshot
+          ? cloneJson(snapshot.quote.paymentMethodSnapshot)
+          : null,
+        metadata: snapshot.quote.metadata
+          ? cloneJson(snapshot.quote.metadata)
+          : null,
+        customFieldSetId: snapshot.quote.customFieldSetId ?? null,
+        subtotalNetAmount: snapshot.quote.subtotalNetAmount,
+        subtotalGrossAmount: snapshot.quote.subtotalGrossAmount,
+        discountTotalAmount: snapshot.quote.discountTotalAmount,
+        taxTotalAmount: snapshot.quote.taxTotalAmount,
+        shippingNetAmount: "0",
+        shippingGrossAmount: "0",
+        surchargeTotalAmount: "0",
+        grandTotalNetAmount: snapshot.quote.grandTotalNetAmount,
+        grandTotalGrossAmount: snapshot.quote.grandTotalGrossAmount,
+        paidTotalAmount: "0",
+        refundedTotalAmount: "0",
+        outstandingAmount: snapshot.quote.grandTotalGrossAmount,
+        totalsSnapshot: snapshot.quote.totalsSnapshot
+          ? cloneJson(snapshot.quote.totalsSnapshot)
+          : null,
+        lineItemCount: snapshot.quote.lineItemCount,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+      em.persist(order);
+
+      const orderLineMap = new Map<string, SalesOrderLine>();
+      snapshot.lines.forEach((line, index) => {
+        const orderLine = em.create(SalesOrderLine, {
+          id: line.id,
+          order,
+          organizationId: snapshot.quote.organizationId,
+          tenantId: snapshot.quote.tenantId,
+          lineNumber: line.lineNumber ?? index + 1,
+          kind: line.kind as SalesLineKind,
+          statusEntryId: (line as any).statusEntryId ?? null,
+          status: (line as any).status ?? null,
+          productId: line.productId ?? null,
+          productVariantId: line.productVariantId ?? null,
+          catalogSnapshot: line.catalogSnapshot
+            ? cloneJson(line.catalogSnapshot)
+            : null,
+          name: line.name ?? null,
+          description: line.description ?? null,
+          comment: line.comment ?? null,
+          quantity: line.quantity,
+          quantityUnit: line.quantityUnit ?? null,
+          normalizedQuantity: line.normalizedQuantity ?? line.quantity,
+          normalizedUnit: line.normalizedUnit ?? line.quantityUnit ?? null,
+          uomSnapshot: line.uomSnapshot ? cloneJson(line.uomSnapshot) : null,
+          reservedQuantity: "0",
+          fulfilledQuantity: "0",
+          invoicedQuantity: "0",
+          returnedQuantity: "0",
+          currencyCode: line.currencyCode,
+          unitPriceNet: line.unitPriceNet,
+          unitPriceGross: line.unitPriceGross,
+          discountAmount: line.discountAmount,
+          discountPercent: line.discountPercent,
+          taxRate: line.taxRate,
+          taxAmount: line.taxAmount,
+          totalNetAmount: line.totalNetAmount,
+          totalGrossAmount: line.totalGrossAmount,
+          configuration: line.configuration
+            ? cloneJson(line.configuration)
+            : null,
+          promotionCode: line.promotionCode ?? null,
+          promotionSnapshot: line.promotionSnapshot
+            ? cloneJson(line.promotionSnapshot)
+            : null,
+          metadata: line.metadata ? cloneJson(line.metadata) : null,
+          customFieldSetId: line.customFieldSetId ?? null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        });
+        em.persist(orderLine);
+        orderLineMap.set(orderLine.id, orderLine);
+      });
+
+      snapshot.adjustments.forEach((adj, index) => {
+        const orderLineId = adj.quoteLineId ?? null;
+        const orderLine = orderLineId
+          ? (orderLineMap.get(orderLineId) ?? null)
+          : null;
+        const entity = em.create(SalesOrderAdjustment, {
+          id: adj.id,
+          order,
+          orderLine: orderLine ?? null,
+          organizationId: snapshot.quote.organizationId,
+          tenantId: snapshot.quote.tenantId,
+          scope: adj.scope,
+          kind: adj.kind as SalesAdjustmentKind,
+          code: adj.code ?? null,
+          label: adj.label ?? null,
+          calculatorKey: adj.calculatorKey ?? null,
+          promotionId: adj.promotionId ?? null,
+          rate: adj.rate,
+          amountNet: adj.amountNet,
+          amountGross: adj.amountGross,
+          currencyCode: adj.currencyCode ?? null,
+          metadata: adj.metadata ? cloneJson(adj.metadata) : null,
+          position: adj.position ?? index,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        });
+        em.persist(entity);
+      });
+
+      const [addresses, notes, tags] = await Promise.all([
+        em.find(SalesDocumentAddress, {
+          documentId: snapshot.quote.id,
+          documentKind: "quote",
+        }),
+        em.find(SalesNote, {
+          contextType: "quote",
+          contextId: snapshot.quote.id,
+        }),
+        em.find(SalesDocumentTagAssignment, {
+          documentId: snapshot.quote.id,
+          documentKind: "quote",
+        }),
+      ]);
+      addresses.forEach((entry) => {
+        entry.documentKind = "order";
+        entry.documentId = order.id;
+        entry.order = order;
+        entry.quote = null;
+        entry.updatedAt = new Date();
+      });
+      notes.forEach((note) => {
+        note.contextType = "order";
+        note.contextId = order.id;
+        note.order = order;
+        note.quote = null;
+        note.updatedAt = new Date();
+      });
+      tags.forEach((assignment) => {
+        assignment.documentKind = "order";
+        assignment.documentId = order.id;
+        assignment.order = order;
+        assignment.quote = null;
+        assignment.updatedAt = new Date();
+      });
+
+      const documentCustomValues = quoteCustomFields[snapshot.quote.id];
+      if (documentCustomValues && Object.keys(documentCustomValues).length) {
+        await setRecordCustomFields(em, {
+          entityId: E.sales.sales_order,
+          recordId: order.id,
+          organizationId: snapshot.quote.organizationId,
+          tenantId: snapshot.quote.tenantId,
+          values: documentCustomValues,
+        });
+      }
+      const lineCustomEntries = quoteLineCustomFields as Record<
+        string,
+        Record<string, unknown>
+      >;
+      if (lineCustomEntries && Object.keys(lineCustomEntries).length) {
+        for (const [lineId, values] of Object.entries(lineCustomEntries)) {
+          if (!values || !Object.keys(values).length) continue;
+          if (!orderLineMap.has(lineId)) continue;
+          await setRecordCustomFields(em, {
+            entityId: E.sales.sales_order_line,
+            recordId: lineId,
+            organizationId: snapshot.quote.organizationId,
+            tenantId: snapshot.quote.tenantId,
+            values,
+          });
+        }
+      }
+
+      await em.nativeDelete(SalesQuoteAdjustment, { quote: snapshot.quote.id });
+      await em.nativeDelete(SalesQuoteLine, { quote: snapshot.quote.id });
+      em.remove(quote);
+      await em.flush();
+
+      return { orderId: order.id };
+    };
+    if (callerEm) {
+      // Already inside the caller's transaction — run directly so the whole flow
+      // stays a single transaction (no nested savepoint).
+      return runConversion(callerEm);
     }
-
-    await em.nativeDelete(SalesQuoteAdjustment, { quote: snapshot.quote.id });
-    await em.nativeDelete(SalesQuoteLine, { quote: snapshot.quote.id });
-    em.remove(quote);
-    await em.flush();
-
-    return { orderId: order.id };
+    return typeof transactionalEm.transactional === "function"
+      ? transactionalEm.transactional((trx) => runConversion(trx))
+      : runConversion(rootEm);
   },
   captureAfter: async (_input, result, ctx) => {
-    const em = (ctx.container.resolve("em") as EntityManager).fork();
+    // Prefer the caller's transactional EM so the just-created (still
+    // uncommitted) order is visible when building the audit "after" snapshot.
+    const em =
+      ctx.transactionalEm ??
+      (ctx.container.resolve("em") as EntityManager).fork();
     return loadOrderSnapshot(em, result.orderId);
   },
   buildLog: async ({ snapshots, result }) => {
@@ -5906,7 +6363,7 @@ const convertQuoteToOrderCommand: CommandHandler<
     if (orderSnapshot) {
       const orderId = orderSnapshot.order.id;
       const orderLineIds = orderSnapshot.lines.map((line) => line.id);
-      const existingOrder = await em.findOne(SalesOrder, { id: orderId });
+      const existingOrder = await findOneWithDecryption(em, SalesOrder, { id: orderId }, undefined, { tenantId: quoteSnapshot.quote.tenantId, organizationId: quoteSnapshot.quote.organizationId });
       if (existingOrder) {
         const shipments = await em.find(SalesShipment, { order: orderId });
         const shipmentIds = shipments.map((entry) => entry.id);
@@ -5968,18 +6425,22 @@ const quoteLineDeleteSchema = z.object({
   quoteId: z.string().uuid(),
 });
 
-const orderAdjustmentUpsertSchema = orderAdjustmentCreateSchema.extend({
-  id: z.string().uuid().optional(),
-});
+const orderAdjustmentUpsertSchema = orderAdjustmentCreateSchema
+  .extend({
+    id: z.string().uuid().optional(),
+  })
+  .superRefine(enforceAdjustmentSign);
 
 const orderAdjustmentDeleteSchema = z.object({
   id: z.string().uuid(),
   orderId: z.string().uuid(),
 });
 
-const quoteAdjustmentUpsertSchema = quoteAdjustmentCreateSchema.extend({
-  id: z.string().uuid().optional(),
-});
+const quoteAdjustmentUpsertSchema = quoteAdjustmentCreateSchema
+  .extend({
+    id: z.string().uuid().optional(),
+  })
+  .superRefine(enforceAdjustmentSign);
 
 const quoteAdjustmentDeleteSchema = z.object({
   id: z.string().uuid(),
@@ -6016,6 +6477,7 @@ const orderLineUpsertCommand: CommandHandler<
     if (!order)
       throw new CrudHttpError(404, { error: "Sales order not found" });
     ensureOrderScope(ctx, order.organizationId, order.tenantId);
+    enforceSalesDocumentOptimisticLock(ctx, order, SALES_RESOURCE_KIND_ORDER);
 
     const [existingLines, adjustments] = await Promise.all([
       em.find(SalesOrderLine, { order }, { orderBy: { lineNumber: "asc" } }),
@@ -6228,30 +6690,39 @@ const orderLineUpsertCommand: CommandHandler<
       context: calculationContext,
       existingTotals: resolveExistingPaymentTotals(order),
     });
-    await applyOrderLineResults({
-      em,
-      order,
-      calculation,
-      sourceLines: sourceInputs,
-      existingLines,
-    });
-    applyOrderTotals(order, calculation.totals, calculation.lines.length);
     let eventBus: EventBus | null = null;
     try {
       eventBus = ctx.container.resolve("eventBus") as EventBus;
     } catch {
       eventBus = null;
     }
-    await emitTotalsCalculated(eventBus, {
-      documentKind: "order",
-      documentId: order.id,
-      organizationId: order.organizationId,
-      tenantId: order.tenantId,
-      customerId: order.customerEntityId ?? null,
-      totals: calculation.totals,
-      lineCount: calculation.lines.length,
-    });
-    await em.flush();
+    // Persist the line changes and recalculated totals atomically so a
+    // mid-build failure cannot leave a half-updated order committed (#2336).
+    await withAtomicFlush(
+      em,
+      [
+        async () => {
+          await applyOrderLineResults({
+            em,
+            order,
+            calculation,
+            sourceLines: sourceInputs,
+            existingLines,
+          });
+          applyOrderTotals(order, calculation.totals, calculation.lines.length);
+          await emitTotalsCalculated(eventBus, {
+            documentKind: "order",
+            documentId: order.id,
+            organizationId: order.organizationId,
+            tenantId: order.tenantId,
+            customerId: order.customerEntityId ?? null,
+            totals: calculation.totals,
+            lineCount: calculation.lines.length,
+          });
+        },
+      ],
+      { transaction: true },
+    );
     return { orderId: order.id, lineId };
   },
   captureAfter: async (_input, result, ctx) => {
@@ -6327,6 +6798,7 @@ const orderLineDeleteCommand: CommandHandler<
         ),
       });
     ensureOrderScope(ctx, order.organizationId, order.tenantId);
+    enforceSalesDocumentOptimisticLock(ctx, order, SALES_RESOURCE_KIND_ORDER);
     const shipmentCount = await em.count(SalesShipmentItem, {
       orderLine: parsed.id,
       shipment: { deletedAt: null },
@@ -6396,30 +6868,39 @@ const orderLineDeleteCommand: CommandHandler<
       context: calculationContext,
       existingTotals: resolveExistingPaymentTotals(order),
     });
-    await applyOrderLineResults({
-      em,
-      order,
-      calculation,
-      sourceLines: sourceInputs,
-      existingLines,
-    });
-    applyOrderTotals(order, calculation.totals, calculation.lines.length);
     let eventBus: EventBus | null = null;
     try {
       eventBus = ctx.container.resolve("eventBus") as EventBus;
     } catch {
       eventBus = null;
     }
-    await emitTotalsCalculated(eventBus, {
-      documentKind: "order",
-      documentId: order.id,
-      organizationId: order.organizationId,
-      tenantId: order.tenantId,
-      customerId: order.customerEntityId ?? null,
-      totals: calculation.totals,
-      lineCount: calculation.lines.length,
-    });
-    await em.flush();
+    // Persist the line removal and recalculated totals atomically so a
+    // mid-build failure cannot leave a half-updated order committed (#2336).
+    await withAtomicFlush(
+      em,
+      [
+        async () => {
+          await applyOrderLineResults({
+            em,
+            order,
+            calculation,
+            sourceLines: sourceInputs,
+            existingLines,
+          });
+          applyOrderTotals(order, calculation.totals, calculation.lines.length);
+          await emitTotalsCalculated(eventBus, {
+            documentKind: "order",
+            documentId: order.id,
+            organizationId: order.organizationId,
+            tenantId: order.tenantId,
+            customerId: order.customerEntityId ?? null,
+            totals: calculation.totals,
+            lineCount: calculation.lines.length,
+          });
+        },
+      ],
+      { transaction: true },
+    );
     return { orderId: order.id, lineId: parsed.id };
   },
   captureAfter: async (_input, result, ctx) => {
@@ -6488,6 +6969,7 @@ const quoteLineUpsertCommand: CommandHandler<
     if (!quote)
       throw new CrudHttpError(404, { error: "Sales quote not found" });
     ensureQuoteScope(ctx, quote.organizationId, quote.tenantId);
+    enforceSalesDocumentOptimisticLock(ctx, quote, SALES_RESOURCE_KIND_QUOTE);
     const [existingLines, adjustments] = await Promise.all([
       em.find(SalesQuoteLine, { quote }, { orderBy: { lineNumber: "asc" } }),
       em.find(
@@ -6697,30 +7179,39 @@ const quoteLineUpsertCommand: CommandHandler<
       adjustments: adjustmentDrafts,
       context: calculationContext,
     });
-    await applyQuoteLineResults({
-      em,
-      quote,
-      calculation,
-      sourceLines: sourceInputs,
-      existingLines,
-    });
-    applyQuoteTotals(quote, calculation.totals, calculation.lines.length);
     let eventBus: EventBus | null = null;
     try {
       eventBus = ctx.container.resolve("eventBus") as EventBus;
     } catch {
       eventBus = null;
     }
-    await emitTotalsCalculated(eventBus, {
-      documentKind: "quote",
-      documentId: quote.id,
-      organizationId: quote.organizationId,
-      tenantId: quote.tenantId,
-      customerId: quote.customerEntityId ?? null,
-      totals: calculation.totals,
-      lineCount: calculation.lines.length,
-    });
-    await em.flush();
+    // Persist the line changes and recalculated totals atomically so a
+    // mid-build failure cannot leave a half-updated quote committed (#2336).
+    await withAtomicFlush(
+      em,
+      [
+        async () => {
+          await applyQuoteLineResults({
+            em,
+            quote,
+            calculation,
+            sourceLines: sourceInputs,
+            existingLines,
+          });
+          applyQuoteTotals(quote, calculation.totals, calculation.lines.length);
+          await emitTotalsCalculated(eventBus, {
+            documentKind: "quote",
+            documentId: quote.id,
+            organizationId: quote.organizationId,
+            tenantId: quote.tenantId,
+            customerId: quote.customerEntityId ?? null,
+            totals: calculation.totals,
+            lineCount: calculation.lines.length,
+          });
+        },
+      ],
+      { transaction: true },
+    );
     return { quoteId: quote.id, lineId };
   },
   captureAfter: async (_input, result, ctx) => {
@@ -6790,6 +7281,7 @@ const quoteLineDeleteCommand: CommandHandler<
     if (!quote)
       throw new CrudHttpError(404, { error: "Sales quote not found" });
     ensureQuoteScope(ctx, quote.organizationId, quote.tenantId);
+    enforceSalesDocumentOptimisticLock(ctx, quote, SALES_RESOURCE_KIND_QUOTE);
     const existingLines = await em.find(
       SalesQuoteLine,
       { quote },
@@ -6841,30 +7333,39 @@ const quoteLineDeleteCommand: CommandHandler<
       adjustments: adjustmentDrafts,
       context: calculationContext,
     });
-    await applyQuoteLineResults({
-      em,
-      quote,
-      calculation,
-      sourceLines: sourceInputs,
-      existingLines,
-    });
-    applyQuoteTotals(quote, calculation.totals, calculation.lines.length);
     let eventBus: EventBus | null = null;
     try {
       eventBus = ctx.container.resolve("eventBus") as EventBus;
     } catch {
       eventBus = null;
     }
-    await emitTotalsCalculated(eventBus, {
-      documentKind: "quote",
-      documentId: quote.id,
-      organizationId: quote.organizationId,
-      tenantId: quote.tenantId,
-      customerId: quote.customerEntityId ?? null,
-      totals: calculation.totals,
-      lineCount: calculation.lines.length,
-    });
-    await em.flush();
+    // Persist the line removal and recalculated totals atomically so a
+    // mid-build failure cannot leave a half-updated quote committed (#2336).
+    await withAtomicFlush(
+      em,
+      [
+        async () => {
+          await applyQuoteLineResults({
+            em,
+            quote,
+            calculation,
+            sourceLines: sourceInputs,
+            existingLines,
+          });
+          applyQuoteTotals(quote, calculation.totals, calculation.lines.length);
+          await emitTotalsCalculated(eventBus, {
+            documentKind: "quote",
+            documentId: quote.id,
+            organizationId: quote.organizationId,
+            tenantId: quote.tenantId,
+            customerId: quote.customerEntityId ?? null,
+            totals: calculation.totals,
+            lineCount: calculation.lines.length,
+          });
+        },
+      ],
+      { transaction: true },
+    );
     return { quoteId: quote.id, lineId: parsed.id };
   },
   captureAfter: async (_input, result, ctx) => {
@@ -6934,6 +7435,7 @@ const orderAdjustmentUpsertCommand: CommandHandler<
     if (!order)
       throw new CrudHttpError(404, { error: "Sales order not found" });
     ensureOrderScope(ctx, order.organizationId, order.tenantId);
+    enforceSalesDocumentOptimisticLock(ctx, order, SALES_RESOURCE_KIND_ORDER);
     if (parsed.scope === "line") {
       throw new CrudHttpError(400, {
         error: "Line-scoped adjustments are not supported yet.",
@@ -7048,6 +7550,63 @@ const orderAdjustmentUpsertCommand: CommandHandler<
       shippingMethodCode: order.shippingMethodCode ?? null,
       paymentMethodCode: order.paymentMethodCode ?? null,
     });
+    const effectiveAdjustment = nextAdjustments.find(
+      (adj) => adj.id === adjustmentId,
+    );
+    if (effectiveAdjustment?.kind === "return") {
+      const baselineAdjustments = nextAdjustments.filter(
+        (adj) => adj.id !== adjustmentId,
+      );
+      const baselineCalculation =
+        await salesCalculationService.calculateDocumentTotals({
+          documentKind: "order",
+          lines: calcLines,
+          adjustments: baselineAdjustments,
+          context: calculationContext,
+          existingTotals: resolveExistingPaymentTotals(order),
+        });
+      const issues = validateReturnAdjustmentWithinRemaining({
+        kind: "return",
+        amountNet:
+          effectiveAdjustment.amountNet ?? effectiveAdjustment.amountGross ?? 0,
+        amountGross:
+          effectiveAdjustment.amountGross ?? effectiveAdjustment.amountNet ?? 0,
+        remainingNet: Number(
+          baselineCalculation.totals?.grandTotalNetAmount ?? 0,
+        ),
+        remainingGross: Number(
+          baselineCalculation.totals?.grandTotalGrossAmount ?? 0,
+        ),
+      });
+      if (issues.length > 0) {
+        const { translate } = await resolveTranslations();
+        const grossIssue = issues.find((issue) => issue.path === "amountGross");
+        const netIssue = issues.find((issue) => issue.path === "amountNet");
+        const fieldErrors: Record<string, string> = {};
+        if (grossIssue) {
+          fieldErrors.amountGross = translate(
+            "sales.adjustments.error.returnExceedsRemainingGrandTotalGross",
+            RETURN_ADJUSTMENT_EXCEEDS_REMAINING_GROSS_MESSAGE,
+          );
+        }
+        if (netIssue) {
+          fieldErrors.amountNet = translate(
+            "sales.adjustments.error.returnExceedsRemainingGrandTotalNet",
+            RETURN_ADJUSTMENT_EXCEEDS_REMAINING_NET_MESSAGE,
+          );
+        }
+        throw new CrudHttpError(400, {
+          error:
+            fieldErrors.amountGross ??
+            fieldErrors.amountNet ??
+            translate(
+              "sales.adjustments.error.returnExceedsRemainingGrandTotalGross",
+              RETURN_ADJUSTMENT_EXCEEDS_REMAINING_GROSS_MESSAGE,
+            ),
+          fieldErrors,
+        });
+      }
+    }
     const calculation = await salesCalculationService.calculateDocumentTotals({
       documentKind: "order",
       lines: calcLines,
@@ -7073,25 +7632,34 @@ const orderAdjustmentUpsertCommand: CommandHandler<
       customFields: (adj as any).customFields ?? undefined,
       position: adj.position ?? index,
     }));
-    await replaceOrderAdjustments(em, order, calculation, adjustmentInputs);
-    applyOrderTotals(order, calculation.totals, calculation.lines.length);
-    order.updatedAt = new Date();
     let eventBus: EventBus | null = null;
     try {
       eventBus = ctx.container.resolve("eventBus") as EventBus;
     } catch {
       eventBus = null;
     }
-    await emitTotalsCalculated(eventBus, {
-      documentKind: "order",
-      documentId: order.id,
-      organizationId: order.organizationId,
-      tenantId: order.tenantId,
-      customerId: order.customerEntityId ?? null,
-      totals: calculation.totals,
-      lineCount: calculation.lines.length,
-    });
-    await em.flush();
+    // Persist the adjustment change and recalculated totals atomically so a
+    // mid-build failure cannot leave a half-updated order committed (#2336).
+    await withAtomicFlush(
+      em,
+      [
+        async () => {
+          await replaceOrderAdjustments(em, order, calculation, adjustmentInputs);
+          applyOrderTotals(order, calculation.totals, calculation.lines.length);
+          order.updatedAt = new Date();
+          await emitTotalsCalculated(eventBus, {
+            documentKind: "order",
+            documentId: order.id,
+            organizationId: order.organizationId,
+            tenantId: order.tenantId,
+            customerId: order.customerEntityId ?? null,
+            totals: calculation.totals,
+            lineCount: calculation.lines.length,
+          });
+        },
+      ],
+      { transaction: true },
+    );
     return { orderId: order.id, adjustmentId };
   },
   captureAfter: async (_input, result, ctx) => {
@@ -7161,6 +7729,7 @@ const orderAdjustmentDeleteCommand: CommandHandler<
     if (!order)
       throw new CrudHttpError(404, { error: "Sales order not found" });
     ensureOrderScope(ctx, order.organizationId, order.tenantId);
+    enforceSalesDocumentOptimisticLock(ctx, order, SALES_RESOURCE_KIND_ORDER);
 
     const [existingLines, adjustments] = await Promise.all([
       em.find(SalesOrderLine, { order }, { orderBy: { lineNumber: "asc" } }),
@@ -7228,25 +7797,34 @@ const orderAdjustmentDeleteCommand: CommandHandler<
       metadata: adj.metadata ?? undefined,
       position: adj.position ?? index,
     }));
-    await replaceOrderAdjustments(em, order, calculation, adjustmentInputs);
-    applyOrderTotals(order, calculation.totals, calculation.lines.length);
-    order.updatedAt = new Date();
     let eventBus: EventBus | null = null;
     try {
       eventBus = ctx.container.resolve("eventBus") as EventBus;
     } catch {
       eventBus = null;
     }
-    await emitTotalsCalculated(eventBus, {
-      documentKind: "order",
-      documentId: order.id,
-      organizationId: order.organizationId,
-      tenantId: order.tenantId,
-      customerId: order.customerEntityId ?? null,
-      totals: calculation.totals,
-      lineCount: calculation.lines.length,
-    });
-    await em.flush();
+    // Persist the adjustment removal and recalculated totals atomically so a
+    // mid-build failure cannot leave a half-updated order committed (#2336).
+    await withAtomicFlush(
+      em,
+      [
+        async () => {
+          await replaceOrderAdjustments(em, order, calculation, adjustmentInputs);
+          applyOrderTotals(order, calculation.totals, calculation.lines.length);
+          order.updatedAt = new Date();
+          await emitTotalsCalculated(eventBus, {
+            documentKind: "order",
+            documentId: order.id,
+            organizationId: order.organizationId,
+            tenantId: order.tenantId,
+            customerId: order.customerEntityId ?? null,
+            totals: calculation.totals,
+            lineCount: calculation.lines.length,
+          });
+        },
+      ],
+      { transaction: true },
+    );
     return { orderId: order.id, adjustmentId: parsed.id };
   },
   captureAfter: async (_input, result, ctx) => {
@@ -7316,6 +7894,7 @@ const quoteAdjustmentUpsertCommand: CommandHandler<
     if (!quote)
       throw new CrudHttpError(404, { error: "Sales quote not found" });
     ensureQuoteScope(ctx, quote.organizationId, quote.tenantId);
+    enforceSalesDocumentOptimisticLock(ctx, quote, SALES_RESOURCE_KIND_QUOTE);
     if (parsed.scope === "line") {
       throw new CrudHttpError(400, {
         error: "Line-scoped adjustments are not supported yet.",
@@ -7430,6 +8009,62 @@ const quoteAdjustmentUpsertCommand: CommandHandler<
       shippingMethodCode: quote.shippingMethodCode ?? null,
       paymentMethodCode: quote.paymentMethodCode ?? null,
     });
+    const effectiveAdjustment = nextAdjustments.find(
+      (adj) => adj.id === adjustmentId,
+    );
+    if (effectiveAdjustment?.kind === "return") {
+      const baselineAdjustments = nextAdjustments.filter(
+        (adj) => adj.id !== adjustmentId,
+      );
+      const baselineCalculation =
+        await salesCalculationService.calculateDocumentTotals({
+          documentKind: "quote",
+          lines: calcLines,
+          adjustments: baselineAdjustments,
+          context: calculationContext,
+        });
+      const issues = validateReturnAdjustmentWithinRemaining({
+        kind: "return",
+        amountNet:
+          effectiveAdjustment.amountNet ?? effectiveAdjustment.amountGross ?? 0,
+        amountGross:
+          effectiveAdjustment.amountGross ?? effectiveAdjustment.amountNet ?? 0,
+        remainingNet: Number(
+          baselineCalculation.totals?.grandTotalNetAmount ?? 0,
+        ),
+        remainingGross: Number(
+          baselineCalculation.totals?.grandTotalGrossAmount ?? 0,
+        ),
+      });
+      if (issues.length > 0) {
+        const { translate } = await resolveTranslations();
+        const grossIssue = issues.find((issue) => issue.path === "amountGross");
+        const netIssue = issues.find((issue) => issue.path === "amountNet");
+        const fieldErrors: Record<string, string> = {};
+        if (grossIssue) {
+          fieldErrors.amountGross = translate(
+            "sales.adjustments.error.returnExceedsRemainingGrandTotalGross",
+            RETURN_ADJUSTMENT_EXCEEDS_REMAINING_GROSS_MESSAGE,
+          );
+        }
+        if (netIssue) {
+          fieldErrors.amountNet = translate(
+            "sales.adjustments.error.returnExceedsRemainingGrandTotalNet",
+            RETURN_ADJUSTMENT_EXCEEDS_REMAINING_NET_MESSAGE,
+          );
+        }
+        throw new CrudHttpError(400, {
+          error:
+            fieldErrors.amountGross ??
+            fieldErrors.amountNet ??
+            translate(
+              "sales.adjustments.error.returnExceedsRemainingGrandTotalGross",
+              RETURN_ADJUSTMENT_EXCEEDS_REMAINING_GROSS_MESSAGE,
+            ),
+          fieldErrors,
+        });
+      }
+    }
     const calculation = await salesCalculationService.calculateDocumentTotals({
       documentKind: "quote",
       lines: calcLines,
@@ -7454,25 +8089,34 @@ const quoteAdjustmentUpsertCommand: CommandHandler<
       customFields: (adj as any).customFields ?? undefined,
       position: adj.position ?? index,
     }));
-    await replaceQuoteAdjustments(em, quote, calculation, adjustmentInputs);
-    applyQuoteTotals(quote, calculation.totals, calculation.lines.length);
-    quote.updatedAt = new Date();
     let eventBus: EventBus | null = null;
     try {
       eventBus = ctx.container.resolve("eventBus") as EventBus;
     } catch {
       eventBus = null;
     }
-    await emitTotalsCalculated(eventBus, {
-      documentKind: "quote",
-      documentId: quote.id,
-      organizationId: quote.organizationId,
-      tenantId: quote.tenantId,
-      customerId: quote.customerEntityId ?? null,
-      totals: calculation.totals,
-      lineCount: calculation.lines.length,
-    });
-    await em.flush();
+    // Persist the adjustment change and recalculated totals atomically so a
+    // mid-build failure cannot leave a half-updated quote committed (#2336).
+    await withAtomicFlush(
+      em,
+      [
+        async () => {
+          await replaceQuoteAdjustments(em, quote, calculation, adjustmentInputs);
+          applyQuoteTotals(quote, calculation.totals, calculation.lines.length);
+          quote.updatedAt = new Date();
+          await emitTotalsCalculated(eventBus, {
+            documentKind: "quote",
+            documentId: quote.id,
+            organizationId: quote.organizationId,
+            tenantId: quote.tenantId,
+            customerId: quote.customerEntityId ?? null,
+            totals: calculation.totals,
+            lineCount: calculation.lines.length,
+          });
+        },
+      ],
+      { transaction: true },
+    );
     return { quoteId: quote.id, adjustmentId };
   },
   captureAfter: async (_input, result, ctx) => {
@@ -7542,6 +8186,7 @@ const quoteAdjustmentDeleteCommand: CommandHandler<
     if (!quote)
       throw new CrudHttpError(404, { error: "Sales quote not found" });
     ensureQuoteScope(ctx, quote.organizationId, quote.tenantId);
+    enforceSalesDocumentOptimisticLock(ctx, quote, SALES_RESOURCE_KIND_QUOTE);
 
     const [existingLines, adjustments] = await Promise.all([
       em.find(SalesQuoteLine, { quote }, { orderBy: { lineNumber: "asc" } }),
@@ -7608,25 +8253,34 @@ const quoteAdjustmentDeleteCommand: CommandHandler<
       metadata: adj.metadata ?? undefined,
       position: adj.position ?? index,
     }));
-    await replaceQuoteAdjustments(em, quote, calculation, adjustmentInputs);
-    applyQuoteTotals(quote, calculation.totals, calculation.lines.length);
-    quote.updatedAt = new Date();
     let eventBus: EventBus | null = null;
     try {
       eventBus = ctx.container.resolve("eventBus") as EventBus;
     } catch {
       eventBus = null;
     }
-    await emitTotalsCalculated(eventBus, {
-      documentKind: "quote",
-      documentId: quote.id,
-      organizationId: quote.organizationId,
-      tenantId: quote.tenantId,
-      customerId: quote.customerEntityId ?? null,
-      totals: calculation.totals,
-      lineCount: calculation.lines.length,
-    });
-    await em.flush();
+    // Persist the adjustment removal and recalculated totals atomically so a
+    // mid-build failure cannot leave a half-updated quote committed (#2336).
+    await withAtomicFlush(
+      em,
+      [
+        async () => {
+          await replaceQuoteAdjustments(em, quote, calculation, adjustmentInputs);
+          applyQuoteTotals(quote, calculation.totals, calculation.lines.length);
+          quote.updatedAt = new Date();
+          await emitTotalsCalculated(eventBus, {
+            documentKind: "quote",
+            documentId: quote.id,
+            organizationId: quote.organizationId,
+            tenantId: quote.tenantId,
+            customerId: quote.customerEntityId ?? null,
+            totals: calculation.totals,
+            lineCount: calculation.lines.length,
+          });
+        },
+      ],
+      { transaction: true },
+    );
     return { quoteId: quote.id, adjustmentId: parsed.id };
   },
   captureAfter: async (_input, result, ctx) => {
@@ -7665,6 +8319,976 @@ const quoteAdjustmentDeleteCommand: CommandHandler<
   },
 };
 
+// ---------------------------------------------------------------------------
+// Invoice CRUD commands
+// ---------------------------------------------------------------------------
+
+const invoiceCrudEvents: CrudEventsConfig<SalesInvoice> = {
+  module: "sales",
+  entity: "invoice",
+  persistent: true,
+  buildPayload: (ctx) => ({
+    id: ctx.identifiers.id,
+    organizationId: ctx.identifiers.organizationId,
+    tenantId: ctx.identifiers.tenantId,
+  }),
+};
+
+const createInvoiceCommand: CommandHandler<
+  InvoiceCreateInput,
+  { invoiceId: string }
+> = {
+  id: "sales.invoices.create",
+  async execute(rawInput, ctx) {
+    const generator = ctx.container.resolve(
+      "salesDocumentNumberGenerator",
+    ) as SalesDocumentNumberGenerator;
+    const initial = invoiceCreateSchema.parse(rawInput ?? {});
+    const invoiceNumber =
+      typeof initial.invoiceNumber === "string" &&
+      initial.invoiceNumber.trim().length
+        ? initial.invoiceNumber.trim()
+        : (
+            await generator.generate({
+              kind: "invoice",
+              organizationId: initial.organizationId,
+              tenantId: initial.tenantId,
+            })
+          ).number;
+    const parsed = invoiceCreateSchema.parse({ ...initial, invoiceNumber });
+    const ensuredInvoiceNumber = parsed.invoiceNumber ?? invoiceNumber;
+    if (!ensuredInvoiceNumber) {
+      throw new CrudHttpError(400, { error: "Invoice number is required." });
+    }
+    ensureOrganizationScope(ctx, parsed.organizationId);
+    ensureTenantScope(ctx, parsed.tenantId);
+    const em = (ctx.container.resolve("em") as EntityManager).fork();
+    const status = await resolveDictionaryEntryValue(
+      em,
+      parsed.statusEntryId ?? null,
+      { tenantId: parsed.tenantId },
+    );
+
+    // Validate orderId belongs to same org/tenant
+    if (parsed.orderId) {
+      const orderExists = await em.findOne(SalesOrder, {
+        id: parsed.orderId,
+        organizationId: parsed.organizationId,
+        tenantId: parsed.tenantId,
+        deletedAt: null,
+      });
+      if (!orderExists) {
+        throw new CrudHttpError(400, { error: "Referenced order not found in current scope." });
+      }
+    }
+
+    const invoiceId = randomUUID();
+    const invoice = em.create(SalesInvoice, {
+      id: invoiceId,
+      organizationId: parsed.organizationId,
+      tenantId: parsed.tenantId,
+      invoiceNumber: ensuredInvoiceNumber,
+      orderId: parsed.orderId ?? null,
+      statusEntryId: parsed.statusEntryId ?? null,
+      status,
+      issueDate: parsed.issueDate ?? new Date(),
+      dueDate: parsed.dueDate ?? null,
+      currencyCode: parsed.currencyCode,
+      subtotalNetAmount: toNumericString(parsed.subtotalNetAmount ?? 0),
+      subtotalGrossAmount: toNumericString(parsed.subtotalGrossAmount ?? 0),
+      discountTotalAmount: toNumericString(parsed.discountTotalAmount ?? 0),
+      taxTotalAmount: toNumericString(parsed.taxTotalAmount ?? 0),
+      grandTotalNetAmount: toNumericString(parsed.grandTotalNetAmount ?? 0),
+      grandTotalGrossAmount: toNumericString(parsed.grandTotalGrossAmount ?? 0),
+      paidTotalAmount: toNumericString(parsed.paidTotalAmount ?? 0),
+      outstandingAmount: toNumericString(parsed.outstandingAmount ?? 0),
+      metadata: parsed.metadata ?? null,
+      customFieldSetId: parsed.customFieldSetId ?? null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    // Header + lines + custom-field writes must commit atomically.
+    // setRecordCustomFields flushes mid-build, so without a transaction a
+    // partial write could persist the header without its lines/custom fields.
+    await withAtomicFlush(
+      em,
+      [
+        async () => {
+          em.persist(invoice);
+
+          if (parsed.lines?.length) {
+            for (let i = 0; i < parsed.lines.length; i++) {
+              const line = parsed.lines[i];
+              em.persist(
+                em.create(SalesInvoiceLine, {
+                  id: randomUUID(),
+                  invoice,
+                  orderLineId: line.orderLineId ?? null,
+                  organizationId: parsed.organizationId,
+                  tenantId: parsed.tenantId,
+                  lineNumber: line.lineNumber ?? i + 1,
+                  kind: line.kind ?? "product",
+                  name: line.name ?? null,
+                  sku: line.sku ?? null,
+                  description: line.description ?? null,
+                  quantity: toNumericString(line.quantity ?? 0),
+                  quantityUnit: line.quantityUnit ?? null,
+                  normalizedQuantity: toNumericString(line.normalizedQuantity ?? 0),
+                  normalizedUnit: line.normalizedUnit ?? null,
+                  uomSnapshot: line.uomSnapshot ?? null,
+                  currencyCode: line.currencyCode ?? parsed.currencyCode,
+                  unitPriceNet: toNumericString(line.unitPriceNet ?? 0),
+                  unitPriceGross: toNumericString(line.unitPriceGross ?? 0),
+                  discountAmount: toNumericString(line.discountAmount ?? 0),
+                  discountPercent: toNumericString(line.discountPercent ?? 0),
+                  taxRate: toNumericString(line.taxRate ?? 0),
+                  taxAmount: toNumericString(line.taxAmount ?? 0),
+                  totalNetAmount: toNumericString(line.totalNetAmount ?? 0),
+                  totalGrossAmount: toNumericString(line.totalGrossAmount ?? 0),
+                  metadata: line.metadata ?? null,
+                }),
+              );
+            }
+          }
+
+          if (parsed.customFieldSetId) {
+            await setRecordCustomFields(em, {
+              entityId: E.sales.sales_invoice,
+              recordId: invoiceId,
+              organizationId: parsed.organizationId,
+              tenantId: parsed.tenantId,
+              values: normalizeCustomFieldValues(
+                ((parsed as Record<string, unknown>).customFields as Record<string, unknown>) ?? {},
+              ),
+            });
+          }
+        },
+      ],
+      { transaction: true },
+    );
+
+    const dataEngine = ctx.container.resolve("dataEngine") as DataEngine;
+    await emitCrudSideEffects({
+      dataEngine,
+      action: "created",
+      entity: invoice,
+      identifiers: {
+        id: invoice.id,
+        organizationId: invoice.organizationId,
+        tenantId: invoice.tenantId,
+      },
+      events: invoiceCrudEvents,
+      indexer: { entityType: E.sales.sales_invoice },
+    });
+
+    await invalidateCrudCache(
+      ctx.container,
+      "sales.invoice",
+      {
+        id: invoice.id,
+        organizationId: invoice.organizationId,
+        tenantId: invoice.tenantId,
+      },
+      ctx.auth?.tenantId ?? null,
+      "created",
+    );
+
+    return { invoiceId: invoice.id };
+  },
+  captureAfter: async (_input, result, ctx) => {
+    const em = (ctx.container.resolve("em") as EntityManager).fork();
+    return loadInvoiceSnapshot(em, result.invoiceId);
+  },
+  buildLog: async ({ result, snapshots }) => {
+    const after = snapshots.after as InvoiceGraphSnapshot | undefined;
+    if (!after) return null;
+    const { translate } = await resolveTranslations();
+    return {
+      actionLabel: translate("sales.audit.invoices.create", "Create invoice"),
+      resourceKind: "sales.invoice",
+      resourceId: result.invoiceId,
+      tenantId: after.invoice.tenantId,
+      organizationId: after.invoice.organizationId,
+      snapshotAfter: after,
+      payload: {
+        undo: { after } satisfies InvoiceUndoPayload,
+      },
+    };
+  },
+  undo: async ({ logEntry, ctx }) => {
+    const payload = extractUndoPayload<InvoiceUndoPayload>(logEntry);
+    const after = payload?.after;
+    if (!after) return;
+    const em = (ctx.container.resolve("em") as EntityManager).fork();
+    const invoice = await em.findOne(SalesInvoice, { id: after.invoice.id });
+    if (!invoice) return;
+    ensureOrganizationScope(ctx, invoice.organizationId);
+    ensureTenantScope(ctx, invoice.tenantId);
+    await em.nativeDelete(SalesInvoiceLine, { invoice: invoice.id });
+    em.remove(invoice);
+    await em.flush();
+  },
+};
+
+const updateInvoiceCommand: CommandHandler<
+  z.infer<typeof invoiceUpdateSchema>,
+  { invoiceId: string }
+> = {
+  id: "sales.invoices.update",
+  async prepare(input, ctx) {
+    const id = requireId(input);
+    const em = ctx.container.resolve("em") as EntityManager;
+    const snapshot = await loadInvoiceSnapshot(em, id);
+    if (snapshot) {
+      ensureOrganizationScope(ctx, snapshot.invoice.organizationId);
+      ensureTenantScope(ctx, snapshot.invoice.tenantId);
+    }
+    return snapshot ? { before: snapshot } : {};
+  },
+  async execute(rawInput, ctx) {
+    const parsed = invoiceUpdateSchema.parse(rawInput ?? {});
+    const id = requireId(parsed);
+    ensureOrganizationScope(ctx, parsed.organizationId);
+    ensureTenantScope(ctx, parsed.tenantId);
+    const em = (ctx.container.resolve("em") as EntityManager).fork();
+    const invoice = await em.findOneOrFail(SalesInvoice, {
+      id,
+      organizationId: parsed.organizationId,
+      tenantId: parsed.tenantId,
+      deletedAt: null,
+    });
+
+    const changes = buildChanges(invoice, parsed, [
+      "invoiceNumber",
+      "statusEntryId",
+      "status",
+      "issueDate",
+      "dueDate",
+      "currencyCode",
+      "subtotalNetAmount",
+      "subtotalGrossAmount",
+      "discountTotalAmount",
+      "taxTotalAmount",
+      "grandTotalNetAmount",
+      "grandTotalGrossAmount",
+      "paidTotalAmount",
+      "outstandingAmount",
+      "metadata",
+    ]);
+
+    if (parsed.statusEntryId !== undefined) {
+      invoice.status = await resolveDictionaryEntryValue(em, parsed.statusEntryId ?? null, { tenantId: invoice.tenantId });
+    }
+
+    Object.assign(invoice, changes);
+    invoice.updatedAt = new Date();
+    await em.flush();
+
+    const dataEngine = ctx.container.resolve("dataEngine") as DataEngine;
+    await emitCrudSideEffects({
+      dataEngine,
+      action: "updated",
+      entity: invoice,
+      identifiers: {
+        id: invoice.id,
+        organizationId: invoice.organizationId,
+        tenantId: invoice.tenantId,
+      },
+      events: invoiceCrudEvents,
+      indexer: { entityType: E.sales.sales_invoice },
+    });
+
+    await invalidateCrudCache(
+      ctx.container,
+      "sales.invoice",
+      {
+        id: invoice.id,
+        organizationId: invoice.organizationId,
+        tenantId: invoice.tenantId,
+      },
+      ctx.auth?.tenantId ?? null,
+      "updated",
+    );
+
+    return { invoiceId: invoice.id };
+  },
+  captureAfter: async (_input, result, ctx) => {
+    const em = (ctx.container.resolve("em") as EntityManager).fork();
+    return loadInvoiceSnapshot(em, result.invoiceId);
+  },
+  buildLog: async ({ result, snapshots }) => {
+    const before = snapshots.before as InvoiceGraphSnapshot | undefined;
+    const after = snapshots.after as InvoiceGraphSnapshot | undefined;
+    if (!after) return null;
+    const { translate } = await resolveTranslations();
+    return {
+      actionLabel: translate("sales.audit.invoices.update", "Update invoice"),
+      resourceKind: "sales.invoice",
+      resourceId: result.invoiceId,
+      tenantId: after.invoice.tenantId,
+      organizationId: after.invoice.organizationId,
+      snapshotBefore: before,
+      snapshotAfter: after,
+      payload: {
+        undo: { before, after } satisfies InvoiceUndoPayload,
+      },
+    };
+  },
+  undo: async ({ logEntry, ctx }) => {
+    const payload = extractUndoPayload<InvoiceUndoPayload>(logEntry);
+    const before = payload?.before;
+    if (!before) return;
+    const em = (ctx.container.resolve("em") as EntityManager).fork();
+    const invoice = await em.findOne(SalesInvoice, { id: before.invoice.id });
+    if (!invoice) return;
+    ensureOrganizationScope(ctx, invoice.organizationId);
+    ensureTenantScope(ctx, invoice.tenantId);
+    invoice.invoiceNumber = before.invoice.invoiceNumber;
+    invoice.orderId = before.invoice.orderId;
+    invoice.statusEntryId = before.invoice.statusEntryId;
+    invoice.status = before.invoice.status;
+    invoice.issueDate = before.invoice.issueDate ? new Date(before.invoice.issueDate as string) : null;
+    invoice.dueDate = before.invoice.dueDate ? new Date(before.invoice.dueDate as string) : null;
+    invoice.currencyCode = before.invoice.currencyCode;
+    invoice.subtotalNetAmount = before.invoice.subtotalNetAmount;
+    invoice.subtotalGrossAmount = before.invoice.subtotalGrossAmount;
+    invoice.discountTotalAmount = before.invoice.discountTotalAmount;
+    invoice.taxTotalAmount = before.invoice.taxTotalAmount;
+    invoice.grandTotalNetAmount = before.invoice.grandTotalNetAmount;
+    invoice.grandTotalGrossAmount = before.invoice.grandTotalGrossAmount;
+    invoice.paidTotalAmount = before.invoice.paidTotalAmount;
+    invoice.outstandingAmount = before.invoice.outstandingAmount;
+    invoice.metadata = before.invoice.metadata;
+    invoice.updatedAt = new Date();
+    await em.flush();
+  },
+};
+
+const deleteInvoiceCommand: CommandHandler<
+  { id: string; organizationId: string; tenantId: string },
+  { invoiceId: string }
+> = {
+  id: "sales.invoices.delete",
+  async prepare(input, ctx) {
+    const id = requireId(input);
+    const em = ctx.container.resolve("em") as EntityManager;
+    const snapshot = await loadInvoiceSnapshot(em, id);
+    if (snapshot) {
+      ensureOrganizationScope(ctx, snapshot.invoice.organizationId);
+      ensureTenantScope(ctx, snapshot.invoice.tenantId);
+    }
+    return snapshot ? { before: snapshot } : {};
+  },
+  async execute(rawInput, ctx) {
+    const id = requireId(rawInput);
+    ensureOrganizationScope(ctx, rawInput.organizationId);
+    ensureTenantScope(ctx, rawInput.tenantId);
+    const em = (ctx.container.resolve("em") as EntityManager).fork();
+    const invoice = await em.findOneOrFail(SalesInvoice, {
+      id,
+      organizationId: rawInput.organizationId,
+      tenantId: rawInput.tenantId,
+      deletedAt: null,
+    });
+    invoice.deletedAt = new Date();
+    invoice.updatedAt = new Date();
+    await em.flush();
+
+    const dataEngine = ctx.container.resolve("dataEngine") as DataEngine;
+    await emitCrudSideEffects({
+      dataEngine,
+      action: "deleted",
+      entity: invoice,
+      identifiers: {
+        id: invoice.id,
+        organizationId: invoice.organizationId,
+        tenantId: invoice.tenantId,
+      },
+      events: invoiceCrudEvents,
+      indexer: { entityType: E.sales.sales_invoice },
+    });
+
+    await invalidateCrudCache(
+      ctx.container,
+      "sales.invoice",
+      {
+        id: invoice.id,
+        organizationId: invoice.organizationId,
+        tenantId: invoice.tenantId,
+      },
+      ctx.auth?.tenantId ?? null,
+      "deleted",
+    );
+
+    return { invoiceId: invoice.id };
+  },
+  buildLog: async ({ snapshots }) => {
+    const before = snapshots.before as InvoiceGraphSnapshot | undefined;
+    if (!before) return null;
+    const { translate } = await resolveTranslations();
+    return {
+      actionLabel: translate("sales.audit.invoices.delete", "Delete invoice"),
+      resourceKind: "sales.invoice",
+      resourceId: before.invoice.id,
+      tenantId: before.invoice.tenantId,
+      organizationId: before.invoice.organizationId,
+      snapshotBefore: before,
+      payload: {
+        undo: { before } satisfies InvoiceUndoPayload,
+      },
+    };
+  },
+  undo: async ({ logEntry, ctx }) => {
+    const payload = extractUndoPayload<InvoiceUndoPayload>(logEntry);
+    const before = payload?.before;
+    if (!before) return;
+    const em = (ctx.container.resolve("em") as EntityManager).fork();
+    ensureOrganizationScope(ctx, before.invoice.organizationId);
+    ensureTenantScope(ctx, before.invoice.tenantId);
+    const restored = em.create(SalesInvoice, {
+      id: before.invoice.id,
+      organizationId: before.invoice.organizationId,
+      tenantId: before.invoice.tenantId,
+      invoiceNumber: before.invoice.invoiceNumber,
+      orderId: before.invoice.orderId,
+      statusEntryId: before.invoice.statusEntryId,
+      status: before.invoice.status,
+      issueDate: before.invoice.issueDate ? new Date(before.invoice.issueDate as string) : new Date(),
+      dueDate: before.invoice.dueDate ? new Date(before.invoice.dueDate as string) : null,
+      currencyCode: before.invoice.currencyCode,
+      subtotalNetAmount: before.invoice.subtotalNetAmount,
+      subtotalGrossAmount: before.invoice.subtotalGrossAmount,
+      discountTotalAmount: before.invoice.discountTotalAmount,
+      taxTotalAmount: before.invoice.taxTotalAmount,
+      grandTotalNetAmount: before.invoice.grandTotalNetAmount,
+      grandTotalGrossAmount: before.invoice.grandTotalGrossAmount,
+      paidTotalAmount: before.invoice.paidTotalAmount,
+      outstandingAmount: before.invoice.outstandingAmount,
+      metadata: before.invoice.metadata,
+      customFieldSetId: before.invoice.customFieldSetId,
+      deletedAt: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    em.persist(restored);
+    for (const line of before.lines) {
+      em.persist(em.create(SalesInvoiceLine, {
+        id: line.id,
+        invoice: restored,
+        orderLineId: line.orderLineId,
+        organizationId: before.invoice.organizationId,
+        tenantId: before.invoice.tenantId,
+        lineNumber: line.lineNumber,
+        kind: line.kind,
+        name: line.name,
+        sku: line.sku,
+        description: line.description,
+        quantity: line.quantity,
+        quantityUnit: line.quantityUnit,
+        normalizedQuantity: line.normalizedQuantity,
+        normalizedUnit: line.normalizedUnit,
+        uomSnapshot: line.uomSnapshot,
+        currencyCode: line.currencyCode,
+        unitPriceNet: line.unitPriceNet,
+        unitPriceGross: line.unitPriceGross,
+        discountAmount: line.discountAmount,
+        discountPercent: line.discountPercent,
+        taxRate: line.taxRate,
+        taxAmount: line.taxAmount,
+        totalNetAmount: line.totalNetAmount,
+        totalGrossAmount: line.totalGrossAmount,
+        metadata: line.metadata,
+      }));
+    }
+    await em.flush();
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Credit Memo CRUD commands
+// ---------------------------------------------------------------------------
+
+const creditMemoCrudEvents: CrudEventsConfig<SalesCreditMemo> = {
+  module: "sales",
+  entity: "credit_memo",
+  persistent: true,
+  buildPayload: (ctx) => ({
+    id: ctx.identifiers.id,
+    organizationId: ctx.identifiers.organizationId,
+    tenantId: ctx.identifiers.tenantId,
+  }),
+};
+
+const createCreditMemoCommand: CommandHandler<
+  CreditMemoCreateInput,
+  { creditMemoId: string }
+> = {
+  id: "sales.credit_memos.create",
+  async execute(rawInput, ctx) {
+    const generator = ctx.container.resolve(
+      "salesDocumentNumberGenerator",
+    ) as SalesDocumentNumberGenerator;
+    const initial = creditMemoCreateSchema.parse(rawInput ?? {});
+    const creditMemoNumber =
+      typeof initial.creditMemoNumber === "string" &&
+      initial.creditMemoNumber.trim().length
+        ? initial.creditMemoNumber.trim()
+        : (
+            await generator.generate({
+              kind: "credit_memo",
+              organizationId: initial.organizationId,
+              tenantId: initial.tenantId,
+            })
+          ).number;
+    const parsed = creditMemoCreateSchema.parse({ ...initial, creditMemoNumber });
+    const ensuredCreditMemoNumber = parsed.creditMemoNumber ?? creditMemoNumber;
+    if (!ensuredCreditMemoNumber) {
+      throw new CrudHttpError(400, { error: "Credit memo number is required." });
+    }
+    ensureOrganizationScope(ctx, parsed.organizationId);
+    ensureTenantScope(ctx, parsed.tenantId);
+    const em = (ctx.container.resolve("em") as EntityManager).fork();
+    const status = await resolveDictionaryEntryValue(
+      em,
+      parsed.statusEntryId ?? null,
+      { tenantId: parsed.tenantId },
+    );
+
+    // Validate orderId belongs to same org/tenant
+    if (parsed.orderId) {
+      const orderExists = await em.findOne(SalesOrder, {
+        id: parsed.orderId,
+        organizationId: parsed.organizationId,
+        tenantId: parsed.tenantId,
+        deletedAt: null,
+      });
+      if (!orderExists) {
+        throw new CrudHttpError(400, { error: "Referenced order not found in current scope." });
+      }
+    }
+
+    // Validate invoiceId belongs to same org/tenant
+    if (parsed.invoiceId) {
+      const invoiceExists = await em.findOne(SalesInvoice, {
+        id: parsed.invoiceId,
+        organizationId: parsed.organizationId,
+        tenantId: parsed.tenantId,
+        deletedAt: null,
+      });
+      if (!invoiceExists) {
+        throw new CrudHttpError(400, { error: "Referenced invoice not found in current scope." });
+      }
+    }
+
+    const creditMemoId = randomUUID();
+    const creditMemo = em.create(SalesCreditMemo, {
+      id: creditMemoId,
+      organizationId: parsed.organizationId,
+      tenantId: parsed.tenantId,
+      creditMemoNumber: ensuredCreditMemoNumber,
+      orderId: parsed.orderId ?? null,
+      invoiceId: parsed.invoiceId ?? null,
+      statusEntryId: parsed.statusEntryId ?? null,
+      status,
+      reason: parsed.reason ?? null,
+      issueDate: parsed.issueDate ?? new Date(),
+      currencyCode: parsed.currencyCode,
+      subtotalNetAmount: toNumericString(parsed.subtotalNetAmount ?? 0),
+      subtotalGrossAmount: toNumericString(parsed.subtotalGrossAmount ?? 0),
+      taxTotalAmount: toNumericString(parsed.taxTotalAmount ?? 0),
+      grandTotalNetAmount: toNumericString(parsed.grandTotalNetAmount ?? 0),
+      grandTotalGrossAmount: toNumericString(parsed.grandTotalGrossAmount ?? 0),
+      metadata: parsed.metadata ?? null,
+      customFieldSetId: parsed.customFieldSetId ?? null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    // Header + lines + custom-field writes must commit atomically.
+    // setRecordCustomFields flushes mid-build, so without a transaction a
+    // partial write could persist the header without its lines/custom fields.
+    await withAtomicFlush(
+      em,
+      [
+        async () => {
+          em.persist(creditMemo);
+
+          if (parsed.lines?.length) {
+            for (let i = 0; i < parsed.lines.length; i++) {
+              const line = parsed.lines[i];
+              em.persist(
+                em.create(SalesCreditMemoLine, {
+                  id: randomUUID(),
+                  creditMemo,
+                  orderLineId: line.orderLineId ?? null,
+                  organizationId: parsed.organizationId,
+                  tenantId: parsed.tenantId,
+                  lineNumber: line.lineNumber ?? i + 1,
+                  name: line.name ?? null,
+                  sku: line.sku ?? null,
+                  description: line.description ?? null,
+                  quantity: toNumericString(line.quantity ?? 0),
+                  quantityUnit: line.quantityUnit ?? null,
+                  normalizedQuantity: toNumericString(line.normalizedQuantity ?? 0),
+                  normalizedUnit: line.normalizedUnit ?? null,
+                  uomSnapshot: line.uomSnapshot ?? null,
+                  currencyCode: line.currencyCode ?? parsed.currencyCode,
+                  unitPriceNet: toNumericString(line.unitPriceNet ?? 0),
+                  unitPriceGross: toNumericString(line.unitPriceGross ?? 0),
+                  taxRate: toNumericString(line.taxRate ?? 0),
+                  taxAmount: toNumericString(line.taxAmount ?? 0),
+                  totalNetAmount: toNumericString(line.totalNetAmount ?? 0),
+                  totalGrossAmount: toNumericString(line.totalGrossAmount ?? 0),
+                  metadata: line.metadata ?? null,
+                }),
+              );
+            }
+          }
+
+          if (parsed.customFieldSetId) {
+            await setRecordCustomFields(em, {
+              entityId: E.sales.sales_credit_memo,
+              recordId: creditMemoId,
+              organizationId: parsed.organizationId,
+              tenantId: parsed.tenantId,
+              values: normalizeCustomFieldValues(
+                ((parsed as Record<string, unknown>).customFields as Record<string, unknown>) ?? {},
+              ),
+            });
+          }
+        },
+      ],
+      { transaction: true },
+    );
+
+    const dataEngine = ctx.container.resolve("dataEngine") as DataEngine;
+    await emitCrudSideEffects({
+      dataEngine,
+      action: "created",
+      entity: creditMemo,
+      identifiers: {
+        id: creditMemo.id,
+        organizationId: creditMemo.organizationId,
+        tenantId: creditMemo.tenantId,
+      },
+      events: creditMemoCrudEvents,
+      indexer: { entityType: E.sales.sales_credit_memo },
+    });
+
+    await invalidateCrudCache(
+      ctx.container,
+      "sales.credit_memo",
+      {
+        id: creditMemo.id,
+        organizationId: creditMemo.organizationId,
+        tenantId: creditMemo.tenantId,
+      },
+      ctx.auth?.tenantId ?? null,
+      "created",
+    );
+
+    return { creditMemoId: creditMemo.id };
+  },
+  captureAfter: async (_input, result, ctx) => {
+    const em = (ctx.container.resolve("em") as EntityManager).fork();
+    return loadCreditMemoSnapshot(em, result.creditMemoId);
+  },
+  buildLog: async ({ result, snapshots }) => {
+    const after = snapshots.after as CreditMemoGraphSnapshot | undefined;
+    if (!after) return null;
+    const { translate } = await resolveTranslations();
+    return {
+      actionLabel: translate("sales.audit.credit_memos.create", "Create credit memo"),
+      resourceKind: "sales.credit_memo",
+      resourceId: result.creditMemoId,
+      tenantId: after.creditMemo.tenantId,
+      organizationId: after.creditMemo.organizationId,
+      snapshotAfter: after,
+      payload: {
+        undo: { after } satisfies CreditMemoUndoPayload,
+      },
+    };
+  },
+  undo: async ({ logEntry, ctx }) => {
+    const payload = extractUndoPayload<CreditMemoUndoPayload>(logEntry);
+    const after = payload?.after;
+    if (!after) return;
+    const em = (ctx.container.resolve("em") as EntityManager).fork();
+    const creditMemo = await em.findOne(SalesCreditMemo, { id: after.creditMemo.id });
+    if (!creditMemo) return;
+    ensureOrganizationScope(ctx, creditMemo.organizationId);
+    ensureTenantScope(ctx, creditMemo.tenantId);
+    await em.nativeDelete(SalesCreditMemoLine, { creditMemo: creditMemo.id });
+    em.remove(creditMemo);
+    await em.flush();
+  },
+};
+
+const updateCreditMemoCommand: CommandHandler<
+  z.infer<typeof creditMemoUpdateSchema>,
+  { creditMemoId: string }
+> = {
+  id: "sales.credit_memos.update",
+  async prepare(input, ctx) {
+    const id = requireId(input);
+    const em = ctx.container.resolve("em") as EntityManager;
+    const snapshot = await loadCreditMemoSnapshot(em, id);
+    if (snapshot) {
+      ensureOrganizationScope(ctx, snapshot.creditMemo.organizationId);
+      ensureTenantScope(ctx, snapshot.creditMemo.tenantId);
+    }
+    return snapshot ? { before: snapshot } : {};
+  },
+  async execute(rawInput, ctx) {
+    const parsed = creditMemoUpdateSchema.parse(rawInput ?? {});
+    const id = requireId(parsed);
+    ensureOrganizationScope(ctx, parsed.organizationId);
+    ensureTenantScope(ctx, parsed.tenantId);
+    const em = (ctx.container.resolve("em") as EntityManager).fork();
+    const creditMemo = await em.findOneOrFail(SalesCreditMemo, {
+      id,
+      organizationId: parsed.organizationId,
+      tenantId: parsed.tenantId,
+      deletedAt: null,
+    });
+
+    const changes = buildChanges(creditMemo, parsed, [
+      "creditMemoNumber",
+      "statusEntryId",
+      "status",
+      "reason",
+      "issueDate",
+      "currencyCode",
+      "subtotalNetAmount",
+      "subtotalGrossAmount",
+      "taxTotalAmount",
+      "grandTotalNetAmount",
+      "grandTotalGrossAmount",
+      "metadata",
+    ]);
+
+    if (parsed.statusEntryId !== undefined) {
+      creditMemo.status = await resolveDictionaryEntryValue(em, parsed.statusEntryId ?? null, { tenantId: creditMemo.tenantId });
+    }
+
+    Object.assign(creditMemo, changes);
+    creditMemo.updatedAt = new Date();
+    await em.flush();
+
+    const dataEngine = ctx.container.resolve("dataEngine") as DataEngine;
+    await emitCrudSideEffects({
+      dataEngine,
+      action: "updated",
+      entity: creditMemo,
+      identifiers: {
+        id: creditMemo.id,
+        organizationId: creditMemo.organizationId,
+        tenantId: creditMemo.tenantId,
+      },
+      events: creditMemoCrudEvents,
+      indexer: { entityType: E.sales.sales_credit_memo },
+    });
+
+    await invalidateCrudCache(
+      ctx.container,
+      "sales.credit_memo",
+      {
+        id: creditMemo.id,
+        organizationId: creditMemo.organizationId,
+        tenantId: creditMemo.tenantId,
+      },
+      ctx.auth?.tenantId ?? null,
+      "updated",
+    );
+
+    return { creditMemoId: creditMemo.id };
+  },
+  captureAfter: async (_input, result, ctx) => {
+    const em = (ctx.container.resolve("em") as EntityManager).fork();
+    return loadCreditMemoSnapshot(em, result.creditMemoId);
+  },
+  buildLog: async ({ result, snapshots }) => {
+    const before = snapshots.before as CreditMemoGraphSnapshot | undefined;
+    const after = snapshots.after as CreditMemoGraphSnapshot | undefined;
+    if (!after) return null;
+    const { translate } = await resolveTranslations();
+    return {
+      actionLabel: translate("sales.audit.credit_memos.update", "Update credit memo"),
+      resourceKind: "sales.credit_memo",
+      resourceId: result.creditMemoId,
+      tenantId: after.creditMemo.tenantId,
+      organizationId: after.creditMemo.organizationId,
+      snapshotBefore: before,
+      snapshotAfter: after,
+      payload: {
+        undo: { before, after } satisfies CreditMemoUndoPayload,
+      },
+    };
+  },
+  undo: async ({ logEntry, ctx }) => {
+    const payload = extractUndoPayload<CreditMemoUndoPayload>(logEntry);
+    const before = payload?.before;
+    if (!before) return;
+    const em = (ctx.container.resolve("em") as EntityManager).fork();
+    const creditMemo = await em.findOne(SalesCreditMemo, { id: before.creditMemo.id });
+    if (!creditMemo) return;
+    ensureOrganizationScope(ctx, creditMemo.organizationId);
+    ensureTenantScope(ctx, creditMemo.tenantId);
+    creditMemo.creditMemoNumber = before.creditMemo.creditMemoNumber;
+    creditMemo.orderId = before.creditMemo.orderId;
+    creditMemo.invoiceId = before.creditMemo.invoiceId;
+    creditMemo.statusEntryId = before.creditMemo.statusEntryId;
+    creditMemo.status = before.creditMemo.status;
+    creditMemo.reason = before.creditMemo.reason;
+    creditMemo.issueDate = before.creditMemo.issueDate ? new Date(before.creditMemo.issueDate as string) : null;
+    creditMemo.currencyCode = before.creditMemo.currencyCode;
+    creditMemo.subtotalNetAmount = before.creditMemo.subtotalNetAmount;
+    creditMemo.subtotalGrossAmount = before.creditMemo.subtotalGrossAmount;
+    creditMemo.taxTotalAmount = before.creditMemo.taxTotalAmount;
+    creditMemo.grandTotalNetAmount = before.creditMemo.grandTotalNetAmount;
+    creditMemo.grandTotalGrossAmount = before.creditMemo.grandTotalGrossAmount;
+    creditMemo.metadata = before.creditMemo.metadata;
+    creditMemo.updatedAt = new Date();
+    await em.flush();
+  },
+};
+
+const deleteCreditMemoCommand: CommandHandler<
+  { id: string; organizationId: string; tenantId: string },
+  { creditMemoId: string }
+> = {
+  id: "sales.credit_memos.delete",
+  async prepare(input, ctx) {
+    const id = requireId(input);
+    const em = ctx.container.resolve("em") as EntityManager;
+    const snapshot = await loadCreditMemoSnapshot(em, id);
+    if (snapshot) {
+      ensureOrganizationScope(ctx, snapshot.creditMemo.organizationId);
+      ensureTenantScope(ctx, snapshot.creditMemo.tenantId);
+    }
+    return snapshot ? { before: snapshot } : {};
+  },
+  async execute(rawInput, ctx) {
+    const id = requireId(rawInput);
+    ensureOrganizationScope(ctx, rawInput.organizationId);
+    ensureTenantScope(ctx, rawInput.tenantId);
+    const em = (ctx.container.resolve("em") as EntityManager).fork();
+    const creditMemo = await em.findOneOrFail(SalesCreditMemo, {
+      id,
+      organizationId: rawInput.organizationId,
+      tenantId: rawInput.tenantId,
+      deletedAt: null,
+    });
+    creditMemo.deletedAt = new Date();
+    creditMemo.updatedAt = new Date();
+    await em.flush();
+
+    const dataEngine = ctx.container.resolve("dataEngine") as DataEngine;
+    await emitCrudSideEffects({
+      dataEngine,
+      action: "deleted",
+      entity: creditMemo,
+      identifiers: {
+        id: creditMemo.id,
+        organizationId: creditMemo.organizationId,
+        tenantId: creditMemo.tenantId,
+      },
+      events: creditMemoCrudEvents,
+      indexer: { entityType: E.sales.sales_credit_memo },
+    });
+
+    await invalidateCrudCache(
+      ctx.container,
+      "sales.credit_memo",
+      {
+        id: creditMemo.id,
+        organizationId: creditMemo.organizationId,
+        tenantId: creditMemo.tenantId,
+      },
+      ctx.auth?.tenantId ?? null,
+      "deleted",
+    );
+
+    return { creditMemoId: creditMemo.id };
+  },
+  buildLog: async ({ snapshots }) => {
+    const before = snapshots.before as CreditMemoGraphSnapshot | undefined;
+    if (!before) return null;
+    const { translate } = await resolveTranslations();
+    return {
+      actionLabel: translate("sales.audit.credit_memos.delete", "Delete credit memo"),
+      resourceKind: "sales.credit_memo",
+      resourceId: before.creditMemo.id,
+      tenantId: before.creditMemo.tenantId,
+      organizationId: before.creditMemo.organizationId,
+      snapshotBefore: before,
+      payload: {
+        undo: { before } satisfies CreditMemoUndoPayload,
+      },
+    };
+  },
+  undo: async ({ logEntry, ctx }) => {
+    const payload = extractUndoPayload<CreditMemoUndoPayload>(logEntry);
+    const before = payload?.before;
+    if (!before) return;
+    const em = (ctx.container.resolve("em") as EntityManager).fork();
+    ensureOrganizationScope(ctx, before.creditMemo.organizationId);
+    ensureTenantScope(ctx, before.creditMemo.tenantId);
+    const restored = em.create(SalesCreditMemo, {
+      id: before.creditMemo.id,
+      organizationId: before.creditMemo.organizationId,
+      tenantId: before.creditMemo.tenantId,
+      creditMemoNumber: before.creditMemo.creditMemoNumber,
+      orderId: before.creditMemo.orderId,
+      invoiceId: before.creditMemo.invoiceId,
+      statusEntryId: before.creditMemo.statusEntryId,
+      status: before.creditMemo.status,
+      reason: before.creditMemo.reason,
+      issueDate: before.creditMemo.issueDate ? new Date(before.creditMemo.issueDate as string) : new Date(),
+      currencyCode: before.creditMemo.currencyCode,
+      subtotalNetAmount: before.creditMemo.subtotalNetAmount,
+      subtotalGrossAmount: before.creditMemo.subtotalGrossAmount,
+      taxTotalAmount: before.creditMemo.taxTotalAmount,
+      grandTotalNetAmount: before.creditMemo.grandTotalNetAmount,
+      grandTotalGrossAmount: before.creditMemo.grandTotalGrossAmount,
+      metadata: before.creditMemo.metadata,
+      customFieldSetId: before.creditMemo.customFieldSetId,
+      deletedAt: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    em.persist(restored);
+    for (const line of before.lines) {
+      em.persist(em.create(SalesCreditMemoLine, {
+        id: line.id,
+        creditMemo: restored,
+        orderLineId: line.orderLineId,
+        organizationId: before.creditMemo.organizationId,
+        tenantId: before.creditMemo.tenantId,
+        lineNumber: line.lineNumber,
+        name: line.name,
+        sku: line.sku,
+        description: line.description,
+        quantity: line.quantity,
+        quantityUnit: line.quantityUnit,
+        normalizedQuantity: line.normalizedQuantity,
+        normalizedUnit: line.normalizedUnit,
+        uomSnapshot: line.uomSnapshot,
+        currencyCode: line.currencyCode,
+        unitPriceNet: line.unitPriceNet,
+        unitPriceGross: line.unitPriceGross,
+        taxRate: line.taxRate,
+        taxAmount: line.taxAmount,
+        totalNetAmount: line.totalNetAmount,
+        totalGrossAmount: line.totalGrossAmount,
+        metadata: line.metadata,
+      }));
+    }
+    await em.flush();
+  },
+};
+
 registerCommand(updateQuoteCommand);
 registerCommand(createQuoteCommand);
 registerCommand(deleteQuoteCommand);
@@ -7680,3 +9304,9 @@ registerCommand(orderAdjustmentUpsertCommand);
 registerCommand(orderAdjustmentDeleteCommand);
 registerCommand(quoteAdjustmentUpsertCommand);
 registerCommand(quoteAdjustmentDeleteCommand);
+registerCommand(createInvoiceCommand);
+registerCommand(updateInvoiceCommand);
+registerCommand(deleteInvoiceCommand);
+registerCommand(createCreditMemoCommand);
+registerCommand(updateCreditMemoCommand);
+registerCommand(deleteCreditMemoCommand);

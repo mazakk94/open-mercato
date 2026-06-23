@@ -1,13 +1,22 @@
 "use client"
 
 import * as React from 'react'
-import { apiCall } from '@open-mercato/ui/backend/utils/apiCall'
+import { apiCall, withScopedApiRequestHeaders } from '@open-mercato/ui/backend/utils/apiCall'
+import { buildOptimisticLockHeader } from '@open-mercato/ui/backend/utils/optimisticLock'
+import { surfaceRecordConflict } from '@open-mercato/ui/backend/conflicts'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
 import { Badge } from '@open-mercato/ui/primitives/badge'
 import { Button } from '@open-mercato/ui/primitives/button'
 import { Input } from '@open-mercato/ui/primitives/input'
 import { Label } from '@open-mercato/ui/primitives/label'
-import { Notice } from '@open-mercato/ui/primitives/Notice'
+import { Alert, AlertDescription } from '@open-mercato/ui/primitives/alert'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@open-mercato/ui/primitives/select'
 import { Spinner } from '@open-mercato/ui/primitives/spinner'
 import { useOrganizationScopeVersion } from '@open-mercato/shared/lib/frontend/useOrganizationScope'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
@@ -25,6 +34,8 @@ type SyncOption = {
   integrationId: string
   title: string
   direction: 'import' | 'export' | 'bidirectional'
+  runMode?: 'generic' | 'provider'
+  canStartRun?: boolean
   supportedEntities: string[]
   hasCredentials: boolean
   isEnabled: boolean
@@ -45,6 +56,7 @@ type SyncScheduleRecord = {
   fullSync: boolean
   isEnabled: boolean
   lastRunAt: string | null
+  updatedAt?: string | null
 }
 
 type SyncSchedulesResponse = {
@@ -59,6 +71,7 @@ type SyncScheduleEditorState = {
   fullSync: boolean
   isEnabled: boolean
   lastRunAt: string | null
+  updatedAt?: string | null
 }
 
 type IntegrationScheduleTabProps = {
@@ -85,6 +98,7 @@ function buildDefaultScheduleState(entityType: string): SyncScheduleEditorState 
     fullSync: normalized !== 'products',
     isEnabled: true,
     lastRunAt: null,
+    updatedAt: null,
   }
 }
 
@@ -118,6 +132,7 @@ function buildScheduleEditors(
             fullSync: record.fullSync,
             isEnabled: record.isEnabled,
             lastRunAt: record.lastRunAt,
+            updatedAt: record.updatedAt ?? null,
           }
           : buildDefaultScheduleState(entityType),
       ])
@@ -197,10 +212,15 @@ export function IntegrationScheduleTab(props: IntegrationScheduleTabProps) {
       flash(t('data_sync.integrationTab.credentialsMissing', 'Configure credentials before starting a sync.'), 'error')
       return
     }
+    if (option?.canStartRun === false) {
+      flash(t('data_sync.integrationTab.providerManaged', 'Start this integration from its provider-specific setup flow.'), 'error')
+      return
+    }
 
     setRunningKey(scheduleKey)
     try {
       const scheduleState = schedules[scheduleKey] ?? buildDefaultScheduleState(entityType)
+      // optimistic-lock-exempt: starts a new sync run (create), not a concurrent record edit
       const call = await apiCall<{ id: string }>('/api/data_sync/run', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -224,29 +244,45 @@ export function IntegrationScheduleTab(props: IntegrationScheduleTabProps) {
     } finally {
       setRunningKey(null)
     }
-  }, [props.hasCredentials, props.integrationId, props.isEnabled, schedules, t])
+  }, [option?.canStartRun, props.hasCredentials, props.integrationId, props.isEnabled, schedules, t])
 
   const handleSaveSchedule = React.useCallback(async (entityType: string, direction: 'import' | 'export', scheduleKey: string) => {
     const scheduleState = schedules[scheduleKey] ?? buildDefaultScheduleState(entityType)
     setSavingKey(scheduleKey)
     try {
-      const call = await apiCall<SyncScheduleRecord>('/api/data_sync/schedules', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          integrationId: props.integrationId,
-          entityType,
-          direction,
-          scheduleType: scheduleState.scheduleType,
-          scheduleValue: scheduleState.scheduleValue,
-          timezone: scheduleState.timezone,
-          fullSync: scheduleState.fullSync,
-          isEnabled: scheduleState.isEnabled,
-        }),
-      }, { fallback: null })
+      // Keyed upsert (POST). When the server resolves an existing row the save
+      // version-checks against this schedule's loaded `updatedAt`; for a brand
+      // new row the header is empty so the create path is unaffected.
+      const call = await withScopedApiRequestHeaders(
+        buildOptimisticLockHeader(scheduleState.updatedAt),
+        () => apiCall<SyncScheduleRecord>('/api/data_sync/schedules', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            integrationId: props.integrationId,
+            entityType,
+            direction,
+            scheduleType: scheduleState.scheduleType,
+            scheduleValue: scheduleState.scheduleValue,
+            timezone: scheduleState.timezone,
+            fullSync: scheduleState.fullSync,
+            isEnabled: scheduleState.isEnabled,
+          }),
+        }, { fallback: null }),
+      )
 
       if (!call.ok || !call.result) {
-        throw new Error((call.result as { error?: string } | null)?.error ?? 'Failed to save schedule')
+        const conflictError = Object.assign(
+          new Error((call.result as { error?: string } | null)?.error ?? 'Failed to save schedule'),
+          {
+            status: call.status,
+            ...(call.result && typeof call.result === 'object' ? call.result : {}),
+          },
+        )
+        if (surfaceRecordConflict(conflictError, t)) {
+          return
+        }
+        throw conflictError
       }
 
       updateScheduleEditor(scheduleKey, {
@@ -257,6 +293,7 @@ export function IntegrationScheduleTab(props: IntegrationScheduleTabProps) {
         fullSync: call.result.fullSync,
         isEnabled: call.result.isEnabled,
         lastRunAt: call.result.lastRunAt,
+        updatedAt: call.result.updatedAt ?? null,
       }, entityType)
       flash(t('data_sync.dashboard.schedule.success', 'Recurring schedule saved'), 'success')
     } catch (error) {
@@ -276,9 +313,12 @@ export function IntegrationScheduleTab(props: IntegrationScheduleTabProps) {
 
     setDeletingKey(scheduleKey)
     try {
-      const call = await apiCall(`/api/data_sync/schedules/${encodeURIComponent(scheduleState.id)}`, {
-        method: 'DELETE',
-      }, { fallback: null })
+      const call = await withScopedApiRequestHeaders(
+        buildOptimisticLockHeader(scheduleState.updatedAt),
+        () => apiCall(`/api/data_sync/schedules/${encodeURIComponent(scheduleState.id as string)}`, {
+          method: 'DELETE',
+        }, { fallback: null }),
+      )
 
       if (!call.ok) {
         throw new Error((call.result as { error?: string } | null)?.error ?? 'Failed to delete schedule')
@@ -307,9 +347,11 @@ export function IntegrationScheduleTab(props: IntegrationScheduleTabProps) {
 
   if (!option) {
     return (
-      <Notice compact variant="warning">
-        {t('data_sync.integrationTab.notAvailable', 'This integration is not registered as a data sync provider.')}
-      </Notice>
+      <Alert variant="warning">
+        <AlertDescription>
+          {t('data_sync.integrationTab.notAvailable', 'This integration is not registered as a data sync provider.')}
+        </AlertDescription>
+      </Alert>
     )
   }
 
@@ -345,21 +387,35 @@ export function IntegrationScheduleTab(props: IntegrationScheduleTabProps) {
       </div>
 
       {!props.isEnabled ? (
-        <Notice compact variant="warning">
-          {t('data_sync.integrationTab.integrationDisabledNotice', 'The integration is disabled. You can save schedules now, but runs will stay blocked until the integration is enabled.')}
-        </Notice>
+        <Alert variant="warning">
+          <AlertDescription>
+            {t('data_sync.integrationTab.integrationDisabledNotice', 'The integration is disabled. You can save schedules now, but runs will stay blocked until the integration is enabled.')}
+          </AlertDescription>
+        </Alert>
       ) : null}
 
       {!props.hasCredentials ? (
-        <Notice compact variant="warning">
-          {t('data_sync.integrationTab.credentialsMissingNotice', 'Credentials are still missing. Save schedules first if you want, but manual and scheduled runs will fail until credentials are configured.')}
-        </Notice>
+        <Alert variant="warning">
+          <AlertDescription>
+            {t('data_sync.integrationTab.credentialsMissingNotice', 'Credentials are still missing. Save schedules first if you want, but manual and scheduled runs will fail until credentials are configured.')}
+          </AlertDescription>
+        </Alert>
+      ) : null}
+
+      {option.canStartRun === false ? (
+        <Alert variant="info">
+          <AlertDescription>
+            {t('data_sync.integrationTab.providerManagedNotice', 'This provider needs its own setup flow before a run can start. Use the provider tab on this page instead of generic schedules.')}
+          </AlertDescription>
+        </Alert>
       ) : null}
 
       {rows.length === 0 ? (
-        <Notice compact>
-          {t('data_sync.integrationTab.empty', 'This provider does not expose any schedulable sync entities yet.')}
-        </Notice>
+        <Alert variant="info">
+          <AlertDescription>
+            {t('data_sync.integrationTab.empty', 'This provider does not expose any schedulable sync entities yet.')}
+          </AlertDescription>
+        </Alert>
       ) : (
         <div className="overflow-x-auto rounded-lg border">
           <table className="w-full min-w-[1080px] text-sm">
@@ -388,17 +444,21 @@ export function IntegrationScheduleTab(props: IntegrationScheduleTabProps) {
                     <td className="px-3 py-3 font-medium">{formatEntityTypeLabel(row.entityType)}</td>
                     <td className="px-3 py-3">{t(`data_sync.dashboard.direction.${row.direction}`, row.direction === 'import' ? 'Import' : 'Export')}</td>
                     <td className="px-3 py-3">
-                      <select
-                        className="flex h-10 w-full min-w-32 rounded-md border border-input bg-background px-3 py-2 text-sm"
+                      <Select
                         value={scheduleState.scheduleType}
-                        onChange={(event) => updateScheduleEditor(row.key, {
-                          scheduleType: event.target.value === 'cron' ? 'cron' : 'interval',
+                        onValueChange={(value) => updateScheduleEditor(row.key, {
+                          scheduleType: value === 'cron' ? 'cron' : 'interval',
                         }, row.entityType)}
                         disabled={controlsDisabled}
                       >
-                        <option value="interval">{t('data_sync.dashboard.schedule.interval', 'Interval')}</option>
-                        <option value="cron">{t('data_sync.dashboard.schedule.cron', 'Cron')}</option>
-                      </select>
+                        <SelectTrigger size="lg" className="min-w-32">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="interval">{t('data_sync.dashboard.schedule.interval', 'Interval')}</SelectItem>
+                          <SelectItem value="cron">{t('data_sync.dashboard.schedule.cron', 'Cron')}</SelectItem>
+                        </SelectContent>
+                      </Select>
                     </td>
                     <td className="px-3 py-3">
                       <Input
@@ -450,7 +510,7 @@ export function IntegrationScheduleTab(props: IntegrationScheduleTabProps) {
                           type="button"
                           size="sm"
                           onClick={() => void handleStartSync(row.entityType, row.direction, row.key)}
-                          disabled={controlsDisabled || !props.isEnabled || !props.hasCredentials}
+                          disabled={controlsDisabled || !props.isEnabled || !props.hasCredentials || option.canStartRun === false}
                         >
                           {isRunning ? <Spinner className="mr-2 h-4 w-4" /> : <Play className="mr-2 h-4 w-4" />}
                           {isRunning
@@ -462,7 +522,7 @@ export function IntegrationScheduleTab(props: IntegrationScheduleTabProps) {
                           size="sm"
                           variant="outline"
                           onClick={() => void handleSaveSchedule(row.entityType, row.direction, row.key)}
-                          disabled={controlsDisabled}
+                          disabled={controlsDisabled || option.canStartRun === false}
                         >
                           {isSaving ? <Spinner className="mr-2 h-4 w-4" /> : <Save className="mr-2 h-4 w-4" />}
                           {isSaving

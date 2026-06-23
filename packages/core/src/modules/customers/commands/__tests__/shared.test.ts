@@ -1,7 +1,9 @@
 import * as shared from '../shared'
 import { CrudHttpError } from '@open-mercato/shared/lib/crud/errors'
 import {
+  CustomerDeal,
   CustomerDictionaryEntry,
+  CustomerEntity,
   CustomerTag,
   CustomerTagAssignment,
 } from '../../data/entities'
@@ -12,6 +14,9 @@ const {
   ensureSameScope,
   extractUndoPayload,
   assertFound,
+  requireCustomerEntity,
+  requireTimelineParentEntity,
+  requireDealInScope,
   ensureDictionaryEntry,
   loadEntityTagIds,
   syncEntityTags,
@@ -64,6 +69,133 @@ describe('customers commands shared utilities', () => {
     })
   })
 
+  const SCOPE = { tenantId: 'tenant-1', organizationId: 'org-1' } as const
+  const OTHER_SCOPE = { tenantId: 'tenant-2', organizationId: 'org-2' } as const
+
+  // Scope-aware mock: `findOne` honors the tenantId/organizationId in the where
+  // clause so the tests prove the helpers filter by scope at query time (a
+  // cross-tenant row is simply never returned) rather than fetching-then-checking.
+  function makeEm(lookups: { entity?: any; deal?: any }) {
+    const matchesScope = (record: any, where: any) =>
+      !!record &&
+      (where.tenantId === undefined || record.tenantId === where.tenantId) &&
+      (where.organizationId === undefined || record.organizationId === where.organizationId)
+    return {
+      findOne: jest.fn(async (cls: unknown, where: any) => {
+        if (cls === CustomerEntity) return matchesScope(lookups.entity, where) ? lookups.entity : null
+        if (cls === CustomerDeal) return matchesScope(lookups.deal, where) ? lookups.deal : null
+        return null
+      }),
+    }
+  }
+
+  describe('requireCustomerEntity', () => {
+    const personEntity = Object.assign(new CustomerEntity(), { id: 'person-1', kind: 'person' as const, ...SCOPE })
+
+    it('returns the entity when found in scope', async () => {
+      const em = makeEm({ entity: personEntity })
+      await expect(requireCustomerEntity(em as any, 'person-1', SCOPE)).resolves.toBe(personEntity)
+    })
+
+    it('throws 400 when the entity kind does not match', async () => {
+      const em = makeEm({ entity: personEntity })
+      await expect(requireCustomerEntity(em as any, 'person-1', SCOPE, 'company')).rejects.toMatchObject({
+        status: 400,
+        body: { error: 'Invalid entity type' },
+      })
+    })
+
+    it('throws 404 (not 403) for a cross-tenant id so existence is not leaked', async () => {
+      const em = makeEm({ entity: personEntity })
+      await expect(
+        requireCustomerEntity(em as any, 'person-1', OTHER_SCOPE, undefined, 'Customer not found'),
+      ).rejects.toMatchObject({
+        status: 404,
+        body: { error: 'Customer not found' },
+      })
+    })
+  })
+
+  describe('requireTimelineParentEntity', () => {
+    const personEntity = Object.assign(new CustomerEntity(), { id: 'person-1', kind: 'person' as const, ...SCOPE })
+    const companyEntity = Object.assign(new CustomerEntity(), { id: 'company-1', kind: 'company' as const, ...SCOPE })
+    const invalidKindEntity = Object.assign(new CustomerEntity(), { id: 'weird-1', kind: 'lead' as any, ...SCOPE })
+    const dealRecord = Object.assign(new CustomerDeal(), { id: 'deal-1', ...SCOPE })
+
+    it('returns a person or company entity', async () => {
+      const personEm = makeEm({ entity: personEntity })
+      const companyEm = makeEm({ entity: companyEntity })
+
+      await expect(requireTimelineParentEntity(personEm as any, 'person-1', SCOPE)).resolves.toBe(personEntity)
+      await expect(requireTimelineParentEntity(companyEm as any, 'company-1', SCOPE)).resolves.toBe(companyEntity)
+    })
+
+    it('throws 422 when entityId belongs to a deal record', async () => {
+      const em = makeEm({ deal: dealRecord })
+
+      await expect(requireTimelineParentEntity(em as any, 'deal-1', SCOPE)).rejects.toMatchObject({
+        status: 422,
+        body: { error: 'entityId must reference a person or company, not a deal' },
+      })
+    })
+
+    it('throws 404 when neither a customer entity nor a deal exists', async () => {
+      const em = makeEm({})
+
+      await expect(requireTimelineParentEntity(em as any, 'missing-1', SCOPE)).rejects.toMatchObject({
+        status: 404,
+        body: { error: 'Customer not found' },
+      })
+    })
+
+    it('throws 422 when the customer entity exists with an unsupported kind', async () => {
+      const em = makeEm({ entity: invalidKindEntity })
+
+      await expect(requireTimelineParentEntity(em as any, 'weird-1', SCOPE)).rejects.toMatchObject({
+        status: 422,
+        body: { error: 'entityId must reference a person or company' },
+      })
+    })
+
+    it('throws 404 (not 403) for a cross-tenant id so existence is not leaked', async () => {
+      const em = makeEm({ entity: personEntity })
+
+      await expect(requireTimelineParentEntity(em as any, 'person-1', OTHER_SCOPE)).rejects.toMatchObject({
+        status: 404,
+        body: { error: 'Customer not found' },
+      })
+    })
+  })
+
+  describe('requireDealInScope', () => {
+    const dealRecord = Object.assign(new CustomerDeal(), { id: 'deal-1', ...SCOPE })
+
+    it('returns null when no dealId is provided', async () => {
+      const em = makeEm({ deal: dealRecord })
+      await expect(
+        requireDealInScope(em as any, null, SCOPE.tenantId, SCOPE.organizationId),
+      ).resolves.toBeNull()
+    })
+
+    it('returns the deal when found in scope', async () => {
+      const em = makeEm({ deal: dealRecord })
+      await expect(
+        requireDealInScope(em as any, 'deal-1', SCOPE.tenantId, SCOPE.organizationId),
+      ).resolves.toBe(dealRecord)
+    })
+
+    it('throws "Deal not found" (not 403) for a cross-tenant id so existence is not leaked', async () => {
+      const em = makeEm({ deal: dealRecord })
+
+      await expect(
+        requireDealInScope(em as any, 'deal-1', OTHER_SCOPE.tenantId, OTHER_SCOPE.organizationId),
+      ).rejects.toMatchObject({
+        status: 400,
+        body: { error: 'Deal not found' },
+      })
+    })
+  })
+
   describe('ensureDictionaryEntry', () => {
     const createEm = () => ({
       findOne: jest.fn(),
@@ -83,16 +215,37 @@ describe('customers commands shared utilities', () => {
       expect(em.findOne).not.toHaveBeenCalled()
     })
 
-    it('throws when dictionary kind is unsupported', async () => {
+    it('throws when dictionary kind is invalid', async () => {
       const em = createEm()
       await expect(
         ensureDictionaryEntry(em as any, {
           tenantId: 't1',
           organizationId: 'o1',
-          kind: 'unsupported' as any,
+          kind: 'unsupported kind' as any,
           value: 'Hot',
         })
       ).rejects.toThrow(CrudHttpError)
+    })
+
+    it('accepts custom dictionary kind slugs', async () => {
+      const em = createEm()
+      em.findOne.mockResolvedValue(null)
+
+      await ensureDictionaryEntry(em as any, {
+        tenantId: 't1',
+        organizationId: 'o1',
+        kind: 'partner-stage',
+        value: 'Active',
+      })
+
+      expect(em.create).toHaveBeenCalledWith(
+        CustomerDictionaryEntry,
+        expect.objectContaining({
+          kind: 'partner-stage',
+          value: 'Active',
+          normalizedValue: 'active',
+        }),
+      )
     })
 
     it('updates existing entry with normalized color and icon', async () => {
@@ -260,4 +413,3 @@ describe('customers commands shared utilities', () => {
     })
   })
 })
-

@@ -9,12 +9,17 @@ import { DataTable } from '@open-mercato/ui/backend/DataTable'
 import type { ColumnDef } from '@tanstack/react-table'
 import { RowActions } from '@open-mercato/ui/backend/RowActions'
 import { Button } from '@open-mercato/ui/primitives/button'
+import { Input } from '@open-mercato/ui/primitives/input'
+import { EmailInput } from '@open-mercato/ui/primitives/email-input'
+import { PasswordInput } from '@open-mercato/ui/primitives/password-input'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@open-mercato/ui/primitives/dialog'
-import { apiCall, readApiResultOrThrow } from '@open-mercato/ui/backend/utils/apiCall'
+import { apiCall, readApiResultOrThrow, withScopedApiRequestHeaders } from '@open-mercato/ui/backend/utils/apiCall'
+import { buildOptimisticLockHeader } from '@open-mercato/ui/backend/utils/optimisticLock'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
 import { useConfirmDialog } from '@open-mercato/ui/backend/confirm-dialog'
 import { useGuardedMutation } from '@open-mercato/ui/backend/injection/useGuardedMutation'
+import { ListEmptyState } from '@open-mercato/ui/backend/filters/ListEmptyState'
 import type { FilterDef, FilterValues } from '@open-mercato/ui/backend/FilterBar'
 
 type UserRow = {
@@ -26,6 +31,7 @@ type UserRow = {
   lastLoginAt: string | null
   roles: Array<{ id: string; name: string; slug: string }>
   createdAt: string
+  updatedAt?: string | null
   personEntityId: string | null
   customerEntityId: string | null
 }
@@ -143,13 +149,11 @@ function CreateUserDialog({
             <label className="text-sm font-medium" htmlFor="create-email">
               {t('customer_accounts.admin.createUser.fields.email', 'Email')}
             </label>
-            <input
+            <EmailInput
               id="create-email"
-              type="email"
               required
               value={email}
               onChange={(event) => setEmail(event.target.value)}
-              className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               placeholder={t('customer_accounts.admin.createUser.fields.emailPlaceholder', 'user@example.com')}
             />
           </div>
@@ -157,13 +161,12 @@ function CreateUserDialog({
             <label className="text-sm font-medium" htmlFor="create-name">
               {t('customer_accounts.admin.createUser.fields.displayName', 'Display Name')}
             </label>
-            <input
+            <Input
               id="create-name"
               type="text"
               required
               value={displayName}
               onChange={(event) => setDisplayName(event.target.value)}
-              className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               placeholder={t('customer_accounts.admin.createUser.fields.displayNamePlaceholder', 'John Doe')}
             />
           </div>
@@ -171,15 +174,14 @@ function CreateUserDialog({
             <label className="text-sm font-medium" htmlFor="create-password">
               {t('customer_accounts.admin.createUser.fields.password', 'Password')}
             </label>
-            <input
+            <PasswordInput
               id="create-password"
-              type="password"
               required
               minLength={8}
               value={password}
               onChange={(event) => setPassword(event.target.value)}
-              className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               placeholder={t('customer_accounts.admin.createUser.fields.passwordPlaceholder', 'Min. 8 characters')}
+              autoComplete="new-password"
             />
           </div>
           {roleOptions.length > 0 && (
@@ -340,13 +342,16 @@ export default function CustomerAccountsPage() {
     if (!confirmed) return
     try {
       await runMutationWithContext(async () => {
-        const call = await apiCall(
-          `/api/customer_accounts/admin/users/${encodeURIComponent(user.id)}`,
-          {
-            method: 'PUT',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ isActive: nextActive }),
-          },
+        const call = await withScopedApiRequestHeaders(
+          buildOptimisticLockHeader(user.updatedAt),
+          () => apiCall(
+            `/api/customer_accounts/admin/users/${encodeURIComponent(user.id)}`,
+            {
+              method: 'PUT',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ isActive: nextActive }),
+            },
+          ),
         )
         if (!call.ok) {
           flash(t('customer_accounts.admin.error.toggleActive', 'Failed to update user status'), 'error')
@@ -376,9 +381,12 @@ export default function CustomerAccountsPage() {
     if (!confirmed) return
     try {
       await runMutationWithContext(async () => {
-        const call = await apiCall(
-          `/api/customer_accounts/admin/users/${encodeURIComponent(user.id)}`,
-          { method: 'DELETE' },
+        const call = await withScopedApiRequestHeaders(
+          buildOptimisticLockHeader(user.updatedAt),
+          () => apiCall(
+            `/api/customer_accounts/admin/users/${encodeURIComponent(user.id)}`,
+            { method: 'DELETE' },
+          ),
         )
         if (!call.ok) {
           flash(t('customer_accounts.admin.error.delete', 'Failed to delete user'), 'error')
@@ -428,8 +436,8 @@ export default function CustomerAccountsPage() {
         cell: ({ row }) => (
           <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${
             row.original.emailVerified
-              ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200'
-              : 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200'
+              ? 'bg-status-success-bg text-status-success-text'
+              : 'bg-status-warning-bg text-status-warning-text'
           }`}>
             {row.original.emailVerified
               ? t('customer_accounts.admin.verified', 'Yes')
@@ -443,8 +451,8 @@ export default function CustomerAccountsPage() {
         cell: ({ row }) => (
           <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${
             row.original.isActive
-              ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200'
-              : 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200'
+              ? 'bg-status-success-bg text-status-success-text'
+              : 'bg-status-error-bg text-status-error-text'
           }`}>
             {row.original.isActive
               ? t('customer_accounts.admin.active', 'Active')
@@ -477,22 +485,22 @@ export default function CustomerAccountsPage() {
   return (
     <Page>
       <PageBody className="space-y-4">
-        <div className="rounded-lg border border-blue-200 bg-blue-50/50 p-4 dark:border-blue-800 dark:bg-blue-950/50">
+        <div className="rounded-lg border border-status-info-border bg-status-info-bg p-4">
           <div className="flex items-start justify-between gap-4">
             <div>
-              <h3 className="text-sm font-medium text-blue-900 dark:text-blue-100">
+              <h3 className="text-sm font-medium text-status-info-text">
                 {t('customer_accounts.admin.portalInfo.title', 'Customer Portal')}
               </h3>
-              <p className="mt-1 text-sm text-blue-700 dark:text-blue-300">
+              <p className="mt-1 text-sm text-status-info-text">
                 {t('customer_accounts.admin.portalInfo.description', 'Manage customer portal accounts. Customers can self-register, log in, and access orders, quotes, and invoices through the portal.')}
               </p>
-              <p className="mt-1.5 text-xs text-blue-600 dark:text-blue-400">
+              <p className="mt-1.5 text-xs text-status-info-text">
                 {t('customer_accounts.admin.portalInfo.url', 'Portal URL: {url}', {
                   url: `${typeof window !== 'undefined' ? window.location.origin : ''}/[org-slug]/portal`,
                 })}
               </p>
-              <p className="mt-0.5 text-xs text-blue-600 dark:text-blue-400">
-                {t('customer_accounts.admin.portalInfo.credentials', 'Demo credentials: alice.johnson@example.com / password123')}
+              <p className="mt-0.5 text-xs text-status-info-text">
+                {t('customer_accounts.admin.portalInfo.credentials', 'Demo credentials: alice.johnson@example.com / Password123!')}
               </p>
             </div>
             <div className="flex shrink-0 flex-col gap-2">
@@ -522,6 +530,7 @@ export default function CustomerAccountsPage() {
           </div>
         </div>
         <DataTable<UserRow>
+          stickyActionsColumn
           title={t('customer_accounts.admin.title', 'Users')}
           actions={(
             <Button onClick={() => setCreateDialogOpen(true)}>
@@ -538,6 +547,13 @@ export default function CustomerAccountsPage() {
           onFiltersApply={handleFiltersApply}
           onFiltersClear={handleFiltersClear}
           perspective={{ tableId: 'customer_accounts.admin.users' }}
+          emptyState={(
+            <ListEmptyState
+              entityName={t('customer_accounts.admin.title', 'Users')}
+              onCreate={() => setCreateDialogOpen(true)}
+              createLabel={t('customer_accounts.admin.actions.createUser', 'Create User')}
+            />
+          )}
           onRowClick={(row) => router.push(`/backend/customer_accounts/users/${row.id}`)}
           rowActions={(row) => (
             <RowActions

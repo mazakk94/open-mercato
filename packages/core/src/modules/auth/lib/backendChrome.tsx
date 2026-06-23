@@ -18,11 +18,19 @@ import {
   convertToSectionNavGroups,
   type AdminNavItem,
 } from '@open-mercato/ui/backend/utils/nav'
+import { resolveRegisteredLucideIconNode } from '@open-mercato/ui/backend/icons/lucideRegistry'
 import { profilePathPrefixes, profileSections } from './profile-sections'
 import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
-import { resolveFeatureCheckContext } from '@open-mercato/core/modules/directory/utils/organizationScope'
+import { filterGrantsByEnabledModules } from '@open-mercato/shared/security/enabledModulesRegistry'
+import {
+  getSelectedOrganizationFromRequest,
+  resolveFeatureCheckContext,
+} from '@open-mercato/core/modules/directory/utils/organizationScope'
+import { isAllOrganizationsSelection } from '@open-mercato/core/modules/directory/constants'
+import { Organization } from '@open-mercato/core/modules/directory/data/entities'
 import { CustomEntity } from '@open-mercato/core/modules/entities/data/entities'
 import { Role } from '@open-mercato/core/modules/auth/data/entities'
+import { findOneWithDecryption } from '@open-mercato/shared/lib/encryption/find'
 import {
   applySidebarPreference,
   loadFirstRoleSidebarPreference,
@@ -106,8 +114,21 @@ async function serializeIconMarkup(icon: React.ReactNode | undefined): Promise<s
     renderToStaticMarkupPromise = import('react-dom/server')
   }
   const { renderToStaticMarkup } = await renderToStaticMarkupPromise
-  const markup = renderToStaticMarkup(<>{icon}</>)
-  return markup.trim().length > 0 ? markup : undefined
+
+  const normalizedIcon = typeof icon === 'string'
+    ? resolveRegisteredLucideIconNode(icon, 'size-4')
+    : icon
+
+  if (!normalizedIcon) return undefined
+
+  try {
+    const markup = renderToStaticMarkup(<>{normalizedIcon}</>)
+    return markup.trim().length > 0 ? markup : undefined
+  } catch {
+    // Some icon values may be client-only component references after dependency upgrades.
+    // Avoid taking down the entire nav payload because one icon cannot be rendered server-side.
+    return undefined
+  }
 }
 
 async function serializeNavItem(item: AdminNavItem): Promise<ResolvedNavItem> {
@@ -119,6 +140,7 @@ async function serializeNavItem(item: AdminNavItem): Promise<ResolvedNavItem> {
     enabled: item.enabled,
     hidden: item.hidden,
     pageContext: item.pageContext,
+    iconName: typeof item.icon === 'string' ? item.icon : undefined,
     iconMarkup: await serializeIconMarkup(item.icon),
     children: item.children ? await Promise.all(item.children.map((child) => serializeNavItem(child))) : undefined,
   }
@@ -210,6 +232,7 @@ async function serializeSectionItem(item: {
     labelKey: item.labelKey,
     href: item.href,
     order: item.order,
+    iconName: typeof item.icon === 'string' ? item.icon : undefined,
     iconMarkup: await serializeIconMarkup(item.icon),
     children: item.children ? await Promise.all(item.children.map((child) => serializeSectionItem(child))) : undefined,
   }
@@ -277,7 +300,8 @@ export async function resolveBackendChromePayload({
       })
     : { isSuperAdmin: false, features: [] }
 
-  const grantedFeatures = acl.isSuperAdmin ? ['*'] : acl.features
+  const rawGrantedFeatures = acl.isSuperAdmin ? ['*'] : acl.features
+  const grantedFeatures = filterGrantsByEnabledModules(rawGrantedFeatures)
   const featureChecker = async (features: string[]): Promise<string[]> => {
     if (!allowNavigation || !features.length) return []
     const context = {
@@ -337,13 +361,12 @@ export async function resolveBackendChromePayload({
   let userPreference: SidebarPreferencesSettings | null = null
 
   if (Array.isArray(auth.roles) && auth.roles.length > 0) {
-    const roleScope: FilterQuery<Role> = scopedTenantId
-      ? { $or: [{ tenantId: scopedTenantId }, { tenantId: null }] }
-      : { tenantId: null }
-    const roleRecords = await em.find(Role, {
-      name: { $in: auth.roles },
-      ...roleScope,
-    })
+    const roleRecords = scopedTenantId
+      ? await em.find(Role, {
+          name: { $in: auth.roles },
+          tenantId: scopedTenantId,
+        })
+      : []
     const roleIds = Array.isArray(roleRecords) ? roleRecords.map((role) => role.id) : []
     if (roleIds.length > 0) {
       rolePreference = await loadFirstRoleSidebarPreference(em, {
@@ -380,6 +403,35 @@ export async function resolveBackendChromePayload({
     ),
   )
 
+  const requestOrganizationId = request ? getSelectedOrganizationFromRequest(request) : null
+  const fallbackOrganizationId = selectedOrganizationId ?? requestOrganizationId ?? auth.orgId ?? null
+  const brandOrganizationId = scopedOrganizationId
+    ?? (fallbackOrganizationId && !isAllOrganizationsSelection(fallbackOrganizationId) ? fallbackOrganizationId : null)
+
+  let brand: BackendChromePayload['brand'] = null
+  if (brandOrganizationId && scopedTenantId) {
+    try {
+      const organization = await findOneWithDecryption(
+        em,
+        Organization,
+        { id: brandOrganizationId, tenant: scopedTenantId, deletedAt: null },
+        undefined,
+        { tenantId: scopedTenantId, organizationId: brandOrganizationId },
+      )
+      if (organization?.logoUrl) {
+        brand = {
+          name: organization.name,
+          logo: {
+            src: organization.logoUrl,
+            alt: `${organization.name} logo`,
+          },
+        }
+      }
+    } catch {
+      brand = null
+    }
+  }
+
   return {
     groups: appliedGroups.map(({ weight: _weight, ...group }) => group),
     settingsSections,
@@ -388,5 +440,6 @@ export async function resolveBackendChromePayload({
     profilePathPrefixes,
     grantedFeatures,
     roles: Array.isArray(auth.roles) ? auth.roles : [],
+    brand,
   }
 }

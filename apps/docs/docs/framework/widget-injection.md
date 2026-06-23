@@ -381,6 +381,33 @@ export const { metadata, GET, POST, PUT, DELETE } = makeCrudRoute({
 - EntityManager usage is **read-only** — no writes in enrichers
 - Non-critical enrichers fail silently (use `fallback`); set `critical: true` to propagate errors
 - Export paths automatically strip enricher fields (anything prefixed with `_`)
+- Keep `cacheableOnListHit` at its `false` default unless the enriched output is record-pure — see below
+
+### List Cache Interaction (`cacheableOnListHit`)
+
+When the opt-in CRUD list cache (`ENABLE_CRUD_API_CACHE`) is on, the factory stores the **enriched** list payload and partitions cache entries by the set of enrichers active for the caller (after ACL + tenant filtering). What happens on a cache hit depends on whether the active enrichers are cacheable:
+
+- If **every** active enricher sets `cacheableOnListHit: true`, the hit serves the stored enriched fields directly **without re-running enrichers** — this is the fast path that makes list caching actually eliminate enrichment cost.
+- Otherwise the hit **re-runs all active enrichers** and the cache stores only the base (pre-enrichment) payload, so non-cacheable enrichers always reflect current data.
+
+```ts
+const customerStatusBadge: ResponseEnricher = {
+  id: 'example.customer-status-badge',
+  targetEntity: 'customers.person',
+  cacheableOnListHit: true, // pure function of the record's own cached fields → safe on a hit
+  // ...
+}
+```
+
+The shipped `example.customer-todo-count` enricher, by contrast, reads other modules' tables, so it keeps the `false` default and re-runs on every hit.
+
+Set `cacheableOnListHit: true` **only** when the enricher's output for a record is a pure function of that record's own cached state and is invalidated together with it. Leave it `false` (the fail-closed default) for any enricher whose output depends on data the list cache does not invalidate on:
+
+- cross-module / cross-entity reads (e.g. a product image fetched for a sales line),
+- wall-clock-relative values (e.g. "days in stage"),
+- aggregates over other tables.
+
+Opting in on such an enricher would serve stale values from the shared cache entry on a hit.
 
 ### Directory Structure
 
@@ -399,7 +426,9 @@ src/modules/<module>/
 ### Built-in Injection Spots
 
 - **CRUD forms**: `crud-form:<entityId>` (automatically derived from `entityId`/`entityIds` passed to `CrudForm`). Widgets can request `placement.kind: 'group'` to render as a side-card and `column: 2` to appear in the right column. Field injection spot: `crud-form:<entityId>:fields`.
-- **Data tables**: `data-table:<tableId>` (or pass `injectionSpotId` to `DataTable`). Header/footer child spots: `:header`, `:footer`. Deep extension spots: `:columns`, `:row-actions`, `:bulk-actions`, `:filters`.
+- **Data tables**: `data-table:<tableId>` (or pass `injectionSpotId` to `DataTable`). Header/footer child spots: `:header`, `:footer`. Deep extension spots: `:columns`, `:row-actions`, `:bulk-actions`, `:filters`, `:toolbar`, `:search-trailing`.
+  - `:toolbar` renders inside the right-side actions row alongside Refresh / Filters / Columns / Export. Suitable for full-sized toolbar buttons.
+  - `:search-trailing` renders inside the `FilterBar`, immediately to the right of the search input on the same row. **Reserve it for compact triggers** — AI assistants, saved-view shortcuts, focus toggles. Full-width or multi-action toolbars belong in `:toolbar` or `:header`. The slot is automatically suppressed when the host DataTable does not render a search input. Use `Button variant="outline"` (default size, h-9, `rounded-md`) with a single leading icon plus a short caption (e.g. `AI`) so the trigger matches the search input's `h-9` row height and the toolbar's standard rounded-rectangle button radius. Resolve the spot id with `DataTableInjectionSpots.searchTrailing(tableId)` from `@open-mercato/ui/backend/injection/spotIds`.
 - **Backend record context**: `backend:record:current` (mounted once per backend page with `{ path, query }` context).
 - **Backend layout**: `backend:layout:top`, `backend:layout:footer` (top and bottom of the main backend content area).
 - **Backend sidebar**: `backend:sidebar:top`, `backend:sidebar:footer` (desktop sidebar top/bottom areas in `AppShell`).

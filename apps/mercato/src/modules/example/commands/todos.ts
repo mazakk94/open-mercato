@@ -10,13 +10,15 @@ import {
   normalizeCustomFieldValues,
 } from '@open-mercato/shared/lib/commands/helpers'
 import type { CrudEmitContext, CrudEventsConfig, CrudIndexerConfig } from '@open-mercato/shared/lib/crud/types'
+import { makeCreateRedo } from '@open-mercato/shared/lib/commands/redo'
 import { CrudHttpError } from '@open-mercato/shared/lib/crud/errors'
 import type { DataEngine } from '@open-mercato/shared/lib/data/engine'
 import type { EntityData, EntityManager, FilterQuery } from '@mikro-orm/postgresql'
 import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
 import { z } from 'zod'
 import { Todo } from '../data/entities'
-import { E } from '@/.mercato/generated/entities.ids.generated'
+
+const ENTITY_ID = 'example:todo' as const
 import type { CommandRuntimeContext } from '@open-mercato/shared/lib/commands'
 import {
   loadCustomFieldSnapshot,
@@ -26,13 +28,13 @@ import {
 
 export const todoCreateSchema = z.object({
   id: z.string().uuid().optional(),
-  title: z.string().min(1),
+  title: z.string().min(1).max(200),
   is_done: z.boolean().optional(),
 })
 
 export const todoUpdateSchema = z.object({
   id: z.string().uuid(),
-  title: z.string().min(1).optional(),
+  title: z.string().min(1).max(200).optional(),
   is_done: z.boolean().optional(),
 })
 
@@ -60,15 +62,15 @@ export const todoCrudEvents: CrudEventsConfig<Todo> = {
 }
 
 export const todoCrudIndexer: CrudIndexerConfig<Todo> = {
-  entityType: E.example.todo,
+  entityType: ENTITY_ID,
   buildUpsertPayload: (ctx: CrudEmitContext<Todo>) => ({
-    entityType: E.example.todo,
+    entityType: ENTITY_ID,
     recordId: ctx.identifiers.id,
     tenantId: ctx.identifiers.tenantId,
     organizationId: ctx.identifiers.organizationId,
   }),
   buildDeletePayload: (ctx: CrudEmitContext<Todo>) => ({
-    entityType: E.example.todo,
+    entityType: ENTITY_ID,
     recordId: ctx.identifiers.id,
     tenantId: ctx.identifiers.tenantId,
     organizationId: ctx.identifiers.organizationId,
@@ -96,7 +98,7 @@ const createTodoCommand: CommandHandler<Record<string, unknown>, Todo> = {
 
     await setCustomFieldsIfAny({
       dataEngine: de,
-      entityId: E.example.todo,
+      entityId: ENTITY_ID,
       recordId: String(todo.id),
       tenantId: scope.tenantId,
       organizationId: scope.organizationId,
@@ -160,7 +162,7 @@ const createTodoCommand: CommandHandler<Record<string, unknown>, Todo> = {
       const values = normalizeCustomFieldValues(rawValues)
       if (Object.keys(values).length) {
         await de.setCustomFields({
-          entityId: E.example.todo,
+          entityId: ENTITY_ID,
           recordId: id,
           tenantId: scope.tenantId,
           organizationId: scope.organizationId,
@@ -183,6 +185,28 @@ const createTodoCommand: CommandHandler<Record<string, unknown>, Todo> = {
       indexer: todoCrudIndexer,
     })
   },
+  redo: makeCreateRedo<Todo, SerializedTodo, Record<string, unknown>, Todo>({
+    entityClass: Todo,
+    getSnapshotId: (snapshot) => snapshot.id,
+    seedFromSnapshot: todoSeedFromSnapshot,
+    buildResult: (entity) => entity,
+    events: todoCrudEvents,
+    indexer: todoCrudIndexer,
+    afterRestore: async ({ ctx, entity, snapshot }) => {
+      if (!snapshot.custom || !Object.keys(snapshot.custom).length) return
+      const de = (ctx.container.resolve('dataEngine') as DataEngine)
+      const values = normalizeCustomFieldValues(snapshot.custom)
+      if (!Object.keys(values).length) return
+      await de.setCustomFields({
+        entityId: ENTITY_ID,
+        recordId: String(entity.id),
+        tenantId: entity.tenantId ? String(entity.tenantId) : null,
+        organizationId: entity.organizationId ? String(entity.organizationId) : null,
+        values,
+        notify: false,
+      })
+    },
+  }),
 }
 
 const updateTodoCommand: CommandHandler<Record<string, unknown>, Todo> = {
@@ -217,7 +241,7 @@ const updateTodoCommand: CommandHandler<Record<string, unknown>, Todo> = {
 
     await setCustomFieldsIfAny({
       dataEngine: de,
-      entityId: E.example.todo,
+      entityId: ENTITY_ID,
       recordId: String(todo.id),
       tenantId: scope.tenantId,
       organizationId: scope.organizationId,
@@ -303,7 +327,7 @@ const updateTodoCommand: CommandHandler<Record<string, unknown>, Todo> = {
     const customValues = normalizeCustomFieldValues(customResetValues)
     if (Object.keys(customValues).length > 0) {
       await de.setCustomFields({
-        entityId: E.example.todo,
+        entityId: ENTITY_ID,
         recordId: before.id,
         tenantId: scope.tenantId,
         organizationId: scope.organizationId,
@@ -406,7 +430,7 @@ const deleteTodoCommand: CommandHandler<{ body?: Record<string, unknown>; query?
       restored.isDone = before.is_done
       restored.tenantId = before.tenantId ?? scope.tenantId
       restored.organizationId = before.organizationId ?? scope.organizationId
-      await em.persistAndFlush(restored)
+      await em.persist(restored).flush()
     } else {
       restored = await de.createOrmEntity({
         entity: Todo,
@@ -422,7 +446,7 @@ const deleteTodoCommand: CommandHandler<{ body?: Record<string, unknown>; query?
     if (before.custom && Object.keys(before.custom).length > 0) {
       const values = normalizeCustomFieldValues(before.custom)
       await de.setCustomFields({
-        entityId: E.example.todo,
+        entityId: ENTITY_ID,
         recordId: before.id,
         tenantId: scope.tenantId,
         organizationId: scope.organizationId,
@@ -468,6 +492,16 @@ function resolveUndoScope(
     organizationId = snapshot.organizationId
   }
   return { tenantId, organizationId }
+}
+
+function todoSeedFromSnapshot(snapshot: SerializedTodo): Record<string, unknown> {
+  return {
+    id: snapshot.id,
+    title: snapshot.title,
+    isDone: snapshot.is_done,
+    tenantId: snapshot.tenantId,
+    organizationId: snapshot.organizationId,
+  }
 }
 
 function serializeTodo(todo: Todo, custom?: Record<string, unknown> | null): SerializedTodo {
@@ -532,7 +566,7 @@ async function loadTodoCustomSnapshot(
   organizationId: string | null
 ): Promise<Record<string, unknown>> {
   return await loadCustomFieldSnapshot(em, {
-    entityId: E.example.todo,
+    entityId: ENTITY_ID,
     recordId: id,
     tenantId,
     organizationId,

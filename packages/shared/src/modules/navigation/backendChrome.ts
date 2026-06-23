@@ -8,6 +8,7 @@ export type BackendChromeNavItem = {
   enabled?: boolean
   hidden?: boolean
   pageContext?: BackendChromePageContext
+  iconName?: string
   iconMarkup?: string
   children?: BackendChromeNavItem[]
 }
@@ -25,6 +26,7 @@ export type BackendChromeSectionItem = {
   labelKey?: string
   href: string
   order?: number
+  iconName?: string
   iconMarkup?: string
   children?: BackendChromeSectionItem[]
 }
@@ -37,6 +39,14 @@ export type BackendChromeSectionGroup = {
   order?: number
 }
 
+export type BackendChromeBrand = {
+  name?: string
+  logo?: {
+    src: string
+    alt?: string
+  } | null
+}
+
 export type BackendChromePayload = {
   groups: BackendChromeNavGroup[]
   settingsSections: BackendChromeSectionGroup[]
@@ -45,4 +55,5 @@ export type BackendChromePayload = {
   profilePathPrefixes: string[]
   grantedFeatures: string[]
   roles: string[]
+  brand?: BackendChromeBrand | null
 }

@@ -26,6 +26,7 @@ export type CustomerTodoRow = {
   todoDueAt?: string | null
   todoCustomValues?: Record<string, unknown> | null
   todoOrganizationId: string | null
+  todoUpdatedAt?: string | null
   organizationId: string
   tenantId: string
   createdAt: string
@@ -46,6 +47,7 @@ export type LegacyTodoDetail = {
   description: string | null
   dueAt: string | null
   organizationId: string | null
+  updatedAt: string | null
   customValues: Record<string, unknown> | null
 }
 
@@ -70,7 +72,10 @@ type CustomersContainerLike = {
 export type CanonicalTodoListResult = {
   items: CustomerTodoRow[]
   bridgeIds: Set<string>
+  total: number
 }
+
+export type ListTodosPagination = { page: number; pageSize: number }
 
 function resolveLegacyTodoSource(source: string | null | undefined): string {
   return typeof source === 'string' && source.trim().length > 0
@@ -333,6 +338,15 @@ export async function resolveLegacyTodoDetails(
           }
         }
 
+        const updatedAt = (() => {
+          const candidates = [record.updated_at, record.updatedAt]
+          for (const candidate of candidates) {
+            const parsed = parseDateValue(candidate)
+            if (parsed) return parsed
+          }
+          return null
+        })()
+
         details.set(`${source}:${rawId}`, {
           title: extractTodoTitle(record),
           isDone,
@@ -341,6 +355,7 @@ export async function resolveLegacyTodoDetails(
           description,
           dueAt,
           organizationId,
+          updatedAt,
           customValues: Object.keys(customValues).length > 0 ? customValues : null,
         })
       }
@@ -359,6 +374,7 @@ export async function listLegacyTodoRows(
   tenantId: string,
   organizationIds: string[] | null,
   entityId: string | undefined,
+  options?: { limit?: number | null },
 ): Promise<CustomerTodoRow[]> {
   const where: Record<string, unknown> = { tenantId }
   if (organizationIds && organizationIds.length > 0) {
@@ -368,10 +384,15 @@ export async function listLegacyTodoRows(
     where.entity = entityId
   }
 
-  const links = await em.find(CustomerTodoLink, where, {
+  const findOptions: Record<string, unknown> = {
     populate: ['entity'],
     orderBy: { createdAt: 'desc' },
-  })
+  }
+  if (typeof options?.limit === 'number' && Number.isFinite(options.limit) && options.limit > 0) {
+    findOptions.limit = options.limit
+  }
+
+  const links = await em.find(CustomerTodoLink, where, findOptions as any)
   const details = await resolveLegacyTodoDetails(
     queryEngine,
     links,
@@ -398,6 +419,9 @@ export async function listCanonicalTodoRows(
     entityId?: string
     includeDeleted?: boolean
     source?: string | string[] | null
+    pagination?: ListTodosPagination | null
+    searchText?: string | null
+    limit?: number | null
   },
 ): Promise<CanonicalTodoListResult> {
   const where: Record<string, unknown> = {
@@ -416,10 +440,41 @@ export async function listCanonicalTodoRows(
   if (options?.source) {
     where.source = Array.isArray(options.source) ? { $in: options.source } : options.source
   }
+  const trimmedSearch =
+    typeof options?.searchText === 'string' ? options.searchText.trim() : ''
+  if (trimmedSearch.length > 0) {
+    const pattern = `%${trimmedSearch}%`
+    where.$or = [
+      { title: { $ilike: pattern } },
+      { body: { $ilike: pattern } },
+    ]
+  }
 
-  const interactions = await em.find(CustomerInteraction, where, {
+  const findOptions: Record<string, unknown> = {
     orderBy: { createdAt: 'desc' },
-  })
+  }
+  const pagination = options?.pagination ?? null
+  if (pagination) {
+    findOptions.offset = Math.max(0, (pagination.page - 1) * pagination.pageSize)
+    findOptions.limit = pagination.pageSize
+  } else if (
+    typeof options?.limit === 'number' &&
+    Number.isFinite(options.limit) &&
+    options.limit > 0
+  ) {
+    findOptions.limit = options.limit
+  }
+
+  let interactions: CustomerInteraction[]
+  let total: number
+  if (pagination) {
+    const [rows, count] = await em.findAndCount(CustomerInteraction, where, findOptions as any)
+    interactions = rows
+    total = count
+  } else {
+    interactions = await em.find(CustomerInteraction, where, findOptions as any)
+    total = interactions.filter((interaction) => !interaction.deletedAt).length
+  }
   const activeInteractions = interactions.filter((interaction) => !interaction.deletedAt)
   const groups = new Map<string, CustomerInteraction[]>()
 
@@ -480,6 +535,7 @@ export async function listCanonicalTodoRows(
       .map((interaction) => rowByInteractionId.get(interaction.id) ?? null)
       .filter((row): row is CustomerTodoRow => !!row),
     bridgeIds: new Set(interactions.map((interaction) => interaction.id)),
+    total,
   }
 }
 
@@ -506,6 +562,7 @@ export function mapLegacyTodoLinkToRow(
     todoDueAt: detail?.dueAt ?? null,
     todoCustomValues: detail?.customValues ?? null,
     todoOrganizationId: detail?.organizationId ?? link.organizationId ?? null,
+    todoUpdatedAt: detail?.updatedAt ?? null,
     organizationId: link.organizationId,
     tenantId: link.tenantId,
     createdAt: link.createdAt.toISOString(),
@@ -551,6 +608,7 @@ export function mapInteractionRecordToTodoRow(
     todoDueAt: interaction.scheduledAt ?? null,
     todoCustomValues: Object.keys(customValues).length > 0 ? customValues : null,
     todoOrganizationId: interaction.organizationId ?? null,
+    todoUpdatedAt: interaction.updatedAt ?? null,
     organizationId: interaction.organizationId ?? '',
     tenantId: interaction.tenantId ?? '',
     createdAt: interaction.createdAt,

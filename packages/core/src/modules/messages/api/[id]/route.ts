@@ -10,6 +10,7 @@ import { getMessageObjectType } from '../../lib/message-objects-registry'
 import { getMessageTypeOrDefault } from '../../lib/message-types-registry'
 import { attachOperationMetadataHeader } from '../../lib/operationMetadata'
 import { hasOrganizationAccess, resolveMessageContext } from '../../lib/routeHelpers'
+import { resolveUserFeatures, runMessageMutationGuardAfterSuccess, runMessageMutationGuards } from '../guards'
 import {
   errorResponseSchema,
   messageDetailResponseSchema,
@@ -18,7 +19,7 @@ import {
 } from '../openapi'
 
 export const metadata = {
-  GET: { requireAuth: true, requireFeatures: ['messages.view'] },
+  GET: { requireAuth: true },
   PATCH: { requireAuth: true, requireFeatures: ['messages.compose'] },
   DELETE: { requireAuth: true, requireFeatures: ['messages.view'] },
 }
@@ -38,11 +39,17 @@ export async function GET(req: Request, { params }: { params: { id: string } }) 
   const skipMarkReadParam = url.searchParams.get('skipMarkRead')
   const skipMarkRead = skipMarkReadParam === '1'
 
-  const message = await em.findOne(Message, {
-    id: params.id,
-    tenantId: scope.tenantId,
-    deletedAt: null,
-  })
+  const message = await findOneWithDecryption(
+    em,
+    Message,
+    {
+      id: params.id,
+      tenantId: scope.tenantId,
+      deletedAt: null,
+    },
+    undefined,
+    { tenantId: scope.tenantId, organizationId: scope.organizationId },
+  )
 
   if (!message) {
     return Response.json({ error: 'Message not found' }, { status: 404 })
@@ -89,7 +96,8 @@ export async function GET(req: Request, { params }: { params: { id: string } }) 
   )
   const allRecipients = await em.find(MessageRecipient, { messageId: params.id, deletedAt: null })
 
-  const threadMessages = await em.find(
+  const threadMessages = await findWithDecryption(
+    em,
     Message,
     {
       threadId: message.threadId ?? message.id,
@@ -98,7 +106,8 @@ export async function GET(req: Request, { params }: { params: { id: string } }) 
       deletedAt: null,
       isDraft: false,
     },
-    { orderBy: { sentAt: 'ASC' } }
+    { orderBy: { sentAt: 'ASC' } },
+    { tenantId: scope.tenantId, organizationId: scope.organizationId },
   )
   const threadMessageIds = threadMessages.map((item) => item.id)
   const visibleRecipientRows = threadMessageIds.length > 0
@@ -267,6 +276,28 @@ export async function PATCH(req: Request, { params }: { params: { id: string } }
     return Response.json({ error: 'Only draft messages can be edited' }, { status: 409 })
   }
 
+  const guardResult = await runMessageMutationGuards(
+    ctx.container,
+    {
+      tenantId: scope.tenantId,
+      organizationId: scope.organizationId,
+      userId: scope.userId,
+      resourceKind: 'messages.message',
+      resourceId: message.id,
+      operation: 'update',
+      requestMethod: req.method,
+      requestHeaders: req.headers,
+      mutationPayload: input as Record<string, unknown>,
+    },
+    resolveUserFeatures(ctx.auth),
+  )
+  if (!guardResult.ok) {
+    return Response.json(
+      guardResult.errorBody ?? { error: 'Operation blocked by guard' },
+      { status: guardResult.errorStatus ?? 422 },
+    )
+  }
+
   try {
     const { logEntry } = await commandBus.execute('messages.messages.update_draft', {
       input: {
@@ -290,6 +321,16 @@ export async function PATCH(req: Request, { params }: { params: { id: string } }
     attachOperationMetadataHeader(response, logEntry, {
       resourceKind: 'messages.message',
       resourceId: message.id,
+    })
+    await runMessageMutationGuardAfterSuccess(guardResult.afterSuccessCallbacks, {
+      tenantId: scope.tenantId,
+      organizationId: scope.organizationId,
+      userId: scope.userId,
+      resourceKind: 'messages.message',
+      resourceId: message.id,
+      operation: 'update',
+      requestMethod: req.method,
+      requestHeaders: req.headers,
     })
     return response
   } catch (error) {
@@ -328,6 +369,28 @@ export async function DELETE(req: Request, { params }: { params: { id: string } 
     return Response.json({ error: 'Access denied' }, { status: 403 })
   }
 
+  const guardResult = await runMessageMutationGuards(
+    ctx.container,
+    {
+      tenantId: scope.tenantId,
+      organizationId: scope.organizationId,
+      userId: scope.userId,
+      resourceKind: 'messages.message',
+      resourceId: params.id,
+      operation: 'delete',
+      requestMethod: req.method,
+      requestHeaders: req.headers,
+      mutationPayload: null,
+    },
+    resolveUserFeatures(ctx.auth),
+  )
+  if (!guardResult.ok) {
+    return Response.json(
+      guardResult.errorBody ?? { error: 'Operation blocked by guard' },
+      { status: guardResult.errorStatus ?? 422 },
+    )
+  }
+
   try {
     const { logEntry } = await commandBus.execute('messages.messages.delete_for_actor', {
       input: {
@@ -350,6 +413,16 @@ export async function DELETE(req: Request, { params }: { params: { id: string } 
     attachOperationMetadataHeader(response, logEntry, {
       resourceKind: 'messages.message',
       resourceId: params.id,
+    })
+    await runMessageMutationGuardAfterSuccess(guardResult.afterSuccessCallbacks, {
+      tenantId: scope.tenantId,
+      organizationId: scope.organizationId,
+      userId: scope.userId,
+      resourceKind: 'messages.message',
+      resourceId: params.id,
+      operation: 'delete',
+      requestMethod: req.method,
+      requestHeaders: req.headers,
     })
     return response
   } catch (error) {

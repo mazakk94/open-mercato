@@ -3,6 +3,8 @@ import fs from 'node:fs'
 import { createRequire } from 'node:module'
 import path from 'node:path'
 import { CacheDependencyUnavailableError } from '../errors'
+import { DEFAULT_SQLITE_CACHE_PATH } from '../defaults'
+import { matchCacheKeyPattern } from '../patterns'
 
 type SqliteStatement<TResult = unknown> = {
   get(...args: unknown[]): TResult | undefined
@@ -21,6 +23,7 @@ type SqliteDatabase = {
 
 type SqliteConstructor = new (file: string) => SqliteDatabase
 type SqliteModule = SqliteConstructor | { default: SqliteConstructor }
+type SqliteStrategyOptions = { defaultTtl?: number; databaseConstructor?: SqliteConstructor }
 
 const sqliteRequire = createRequire(path.join(process.cwd(), 'package.json'))
 
@@ -32,16 +35,16 @@ const sqliteRequire = createRequire(path.join(process.cwd(), 'package.json'))
  * - cache_entries: stores cache data
  * - cache_tags: stores tag associations (many-to-many)
  */
-export function createSqliteStrategy(dbPath?: string, options?: { defaultTtl?: number }): CacheStrategy {
+export function createSqliteStrategy(dbPath?: string, options?: SqliteStrategyOptions): CacheStrategy {
   let db: SqliteDatabase | null = null
   const defaultTtl = options?.defaultTtl
-  const filePath = dbPath || process.env.CACHE_SQLITE_PATH || '.cache.db'
+  const filePath = dbPath || process.env.CACHE_SQLITE_PATH || DEFAULT_SQLITE_CACHE_PATH
 
   async function getDb(): Promise<SqliteDatabase> {
     if (db) return db
 
     try {
-      const imported = sqliteRequire('better-sqlite3') as SqliteModule
+      const imported = (options?.databaseConstructor ?? sqliteRequire('better-sqlite3')) as SqliteModule
       const Database = typeof imported === 'function' ? imported : imported.default
       
       // Ensure directory exists
@@ -51,6 +54,13 @@ export function createSqliteStrategy(dbPath?: string, options?: { defaultTtl?: n
       }
 
       db = new Database(filePath)
+
+      db.exec(`
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = NORMAL;
+        PRAGMA busy_timeout = 5000;
+        PRAGMA foreign_keys = ON;
+      `)
 
       // Create tables
       db.exec(`
@@ -81,15 +91,6 @@ export function createSqliteStrategy(dbPath?: string, options?: { defaultTtl?: n
   function isExpired(expiresAt: number | null): boolean {
     if (expiresAt === null) return false
     return Date.now() > expiresAt
-  }
-
-  function matchPattern(key: string, pattern: string): boolean {
-    const regexPattern = pattern
-      .replace(/[.+^${}()|[\]\\]/g, '\\$&')
-      .replace(/\*/g, '.*')
-      .replace(/\?/g, '.')
-    const regex = new RegExp(`^${regexPattern}$`)
-    return regex.test(key)
   }
 
   type EntryRow = { value: string; expires_at: number | null }
@@ -228,7 +229,7 @@ export function createSqliteStrategy(dbPath?: string, options?: { defaultTtl?: n
     
     if (!pattern) return allKeys
     
-    return allKeys.filter((key: string) => matchPattern(key, pattern))
+    return allKeys.filter((key: string) => matchCacheKeyPattern(key, pattern))
   }
 
   const stats = async (): Promise<{ size: number; expired: number }> => {

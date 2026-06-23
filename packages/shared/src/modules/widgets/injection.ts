@@ -164,6 +164,24 @@ export type InjectionWidgetMetadata = {
   features?: string[]
   priority?: number
   enabled?: boolean
+  /**
+   * Module IDs that MUST be enabled in `modules.ts` for this widget to be loaded.
+   * When any listed module is missing from the enabled module set, the widget is
+   * skipped at load time — its component is never imported and never rendered.
+   *
+   * Use this when a widget integrates with another module's runtime surface
+   * (for example a customers AI trigger that calls `/api/ai_assistant/...`).
+   * Feature flags alone are insufficient because a superadmin / wildcard grant
+   * may still pass the feature gate even when the dependency module is absent.
+   */
+  requiredModules?: string[]
+  /**
+   * Field ids that this widget treats as required (enforced by its own
+   * `onBeforeSave` validation). Host forms add a visual required marker to the
+   * matching fields while the widget is active. The marker is presentational
+   * only — enforcement still comes from the widget's `onBeforeSave` result.
+   */
+  requiredFields?: string[]
 }
 
 /**

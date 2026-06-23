@@ -230,7 +230,11 @@ export class CommandBus {
     }
 
     const snapshots = await this.prepareSnapshots(handler, effectiveOptions)
-    const result = await handler.execute(effectiveOptions.input, effectiveOptions.ctx)
+    const redoLogEntry = effectiveOptions.redoLogEntry ?? null
+    const result =
+      redoLogEntry && typeof handler.redo === 'function'
+        ? await handler.redo({ input: effectiveOptions.input, ctx: effectiveOptions.ctx, logEntry: redoLogEntry })
+        : await handler.execute(effectiveOptions.input, effectiveOptions.ctx)
     const afterSnapshot = await this.captureAfter(handler, effectiveOptions, result)
     const snapshotsWithAfter = { ...snapshots, after: afterSnapshot }
     const logMeta = await this.buildLog(handler, effectiveOptions, result, snapshotsWithAfter)
@@ -302,53 +306,67 @@ export class CommandBus {
       throw new Error(`Command ${log.commandId} is not undoable`)
     }
 
-    // Run beforeUndo command interceptors
-    const allInterceptors = getAllCommandInterceptorInstances()
-    let undoInterceptorMetadata = new Map<string, Record<string, unknown>>()
-    const userFeatures = allInterceptors.length
-      ? await this.resolveUserFeaturesForInterceptors(ctx)
-      : []
-    if (allInterceptors.length) {
-      const undoCtx = { input: log.commandPayload, logEntry: log, undoToken }
-      const interceptorCtx: CommandInterceptorContext = {
-        commandId: log.commandId,
-        auth: ctx.auth ?? null,
-        selectedOrganizationId: ctx.selectedOrganizationId ?? ctx.auth?.orgId ?? null,
-        container: ctx.container,
+    // Atomically claim the action-log row before running any undo side effects.
+    // Two concurrent requests holding the same undo token can both pass
+    // findByUndoToken/executionState checks; the compare-and-set below ensures
+    // only one transitions `done` -> `undoing` and proceeds, the other bails out.
+    const claimed = await service.claimForUndo(log.id)
+    if (!claimed) throw new Error('Undo token already consumed')
+
+    try {
+      // Run beforeUndo command interceptors
+      const allInterceptors = getAllCommandInterceptorInstances()
+      let undoInterceptorMetadata = new Map<string, Record<string, unknown>>()
+      const userFeatures = allInterceptors.length
+        ? await this.resolveUserFeaturesForInterceptors(ctx)
+        : []
+      if (allInterceptors.length) {
+        const undoCtx = { input: log.commandPayload, logEntry: log, undoToken }
+        const interceptorCtx: CommandInterceptorContext = {
+          commandId: log.commandId,
+          auth: ctx.auth ?? null,
+          selectedOrganizationId: ctx.selectedOrganizationId ?? ctx.auth?.orgId ?? null,
+          container: ctx.container,
+        }
+        const beforeResult = await runCommandInterceptorsBeforeUndo(
+          allInterceptors, log.commandId, undoCtx, interceptorCtx, userFeatures,
+        )
+        if (!beforeResult.ok) {
+          throw new CommandInterceptorError(beforeResult.error!.message)
+        }
+        undoInterceptorMetadata = beforeResult.metadataByInterceptor
       }
-      const beforeResult = await runCommandInterceptorsBeforeUndo(
-        allInterceptors, log.commandId, undoCtx, interceptorCtx, userFeatures,
-      )
-      if (!beforeResult.ok) {
-        throw new CommandInterceptorError(beforeResult.error!.message)
+
+      await handler.undo({
+        input: log.commandPayload as Parameters<NonNullable<typeof handler.undo>>[0]['input'],
+        ctx,
+        logEntry: log,
+      })
+      await service.markUndone(log.id, this.buildUndoTraceLog(log, ctx))
+
+      // Run afterUndo command interceptors
+      if (allInterceptors.length) {
+        const undoCtx = { input: log.commandPayload, logEntry: log, undoToken }
+        const interceptorCtx: CommandInterceptorContext = {
+          commandId: log.commandId,
+          auth: ctx.auth ?? null,
+          selectedOrganizationId: ctx.selectedOrganizationId ?? ctx.auth?.orgId ?? null,
+          container: ctx.container,
+        }
+        await runCommandInterceptorsAfterUndo(
+          allInterceptors, log.commandId, undoCtx, interceptorCtx,
+          userFeatures, undoInterceptorMetadata,
+        )
       }
-      undoInterceptorMetadata = beforeResult.metadataByInterceptor
+
+      await this.invalidateCacheAfterUndo(log, ctx)
+      await this.flushCrudSideEffects(ctx.container)
+    } catch (err) {
+      // Undo failed after claiming the row — release the claim so the action
+      // remains retryable instead of being stranded in the `undoing` state.
+      await service.releaseUndoClaim(log.id).catch(() => {})
+      throw err
     }
-
-    await handler.undo({
-      input: log.commandPayload as Parameters<NonNullable<typeof handler.undo>>[0]['input'],
-      ctx,
-      logEntry: log,
-    })
-    await service.markUndone(log.id, this.buildUndoTraceLog(log, ctx))
-
-    // Run afterUndo command interceptors
-    if (allInterceptors.length) {
-      const undoCtx = { input: log.commandPayload, logEntry: log, undoToken }
-      const interceptorCtx: CommandInterceptorContext = {
-        commandId: log.commandId,
-        auth: ctx.auth ?? null,
-        selectedOrganizationId: ctx.selectedOrganizationId ?? ctx.auth?.orgId ?? null,
-        container: ctx.container,
-      }
-      await runCommandInterceptorsAfterUndo(
-        allInterceptors, log.commandId, undoCtx, interceptorCtx,
-        userFeatures, undoInterceptorMetadata,
-      )
-    }
-
-    await this.invalidateCacheAfterUndo(log, ctx)
-    await this.flushCrudSideEffects(ctx.container)
   }
 
   private buildUndoTraceLog(log: ActionLog, ctx: CommandRuntimeContext): ActionLogCreateInput | undefined {
@@ -377,6 +395,8 @@ export class CommandBus {
       resourceId: log.resourceId ?? undefined,
       parentResourceKind: log.parentResourceKind ?? null,
       parentResourceId: log.parentResourceId ?? null,
+      relatedResourceKind: log.relatedResourceKind ?? null,
+      relatedResourceId: log.relatedResourceId ?? null,
       snapshotBefore,
       snapshotAfter,
       changes,
@@ -465,6 +485,8 @@ export class CommandBus {
       resourceId: secondary?.resourceId ?? primary?.resourceId ?? null,
       parentResourceKind: secondary?.parentResourceKind ?? primary?.parentResourceKind ?? null,
       parentResourceId: secondary?.parentResourceId ?? primary?.parentResourceId ?? null,
+      relatedResourceKind: secondary?.relatedResourceKind ?? primary?.relatedResourceKind ?? null,
+      relatedResourceId: secondary?.relatedResourceId ?? primary?.relatedResourceId ?? null,
       undoToken: secondary?.undoToken ?? primary?.undoToken ?? null,
       payload: secondary?.payload ?? primary?.payload ?? null,
       snapshotBefore: secondary?.snapshotBefore ?? primary?.snapshotBefore ?? null,
@@ -511,6 +533,8 @@ export class CommandBus {
       if ('resourceId' in metadata && metadata.resourceId != null) payload.resourceId = metadata.resourceId
       if ('parentResourceKind' in metadata && metadata.parentResourceKind != null) payload.parentResourceKind = metadata.parentResourceKind
       if ('parentResourceId' in metadata && metadata.parentResourceId != null) payload.parentResourceId = metadata.parentResourceId
+      if ('relatedResourceKind' in metadata && metadata.relatedResourceKind != null) payload.relatedResourceKind = metadata.relatedResourceKind
+      if ('relatedResourceId' in metadata && metadata.relatedResourceId != null) payload.relatedResourceId = metadata.relatedResourceId
       if ('undoToken' in metadata && metadata.undoToken != null) payload.undoToken = metadata.undoToken
       if ('payload' in metadata && metadata.payload !== undefined) payload.commandPayload = metadata.payload
       if ('snapshotBefore' in metadata && metadata.snapshotBefore !== undefined) payload.snapshotBefore = metadata.snapshotBefore

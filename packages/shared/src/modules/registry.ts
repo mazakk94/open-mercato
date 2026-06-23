@@ -4,13 +4,37 @@ import type { SyncCrudEventResult } from '../lib/crud/sync-event-types'
 import type { DashboardWidgetModule } from './dashboard/widgets'
 import type { InjectionAnyWidgetModule, ModuleInjectionTable } from './widgets/injection'
 import type { IntegrationBundle, IntegrationDefinition } from './integrations/types'
+import {
+  applyApiOverridesToManifests,
+  applyModuleOverridesToModules,
+  applyPageOverridesToManifests,
+  composeApiRouteOverrides,
+  composePageRouteOverrides,
+} from './overrides'
 
 // Context passed to dynamic metadata guards
 export type RouteVisibilityContext = { path?: string; auth?: any }
 
+/**
+ * Portal sidebar navigation hint. When declared on a portal page's metadata,
+ * the page is auto-listed in the portal sidebar (subject to RBAC) by the
+ * `/api/customer_accounts/portal/nav` endpoint.
+ *
+ * Absence of `nav` means the page is routable but not auto-listed (useful for
+ * detail pages, create forms, etc.).
+ */
+export type PortalNavMetadata = {
+  label: string
+  labelKey?: string
+  group?: 'main' | 'account'
+  order?: number
+  icon?: string
+}
+
 // Metadata you can export from page.meta.ts or directly from a server page
 export type PageMetadata = {
   requireAuth?: boolean
+  /** @deprecated Use `requireFeatures` instead — role names are mutable and can be spoofed */
   requireRoles?: readonly string[]
   // Optional fine-grained feature requirements
   requireFeatures?: readonly string[]
@@ -18,6 +42,8 @@ export type PageMetadata = {
   requireCustomerAuth?: boolean
   // Portal: require customer-specific features (checked against CustomerRbacService)
   requireCustomerFeatures?: readonly string[]
+  // Portal: optional sidebar presentation hint (auto-listed by portal nav endpoint)
+  nav?: PortalNavMetadata
   // Titles and grouping (aliases supported)
   title?: string
   titleKey?: string
@@ -66,6 +92,7 @@ export type ModuleRoute = {
   pattern?: string
   path?: string
   requireAuth?: boolean
+  /** @deprecated Use `requireFeatures` instead — role names are mutable and can be spoofed */
   requireRoles?: string[]
   // Optional fine-grained feature requirements
   requireFeatures?: string[]
@@ -73,6 +100,8 @@ export type ModuleRoute = {
   requireCustomerAuth?: boolean
   // Portal: require customer-specific features (checked against CustomerRbacService)
   requireCustomerFeatures?: string[]
+  // Portal: optional sidebar presentation hint (auto-listed by portal nav endpoint)
+  nav?: PortalNavMetadata
   title?: string
   titleKey?: string
   group?: string
@@ -106,6 +135,7 @@ export type ModuleApiRouteFile = {
   path: string
   handlers: Partial<Record<HttpMethod, ApiHandler>>
   requireAuth?: boolean
+  /** @deprecated Use `requireFeatures` instead — role names are mutable and can be spoofed */
   requireRoles?: string[]
   // Optional fine-grained feature requirements for the entire route file
   // Note: per-method feature requirements should be expressed inside metadata
@@ -184,6 +214,7 @@ export type ModuleInjectionWidgetEntry = {
   moduleId: string
   key: string
   source: 'app' | 'package'
+  widgetId?: string
   loader: () => Promise<InjectionAnyWidgetModule<any, any>>
 }
 
@@ -215,6 +246,8 @@ export type Module = {
   vector?: import('./vector').VectorModuleConfig
   // Optional: module-specific tenant setup configuration (from setup.ts)
   setup?: import('./setup').ModuleSetupConfig
+  // Optional: default encryption maps owned by the module (from encryption.ts)
+  defaultEncryptionMaps?: import('./encryption').ModuleEncryptionMap[]
   // Optional: integration marketplace declarations discovered from integration.ts
   integrations?: IntegrationDefinition[]
   bundles?: IntegrationBundle[]
@@ -222,6 +255,46 @@ export type Module = {
 
 function normPath(s: string) {
   return (s.startsWith('/') ? s : '/' + s).replace(/\/+$/, '') || '/'
+}
+
+// 0 = literal (most specific), 1 = dynamic [param], 2 = catch-all [...param] or [[...param]]
+function segmentSpecificity(seg: string): 0 | 1 | 2 {
+  if (seg.startsWith('[[...') || seg.startsWith('[...')) return 2
+  if (seg.startsWith('[')) return 1
+  return 0
+}
+
+function compareRouteSpecificity(aPattern: string, bPattern: string): number {
+  const aSegs = aPattern.split('/')
+  const bSegs = bPattern.split('/')
+  const len = Math.max(aSegs.length, bSegs.length)
+  for (let i = 0; i < len; i++) {
+    const av = i < aSegs.length ? segmentSpecificity(aSegs[i]) : -1
+    const bv = i < bSegs.length ? segmentSpecificity(bSegs[i]) : -1
+    if (av !== bv) return av - bv
+  }
+  return 0
+}
+
+export function sortRoutesBySpecificity<T extends { pattern?: string; path?: string }>(routes: T[]): T[] {
+  return [...routes].sort((a, b) =>
+    compareRouteSpecificity(a.pattern ?? a.path ?? '/', b.pattern ?? b.path ?? '/'),
+  )
+}
+
+// Memoized per-array sorted view, so direct callers (e.g., the Next.js catch-all
+// routes that import generated `frontendRoutes`/`backendRoutes`/`apiRoutes`
+// arrays) match against a specificity-sorted view even if they never call
+// `register*RouteManifests`. Keyed by array reference; generated arrays are
+// module-level constants so this caches once per process.
+const sortedRoutesCache = new WeakMap<object, readonly unknown[]>()
+
+function ensureSortedRoutes<T extends { pattern?: string; path?: string }>(routes: readonly T[]): readonly T[] {
+  const cached = sortedRoutesCache.get(routes) as readonly T[] | undefined
+  if (cached) return cached
+  const sorted = sortRoutesBySpecificity([...routes])
+  sortedRoutesCache.set(routes, sorted)
+  return sorted
 }
 
 export function matchRoutePattern(pattern: string, pathname: string): RouteMatchParams | undefined {
@@ -251,7 +324,7 @@ export function matchRoutePattern(pattern: string, pathname: string): RouteMatch
       if (i >= uSegs.length) return undefined
       params[mDyn[1]] = uSegs[i]
     } else {
-      if (i >= uSegs.length || uSegs[i] !== seg) return undefined
+      if (i >= uSegs.length || uSegs[i].toLowerCase() !== seg.toLowerCase()) return undefined
     }
   }
   if (i !== uSegs.length) return undefined
@@ -306,7 +379,7 @@ export function findRouteManifestMatch<T extends { pattern?: string; path?: stri
   routes: T[],
   pathname: string
 ): { route: T; params: RouteMatchParams } | undefined {
-  for (const route of routes) {
+  for (const route of ensureSortedRoutes(routes)) {
     const params = matchRoutePattern(route.pattern ?? route.path ?? '/', pathname)
     if (params) {
       return { route, params }
@@ -319,7 +392,7 @@ export function findApiRouteManifestMatch<T extends { path: string; methods: Htt
   method: HttpMethod,
   pathname: string
 ): { route: T; params: RouteMatchParams } | undefined {
-  for (const route of routes) {
+  for (const route of ensureSortedRoutes(routes)) {
     if (!route.methods.includes(method)) continue
     const params = matchRoutePattern(route.path, pathname)
     if (params) {
@@ -331,11 +404,47 @@ export function findApiRouteManifestMatch<T extends { path: string; methods: Htt
 let _backendRouteManifests: BackendRouteManifestEntry[] | null = null
 
 export function registerBackendRouteManifests(routes: BackendRouteManifestEntry[]) {
-  _backendRouteManifests = routes
+  const pageOverrides = composePageRouteOverrides()
+  const finalRoutes = Object.keys(pageOverrides).length === 0
+    ? routes
+    : applyPageOverridesToManifests(routes, pageOverrides, 'backend')
+  _backendRouteManifests = sortRoutesBySpecificity(finalRoutes)
 }
 
 export function getBackendRouteManifests(): BackendRouteManifestEntry[] {
   return _backendRouteManifests ?? []
+}
+
+let _frontendRouteManifests: FrontendRouteManifestEntry[] | null = null
+
+export function registerFrontendRouteManifests(routes: FrontendRouteManifestEntry[]) {
+  const pageOverrides = composePageRouteOverrides()
+  const finalRoutes = Object.keys(pageOverrides).length === 0
+    ? routes
+    : applyPageOverridesToManifests(routes, pageOverrides, 'frontend')
+  _frontendRouteManifests = sortRoutesBySpecificity(finalRoutes)
+}
+
+export function getFrontendRouteManifests(): FrontendRouteManifestEntry[] {
+  return _frontendRouteManifests ?? []
+}
+
+let _apiRouteManifests: ApiRouteManifestEntry[] | null = null
+
+export function registerApiRouteManifests(routes: ApiRouteManifestEntry[]) {
+  // Apply any `entry.overrides.routes.api` overrides registered through the
+  // unified `modules.ts` dispatcher or programmatic API before storing the
+  // manifest. The composer is cheap and returns an empty object when no
+  // overrides exist, so this is a no-op for apps that do not opt in.
+  const routeOverrides = composeApiRouteOverrides()
+  const finalRoutes = Object.keys(routeOverrides).length === 0
+    ? routes
+    : applyApiOverridesToManifests(routes, routeOverrides)
+  _apiRouteManifests = sortRoutesBySpecificity(finalRoutes)
+}
+
+export function getApiRouteManifests(): ApiRouteManifestEntry[] {
+  return _apiRouteManifests ?? []
 }
 
 // CLI modules registry - shared between CLI and module workers
@@ -345,7 +454,7 @@ export function registerCliModules(modules: Module[]) {
   if (_cliModules !== null && process.env.NODE_ENV === 'development') {
     console.debug('[Bootstrap] CLI modules re-registered (this may occur during HMR)')
   }
-  _cliModules = modules
+  _cliModules = applyModuleOverridesToModules(modules)
 }
 
 export function getCliModules(): Module[] {
@@ -355,6 +464,33 @@ export function getCliModules(): Module[] {
 
 export function hasCliModules(): boolean {
   return _cliModules !== null && _cliModules.length > 0
+}
+
+export function getDefaultEncryptionMaps(modules: Module[]): import('./encryption').ModuleEncryptionMap[] {
+  const byEntityId = new Map<string, { moduleId: string; map: import('./encryption').ModuleEncryptionMap }>()
+
+  for (const mod of modules) {
+    for (const entry of mod.defaultEncryptionMaps ?? []) {
+      const previous = byEntityId.get(entry.entityId)
+      if (previous) {
+        throw new Error(
+          `[registry] Duplicate default encryption map for "${entry.entityId}" declared by "${previous.moduleId}" and "${mod.id}"`
+        )
+      }
+      byEntityId.set(entry.entityId, {
+        moduleId: mod.id,
+        map: {
+          entityId: entry.entityId,
+          fields: entry.fields.map((field) => ({
+            field: field.field,
+            hashField: field.hashField ?? null,
+          })),
+        },
+      })
+    }
+  }
+
+  return Array.from(byEntityId.values(), ({ map }) => map)
 }
 
 function ensureLazyHandler<T extends (...args: any[]) => any>(

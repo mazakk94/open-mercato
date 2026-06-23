@@ -2,7 +2,7 @@
 
 import * as React from 'react'
 import type { DashboardWidgetComponentProps } from '@open-mercato/shared/modules/dashboard/widgets'
-import { apiCall } from '@open-mercato/ui/backend/utils/apiCall'
+import { useWidgetData, type WidgetDataFetcher } from '@open-mercato/ui/backend/dashboard/widgetData'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
 import { PieChart, type PieChartDataItem } from '@open-mercato/ui/backend/charts'
 import {
@@ -10,10 +10,17 @@ import {
   InlineDateRangeSelect,
   type DateRangePreset,
 } from '@open-mercato/ui/backend/date-range'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@open-mercato/ui/primitives/select'
 import { DEFAULT_SETTINGS, hydrateSettings, type OrdersByStatusSettings } from './config'
 import type { WidgetDataResponse } from '../../../services/widgetDataService'
 
-async function fetchOrdersByStatusData(settings: OrdersByStatusSettings): Promise<WidgetDataResponse> {
+async function fetchOrdersByStatusData(settings: OrdersByStatusSettings, fetchWidgetData: WidgetDataFetcher): Promise<WidgetDataResponse> {
   const body = {
     entityType: 'sales:orders',
     metric: {
@@ -29,18 +36,7 @@ async function fetchOrdersByStatusData(settings: OrdersByStatusSettings): Promis
     },
   }
 
-  const call = await apiCall<WidgetDataResponse>('/api/dashboards/widgets/data', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  })
-
-  if (!call.ok) {
-    const errorMsg = (call.result as Record<string, unknown>)?.error
-    throw new Error(typeof errorMsg === 'string' ? errorMsg : 'Failed to fetch orders by status data')
-  }
-
-  return call.result as WidgetDataResponse
+  return fetchWidgetData<WidgetDataResponse>(body)
 }
 
 const ORDER_STATUS_KEYS: Record<string, string> = {
@@ -75,12 +71,13 @@ const OrdersByStatusWidget: React.FC<DashboardWidgetComponentProps<OrdersByStatu
   const [loading, setLoading] = React.useState(true)
   const [error, setError] = React.useState<string | null>(null)
 
+  const fetchWidgetData = useWidgetData()
   const refresh = React.useCallback(async () => {
     onRefreshStateChange?.(true)
     setLoading(true)
     setError(null)
     try {
-      const result = await fetchOrdersByStatusData(hydrated)
+      const result = await fetchOrdersByStatusData(hydrated, fetchWidgetData)
       const chartData = result.data.map((item) => ({
         name: formatStatusLabel(item.groupKey as string | null, t),
         value: item.value ?? 0,
@@ -93,7 +90,7 @@ const OrdersByStatusWidget: React.FC<DashboardWidgetComponentProps<OrdersByStatu
       setLoading(false)
       onRefreshStateChange?.(false)
     }
-  }, [hydrated, onRefreshStateChange, t])
+  }, [hydrated, fetchWidgetData, onRefreshStateChange, t])
 
   React.useEffect(() => {
     refresh().catch(() => {})
@@ -115,15 +112,18 @@ const OrdersByStatusWidget: React.FC<DashboardWidgetComponentProps<OrdersByStatu
           >
             {t('dashboards.analytics.settings.chartVariant', 'Chart Style')}
           </label>
-          <select
-            id="orders-by-status-variant"
-            className="w-full rounded-md border bg-background px-2 py-1 text-sm text-foreground focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+          <Select
             value={hydrated.variant}
-            onChange={(e) => onSettingsChange({ ...hydrated, variant: e.target.value as 'pie' | 'donut' })}
+            onValueChange={(value) => onSettingsChange({ ...hydrated, variant: value as 'pie' | 'donut' })}
           >
-            <option value="donut">{t('dashboards.analytics.chartVariant.donut', 'Donut')}</option>
-            <option value="pie">{t('dashboards.analytics.chartVariant.pie', 'Pie')}</option>
-          </select>
+            <SelectTrigger id="orders-by-status-variant" size="sm">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="donut">{t('dashboards.analytics.chartVariant.donut', 'Donut')}</SelectItem>
+              <SelectItem value="pie">{t('dashboards.analytics.chartVariant.pie', 'Pie')}</SelectItem>
+            </SelectContent>
+          </Select>
         </div>
       </div>
     )

@@ -7,6 +7,13 @@ import { DictionarySelectControl } from '@open-mercato/core/modules/dictionaries
 import { AppearanceSelector } from '@open-mercato/core/modules/dictionaries/components/AppearanceSelector'
 import { AttachmentsSection, TagsSection, type TagOption, type TagsSectionLabels } from '@open-mercato/ui/backend/detail'
 import { Button } from '@open-mercato/ui/primitives/button'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@open-mercato/ui/primitives/select'
 import { E } from '#generated/entities.ids.generated'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
 import { useOrganizationScopeVersion } from '@open-mercato/shared/lib/frontend/useOrganizationScope'
@@ -45,8 +52,10 @@ export type ResourcesResourceFormConfig = {
 
 export function useResourcesResourceFormConfig(options: {
   tagsSection?: ResourceTagsSectionConfig
+  selectedResourceTypeId?: string | null
+  selectedCapacityUnit?: { value: string; label: string; color?: string | null; icon?: string | null } | null
 } = {}): ResourcesResourceFormConfig {
-  const { tagsSection } = options
+  const { selectedCapacityUnit, selectedResourceTypeId, tagsSection } = options
   const t = useT()
   const scopeVersion = useOrganizationScopeVersion()
   const [resourceTypes, setResourceTypes] = React.useState<ResourceTypeRow[]>([])
@@ -72,6 +81,37 @@ export function useResourcesResourceFormConfig(options: {
     loadResourceTypes()
     return () => { cancelled = true }
   }, [scopeVersion])
+
+  React.useEffect(() => {
+    const selectedId = typeof selectedResourceTypeId === 'string' && selectedResourceTypeId.trim().length
+      ? selectedResourceTypeId.trim()
+      : null
+    if (!selectedId) return
+    if (resourceTypes.some((type) => type.id === selectedId)) return
+    const selectedResourceTypeLookupId = selectedId
+    let cancelled = false
+    async function loadSelectedResourceType() {
+      try {
+        const call = await apiCall<ResourceTypesResponse>(
+          `/api/resources/resource-types?ids=${encodeURIComponent(selectedResourceTypeLookupId)}&pageSize=1`,
+        )
+        const entry = Array.isArray(call.result?.items) ? call.result.items[0] : null
+        const entryId = typeof entry?.id === 'string' ? entry.id : null
+        const entryName = typeof entry?.name === 'string' ? entry.name : null
+        if (!entryId || !entryName) return
+        if (!cancelled) {
+          setResourceTypes((prev) => {
+            if (prev.some((type) => type.id === entryId)) return prev
+            return [{ id: entryId, name: entryName }, ...prev]
+          })
+        }
+      } catch {
+        if (!cancelled) setResourceTypes((prev) => prev)
+      }
+    }
+    loadSelectedResourceType()
+    return () => { cancelled = true }
+  }, [resourceTypes, selectedResourceTypeId])
 
   React.useEffect(() => {
     let cancelled = false
@@ -130,58 +170,69 @@ export function useResourcesResourceFormConfig(options: {
         id: 'resourceTypeId',
         label: t('resources.resources.form.fields.type', 'Resource type'),
         type: 'custom',
-        component: ({ value, setValue, setFormValue, disabled }) => (
-          <div className="flex items-center gap-2">
-            <select
-              className="h-9 w-full rounded border px-2 text-sm"
-              value={typeof value === 'string' ? value : ''}
-              onChange={(event) => {
-                const next = event.target.value || ''
-                setValue(next)
-                if (setFormValue) {
-                  setFormValue('customFieldsetCode', resolveFieldsetCode(next || null))
-                }
-              }}
-              data-crud-focus-target=""
-              disabled={disabled}
-            >
-              <option value="">{t('ui.forms.select.emptyOption', '—')}</option>
-              {resourceTypes.map((type) => (
-                <option key={type.id} value={type.id}>
-                  {type.name}
-                </option>
-              ))}
-            </select>
-            <Button
-              asChild
-              type="button"
-              variant="ghost"
-              size="icon"
-              className="shrink-0"
-              title={t('resources.resources.form.fields.type.manage', 'Manage resource types')}
-              aria-label={t('resources.resources.form.fields.type.manage', 'Manage resource types')}
-              disabled={disabled}
-            >
-              <Link href="/backend/resources/resource-types">
-                <Settings className="h-4 w-4" aria-hidden />
-              </Link>
-            </Button>
-            <Button
-              asChild
-              type="button"
-              variant="ghost"
-              size="icon"
-              className="shrink-0"
-              title={t('resources.resources.form.fields.type.add', 'Add resource type')}
-              aria-label={t('resources.resources.form.fields.type.add', 'Add resource type')}
-              disabled={disabled}
-            >
-              <Link href="/backend/resources/resource-types/create">
-                <Plus className="h-4 w-4" aria-hidden />
-              </Link>
-            </Button>
-          </div>
-        ),
+        component: ({ value, setValue, setFormValue, disabled }) => {
+          const selectedValue = typeof value === 'string' ? value : ''
+          const selectedOption = resourceTypes.find((type) => type.id === selectedValue)
+          const optionsKey = resourceTypes.map((type) => `${type.id}:${type.name}`).join('\0')
+
+          return (
+            <div className="flex items-center gap-2">
+              <Select
+                key={`resource-type:${selectedValue}:${optionsKey}`}
+                value={selectedValue}
+                onValueChange={(next) => {
+                  const value = next || ''
+                  setValue(value)
+                  if (setFormValue) {
+                    setFormValue('customFieldsetCode', resolveFieldsetCode(value || null))
+                  }
+                }}
+                disabled={disabled}
+              >
+                <SelectTrigger data-crud-focus-target="">
+                  <SelectValue placeholder={t('ui.forms.select.emptyOption', '—')}>
+                    {selectedOption?.name}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  {resourceTypes.map((type) => (
+                    <SelectItem key={type.id} value={type.id}>
+                      {type.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Button
+                asChild
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="shrink-0"
+                title={t('resources.resources.form.fields.type.manage', 'Manage resource types')}
+                aria-label={t('resources.resources.form.fields.type.manage', 'Manage resource types')}
+                disabled={disabled}
+              >
+                <Link href="/backend/resources/resource-types">
+                  <Settings className="h-4 w-4" aria-hidden />
+                </Link>
+              </Button>
+              <Button
+                asChild
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="shrink-0"
+                title={t('resources.resources.form.fields.type.add', 'Add resource type')}
+                aria-label={t('resources.resources.form.fields.type.add', 'Add resource type')}
+                disabled={disabled}
+              >
+                <Link href="/backend/resources/resource-types/create">
+                  <Plus className="h-4 w-4" aria-hidden />
+                </Link>
+              </Button>
+            </div>
+          )
+        },
       },
       {
         id: 'capacity',
@@ -210,6 +261,7 @@ export function useResourcesResourceFormConfig(options: {
               value={typeof value === 'string' ? value : null}
               onChange={(next) => setValue(next ?? '')}
               selectClassName="w-full"
+              seedOptions={selectedCapacityUnit ? [selectedCapacityUnit] : undefined}
             />
           )
         },
@@ -248,6 +300,7 @@ export function useResourcesResourceFormConfig(options: {
     capacityUnitDictionaryId,
     resolveFieldsetCode,
     resourceTypes,
+    selectedCapacityUnit,
     t,
   ])
 
@@ -307,6 +360,7 @@ export type ResourcesResourceFormProps = {
   embedded?: boolean
   successRedirect?: string
   initialValues?: Record<string, unknown>
+  optimisticLockUpdatedAt?: string | null
   onSubmit: (values: Record<string, unknown>) => Promise<void>
   onDelete?: () => Promise<void>
   isLoading?: boolean
@@ -323,6 +377,7 @@ export function ResourcesResourceForm(props: ResourcesResourceFormProps) {
     embedded = false,
     successRedirect,
     initialValues,
+    optimisticLockUpdatedAt,
     onSubmit,
     onDelete,
     isLoading,
@@ -359,6 +414,7 @@ export function ResourcesResourceForm(props: ResourcesResourceFormProps) {
       fields={formConfig.fields}
       groups={groups}
       initialValues={initialValues}
+      optimisticLockUpdatedAt={optimisticLockUpdatedAt}
       entityId={E.resources.resources_resource}
       customFieldsetBindings={{ [E.resources.resources_resource]: { valueKey: 'customFieldsetCode' } }}
       onSubmit={onSubmit}

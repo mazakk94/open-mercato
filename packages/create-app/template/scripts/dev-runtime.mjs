@@ -1,7 +1,7 @@
-import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import spawn from 'cross-spawn'
 import {
   createRuntimeNoiseFilter,
   isStatelessRuntimeNoiseLine,
@@ -22,9 +22,51 @@ function resolveSplashHelpersImport() {
   throw new Error('Unable to resolve dev splash helpers module')
 }
 
+function resolveSpawnUtilsImport() {
+  const candidates = [
+    new URL('./dev-spawn-utils.mjs', import.meta.url),
+    new URL('../../../scripts/dev-spawn-utils.mjs', import.meta.url),
+  ]
+
+  for (const candidate of candidates) {
+    if (fs.existsSync(fileURLToPath(candidate))) {
+      return candidate.href
+    }
+  }
+
+  throw new Error('Unable to resolve dev spawn utils module')
+}
+
 function isEnabledEnvFlag(value) {
   if (typeof value !== 'string') return false
   return ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase())
+}
+
+function parseEnvBooleanToken(value) {
+  if (typeof value !== 'string') return null
+  const normalized = value.trim().toLowerCase()
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true
+  if (['0', 'false', 'no', 'off'].includes(normalized)) return false
+  return null
+}
+
+function parsePositiveIntegerEnv(value) {
+  if (typeof value !== 'string') return null
+  const parsed = Number.parseInt(value.trim(), 10)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null
+}
+
+function resolveAutoSpawnEnabled(env, legacyName, aliasedName) {
+  const legacy = parseEnvBooleanToken(env[legacyName])
+  if (legacy !== null) return legacy
+  const aliased = parseEnvBooleanToken(env[aliasedName])
+  if (aliased !== null) return aliased
+  return true
+}
+
+function resolveAutoSpawnMode(env, legacyName, aliasedName, lazyName) {
+  if (!resolveAutoSpawnEnabled(env, legacyName, aliasedName)) return 'off'
+  return parseEnvBooleanToken(env[lazyName]) === true ? 'lazy' : 'eager'
 }
 
 const {
@@ -40,19 +82,28 @@ const {
   stripAnsi,
   wrapListLines,
 } = await import(resolveSplashHelpersImport())
+const { resolveProjectBinary, resolveSpawnCommand } = await import(resolveSpawnUtilsImport())
 
-const command = process.platform === 'win32' ? 'mercato.cmd' : 'mercato'
+const command = resolveProjectBinary(process.platform === 'win32' ? 'mercato.cmd' : 'mercato')
 const classic = process.argv.includes('--classic') || isEnabledEnvFlag(process.env.OM_DEV_CLASSIC)
 const verbose = !classic && (process.argv.includes('--verbose') || process.env.MERCATO_DEV_OUTPUT === 'verbose')
 const rawPassthrough = classic || verbose
 const interactiveLogToggle = !rawPassthrough && process.stdin.isTTY && process.stdout.isTTY && process.env.CI !== 'true'
 const splashChildStateFile = process.env.OM_DEV_SPLASH_CHILD_STATE_FILE?.trim() || null
+const warmupReadyFile = process.env.OM_DEV_WARMUP_READY_FILE?.trim()
+  || (splashChildStateFile ? `${splashChildStateFile}.warmup-ready` : null)
 const splashMode = process.env.OM_DEV_SPLASH_MODE?.trim() || 'dev'
 const setupSplashMode = splashMode === 'setup'
 const startupSplashPhase = setupSplashMode ? 'Project setup is in progress...' : 'Installation and first compilation is in progress...'
-const runtimeProgressTotal = setupSplashMode ? 5 : 4
-const runtimeProgressCurrent = setupSplashMode ? 4 : 0
-const runtimeReadyProgressCurrent = setupSplashMode ? 5 : 4
+const configuredRuntimeProgressTotal = parsePositiveIntegerEnv(process.env.OM_DEV_SPLASH_STAGE_TOTAL)
+const configuredRuntimeProgressCurrent = parsePositiveIntegerEnv(process.env.OM_DEV_SPLASH_STAGE_CURRENT)
+const runtimeProgressTotal = configuredRuntimeProgressTotal ?? (setupSplashMode ? 5 : 4)
+const runtimeProgressCurrent = configuredRuntimeProgressCurrent ?? (setupSplashMode ? 4 : 0)
+const runtimeReadyProgressCurrent = Math.max(runtimeProgressCurrent, runtimeProgressTotal)
+const runtimeWarmupProgressCurrent = Math.max(
+  runtimeProgressCurrent,
+  Math.min(runtimeReadyProgressCurrent, Math.max(0, runtimeProgressTotal - 1)),
+)
 const children = new Set()
 let shuttingDown = false
 let logsVisible = false
@@ -67,6 +118,11 @@ const CYAN_BORDER = '\u001B[46m\u001B[30m'
 const ERROR_BANNER = '\u001B[41m\u001B[97m'
 const warmupRequestTimeoutsMs = [45000, 120000]
 const maxWarmupRetryAttempts = 3
+const backgroundServiceModes = {
+  workers: resolveAutoSpawnMode(process.env, 'AUTO_SPAWN_WORKERS', 'OM_AUTO_SPAWN_WORKERS', 'OM_AUTO_SPAWN_WORKERS_LAZY'),
+  scheduler: resolveAutoSpawnMode(process.env, 'AUTO_SPAWN_SCHEDULER', 'OM_AUTO_SPAWN_SCHEDULER', 'OM_AUTO_SPAWN_SCHEDULER_LAZY'),
+}
+const shutdownNoticeOwnedByParent = process.env.OM_DEV_SHUTDOWN_NOTICE_OWNER === 'parent'
 const splashState = {
   mode: splashMode,
   phase: startupSplashPhase,
@@ -82,6 +138,8 @@ const splashState = {
   packageNames: [],
   workerQueues: [],
   schedulerActive: false,
+  workerMode: backgroundServiceModes.workers,
+  schedulerMode: backgroundServiceModes.scheduler,
   progressCurrent: runtimeProgressCurrent,
   progressTotal: runtimeProgressTotal,
   progressPercent: 0,
@@ -104,6 +162,8 @@ const runtimeSummaryState = {
   packageNames: [],
   workerQueues: [],
   schedulerActive: false,
+  workerMode: backgroundServiceModes.workers,
+  schedulerMode: backgroundServiceModes.scheduler,
   packagesPrinted: false,
   workersPrinted: false,
   lastWorkersSignature: '',
@@ -116,10 +176,37 @@ const runtimeWarmupState = {
   failed: false,
   promise: null,
   retryTimer: null,
+  abortController: null,
+  generation: 0,
   retryAttempts: 0,
   tenantId: readNonEmptyEnvValue('OM_DEV_WARMUP_TENANT_ID') ?? null,
   tenantLookupAttempted: false,
 }
+
+function clearWarmupReadyFile() {
+  if (!warmupReadyFile) return
+  try {
+    fs.rmSync(warmupReadyFile, { force: true })
+  } catch {
+    // Warmup readiness is best-effort; terminal status remains authoritative.
+  }
+}
+
+function writeWarmupReadyFile(reason) {
+  if (!warmupReadyFile) return
+  try {
+    fs.mkdirSync(path.dirname(warmupReadyFile), { recursive: true })
+    fs.writeFileSync(warmupReadyFile, `${JSON.stringify({
+      ready: true,
+      reason,
+      at: new Date().toISOString(),
+    }, null, 2)}\n`)
+  } catch {
+    // Warmup readiness is best-effort; background services can still run without it.
+  }
+}
+
+clearWarmupReadyFile()
 
 function printCompactSummary(icon, title, lines) {
   if (!Array.isArray(lines) || lines.length === 0) return
@@ -127,6 +214,22 @@ function printCompactSummary(icon, title, lines) {
   for (const line of lines) {
     console.log(`   ${line}`)
   }
+}
+
+function formatBackgroundServiceMode(modes = runtimeSummaryState) {
+  const activeModes = []
+  if (modes.workerMode !== 'off') activeModes.push(['workers', modes.workerMode])
+  if (modes.schedulerMode !== 'off') activeModes.push(['scheduler', modes.schedulerMode])
+  if (activeModes.length === 0) return 'off'
+
+  const uniqueModes = new Set(activeModes.map(([, mode]) => mode))
+  if (uniqueModes.size === 1) return activeModes[0][1]
+
+  return activeModes.map(([service, mode]) => `${service} ${mode}`).join(', ')
+}
+
+function formatBackgroundServiceStatus(action = 'Starting background services', modes = runtimeSummaryState) {
+  return `${action} (${formatBackgroundServiceMode(modes)})`
 }
 
 function loadRuntimePackageNames() {
@@ -152,6 +255,8 @@ function updateRuntimeSummaryState() {
     packageNames: runtimeSummaryState.packageNames,
     workerQueues: runtimeSummaryState.workerQueues,
     schedulerActive: runtimeSummaryState.schedulerActive,
+    workerMode: runtimeSummaryState.workerMode,
+    schedulerMode: runtimeSummaryState.schedulerMode,
   })
 }
 
@@ -177,6 +282,8 @@ function printBackgroundServicesSummary() {
 
   const signature = JSON.stringify({
     schedulerActive: runtimeSummaryState.schedulerActive,
+    workerMode: runtimeSummaryState.workerMode,
+    schedulerMode: runtimeSummaryState.schedulerMode,
     workerQueues: runtimeSummaryState.workerQueues,
   })
 
@@ -188,7 +295,7 @@ function printBackgroundServicesSummary() {
   runtimeSummaryState.workersPrinted = true
   printCompactSummary(
     '⚙️',
-    `Background services (${detailItems.length})`,
+    `Background services (${formatBackgroundServiceMode()}, ${detailItems.length} active)`,
     detailItems.map((item, index) => `${index === 0 ? '🕒' : '🧵'} ${item}`),
   )
 }
@@ -199,6 +306,32 @@ function initializeRuntimeSummary() {
 }
 
 function captureBackgroundServiceLine(line) {
+  if (
+    line.startsWith('[server] Lazy worker auto-spawn enabled')
+    || line.startsWith('[lazy-supervisor] Watching')
+    || line.startsWith('[lazy-supervisor] Pending job detected')
+  ) {
+    runtimeSummaryState.workerMode = 'lazy'
+    updateRuntimeSummaryState()
+    return true
+  }
+
+  if (
+    line === '[server] Starting workers for all queues...'
+    || line === '[server] Eager worker auto-spawn enabled - starting workers for all queues...'
+    || line.startsWith('🚀 Running queue:worker')
+  ) {
+    runtimeSummaryState.workerMode = 'eager'
+    updateRuntimeSummaryState()
+    return true
+  }
+
+  if (line.startsWith('[server] Lazy scheduler auto-spawn enabled')) {
+    runtimeSummaryState.schedulerMode = 'lazy'
+    updateRuntimeSummaryState()
+    return true
+  }
+
   const queuesMatch = line.match(/^\[worker\] Starting workers for all queues: (.+)$/)
   if (queuesMatch) {
     const queueNames = queuesMatch[1].split(',').map((item) => item.trim()).filter(Boolean)
@@ -225,7 +358,24 @@ function captureBackgroundServiceLine(line) {
     return true
   }
 
-  if (line === '[server] Starting scheduler polling engine...' || line.startsWith('✓ Local scheduler started')) {
+  if (
+    line === '[server] Starting scheduler polling engine...'
+    || line === '[server] Eager scheduler auto-spawn enabled - starting scheduler polling engine...'
+    || line.startsWith('🚀 Running scheduler:start')
+  ) {
+    runtimeSummaryState.schedulerMode = 'eager'
+    runtimeSummaryState.schedulerActive = true
+    updateRuntimeSummaryState()
+    return true
+  }
+
+  if (
+    line === '[lazy-scheduler] Enabled schedule detected - starting scheduler polling engine.'
+    || line.startsWith('✓ Local scheduler started')
+  ) {
+    if (line === '[lazy-scheduler] Enabled schedule detected - starting scheduler polling engine.') {
+      runtimeSummaryState.schedulerMode = 'lazy'
+    }
     runtimeSummaryState.schedulerActive = true
     updateRuntimeSummaryState()
     return true
@@ -299,6 +449,8 @@ function updateSplashState(patch) {
   if (Array.isArray(patch.packageNames)) splashState.packageNames = patch.packageNames
   if (Array.isArray(patch.workerQueues)) splashState.workerQueues = patch.workerQueues
   if (typeof patch.schedulerActive === 'boolean') splashState.schedulerActive = patch.schedulerActive
+  if (typeof patch.workerMode === 'string') splashState.workerMode = patch.workerMode
+  if (typeof patch.schedulerMode === 'string') splashState.schedulerMode = patch.schedulerMode
   if (typeof patch.progressCurrent === 'number') splashState.progressCurrent = patch.progressCurrent
   if (typeof patch.progressTotal === 'number') splashState.progressTotal = patch.progressTotal
   if (typeof patch.progressPercent === 'number') splashState.progressPercent = clampPercent(patch.progressPercent)
@@ -351,8 +503,17 @@ function publishRuntimeFailure(detail, options = {}) {
   })
 }
 
+function looksLikeWarningLine(line) {
+  if (typeof line !== 'string') return false
+
+  return line.startsWith('⚠')
+    || /^\(node:\d+\)\s+Warning:/i.test(line)
+    || /^Warning:/i.test(line)
+    || /^warn\s+-/i.test(line)
+}
+
 function looksLikeFailure(line) {
-  if (isStatelessRuntimeNoiseLine(line)) return false
+  if (isStatelessRuntimeNoiseLine(line) || looksLikeWarningLine(line)) return false
 
   return /^error\b/i.test(line)
     || /^Error:/i.test(line)
@@ -363,13 +524,17 @@ function looksLikeFailure(line) {
 }
 
 function spawnMercato(args) {
-  const child = spawn(command, args, {
+  const resolvedSpawn = resolveSpawnCommand(command, args)
+  const child = spawn(resolvedSpawn.command, resolvedSpawn.args, {
     stdio: rawPassthrough ? 'inherit' : 'pipe',
     env: {
       ...process.env,
       OM_CLI_QUIET: rawPassthrough ? process.env.OM_CLI_QUIET : '1',
       DOTENV_CONFIG_QUIET: rawPassthrough ? process.env.DOTENV_CONFIG_QUIET : 'true',
+      ...(!rawPassthrough ? { OM_DEV_SPLASH_RUNTIME_WRAPPER: '1' } : {}),
+      ...(!rawPassthrough && warmupReadyFile ? { OM_DEV_WARMUP_READY_FILE: warmupReadyFile } : {}),
     },
+    ...resolvedSpawn.spawnOptions,
   })
 
   children.add(child)
@@ -385,10 +550,10 @@ function spawnMercato(args) {
   return child
 }
 
-function waitForExit(child) {
+function waitForExit(child, label = 'Child process') {
   return new Promise((resolve) => {
     child.on('exit', (code, signal) => {
-      resolve({ code, signal })
+      resolve({ label, code, signal })
     })
   })
 }
@@ -398,7 +563,7 @@ function isExpectedShutdownSignal(signal) {
 }
 
 function isGracefulShutdownResult(result) {
-  return shuttingDown && isExpectedShutdownSignal(result?.signal)
+  return shuttingDown && (isExpectedShutdownSignal(result?.signal) || result?.code === 0)
 }
 
 function resolveChildExitCode(result, fallback = 1) {
@@ -412,6 +577,32 @@ function resolveChildExitCode(result, fallback = 1) {
     return 143
   }
   return fallback
+}
+
+function formatChildExitStatus(result) {
+  if (typeof result?.code === 'number') {
+    return `exit code ${result.code}`
+  }
+  if (result?.signal) {
+    return `signal ${result.signal}`
+  }
+  return 'an unknown status'
+}
+
+function resolveUnexpectedExitCode(result) {
+  const exitCode = resolveChildExitCode(result, 1)
+  return exitCode === 0 ? 1 : exitCode
+}
+
+function reportUnexpectedChildExit(result) {
+  const message = `❌ ${result?.label ?? 'Child process'} exited unexpectedly with ${formatChildExitStatus(result)}`
+  console.error(message)
+  rememberRawLog(message)
+  publishRuntimeFailure(message, {
+    progressCurrent: splashState.progressCurrent >= runtimeProgressCurrent ? splashState.progressCurrent : runtimeProgressCurrent,
+    progressLabel: splashState.progressLabel || startupProgress.label,
+    failureLines: [...collectRuntimeFailureLines(), message].slice(-10),
+  })
 }
 
 function joinBaseUrl(baseUrl, pathname) {
@@ -429,6 +620,14 @@ function resolveWarmupCredentials() {
   return {
     email: readNonEmptyEnvValue('OM_INIT_SUPERADMIN_EMAIL') ?? 'superadmin@acme.com',
     password: readNonEmptyEnvValue('OM_INIT_SUPERADMIN_PASSWORD') ?? 'secret',
+  }
+}
+
+class LoginError extends Error {
+  constructor(message, status) {
+    super(message)
+    this.name = 'LoginError'
+    this.status = status
   }
 }
 
@@ -494,10 +693,18 @@ async function resolveWarmupTenantIdFromDatabase(email) {
   }
 }
 
-async function fetchWithTimeout(url, init = {}, timeoutMs = 45000) {
+async function fetchWithTimeout(url, init = {}, timeoutMs = 45000, externalSignal = null) {
+  if (externalSignal?.aborted) {
+    throw externalSignal.reason ?? new Error('warmup request aborted')
+  }
+
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   timer.unref?.()
+  const abortFromExternalSignal = () => {
+    controller.abort(externalSignal.reason ?? new Error('warmup request aborted'))
+  }
+  externalSignal?.addEventListener?.('abort', abortFromExternalSignal, { once: true })
 
   try {
     return await fetch(url, {
@@ -506,6 +713,7 @@ async function fetchWithTimeout(url, init = {}, timeoutMs = 45000) {
     })
   } finally {
     clearTimeout(timer)
+    externalSignal?.removeEventListener?.('abort', abortFromExternalSignal)
   }
 }
 
@@ -519,14 +727,14 @@ function isAbortLikeError(error) {
   return /aborted/i.test(String(error))
 }
 
-async function fetchWarmupWithRetry(url, init, detailLabel, progressLabel) {
+async function fetchWarmupWithRetry(url, init, detailLabel, progressLabel, signal = null) {
   let lastError = null
 
   for (let index = 0; index < warmupRequestTimeoutsMs.length; index += 1) {
     const timeoutMs = warmupRequestTimeoutsMs[index]
 
     try {
-      return await fetchWithTimeout(url, init, timeoutMs)
+      return await fetchWithTimeout(url, init, timeoutMs, signal)
     } catch (error) {
       lastError = error
 
@@ -611,6 +819,20 @@ function clearWarmupRetryTimer() {
   runtimeWarmupState.retryTimer = null
 }
 
+function resetWarmupForRuntimeRestart(reason) {
+  clearWarmupRetryTimer()
+  runtimeWarmupState.generation += 1
+  runtimeWarmupState.readySignalSeen = false
+  runtimeWarmupState.started = false
+  runtimeWarmupState.completed = false
+  runtimeWarmupState.failed = false
+  runtimeWarmupState.promise = null
+  runtimeWarmupState.retryAttempts = 0
+  runtimeWarmupState.abortController?.abort(new Error(`warmup aborted because ${reason}`))
+  runtimeWarmupState.abortController = null
+  clearWarmupReadyFile()
+}
+
 function scheduleWarmupRetry(delayMs = 2000) {
   clearWarmupRetryTimer()
   runtimeWarmupState.retryTimer = setTimeout(() => {
@@ -627,6 +849,9 @@ async function runTargetedRouteWarmup() {
 
   clearWarmupRetryTimer()
   runtimeWarmupState.started = true
+  const generation = runtimeWarmupState.generation
+  const abortController = new AbortController()
+  runtimeWarmupState.abortController = abortController
   const startedAt = Date.now()
   const progressLabel = 'Precompiling login and backend'
   const introMessage = '🔥 Precompiling /login, login POST, and /backend'
@@ -641,7 +866,9 @@ async function runTargetedRouteWarmup() {
       { method: 'GET', redirect: 'manual' },
       '/login',
       progressLabel,
+      abortController.signal,
     )
+    if (generation !== runtimeWarmupState.generation) return
     if (shouldRetryWarmupStatus(loginPageResponse.status)) {
       throw createWarmupTransientError(`/login returned HTTP ${loginPageResponse.status}`)
     }
@@ -670,7 +897,9 @@ async function runTargetedRouteWarmup() {
       },
       'POST /api/auth/login',
       progressLabel,
+      abortController.signal,
     )
+    if (generation !== runtimeWarmupState.generation) return
     const loginPayload = await readResponsePayload(loginResponse)
     if (!loginResponse.ok || !loginPayload || typeof loginPayload !== 'object' || loginPayload.ok !== true) {
       const failure = extractWarmupErrorMessage(loginPayload, `HTTP ${loginResponse.status}`)
@@ -684,7 +913,7 @@ async function runTargetedRouteWarmup() {
           throw createWarmupTransientError('login warmup required tenant selection')
         }
       }
-      throw new Error(`login warmup failed: ${failure}`)
+      throw new LoginError(`login warmup failed: ${failure}`, loginResponse.status)
     }
 
     const cookieHeader = buildCookieHeader(loginResponse)
@@ -709,7 +938,9 @@ async function runTargetedRouteWarmup() {
       },
       '/backend',
       progressLabel,
+      abortController.signal,
     )
+    if (generation !== runtimeWarmupState.generation) return
     if (backendResponse.status >= 300 && backendResponse.status < 400) {
       const location = backendResponse.headers.get('location') || 'redirect'
       if (isWarmupRetryableRedirect(location)) {
@@ -733,6 +964,7 @@ async function runTargetedRouteWarmup() {
     runtimeWarmupState.completed = true
     runtimeWarmupState.failed = false
     runtimeWarmupState.promise = null
+    runtimeWarmupState.abortController = null
     const completedMessage = `🚪 Login flow and backend warmed in ${formatDuration(Date.now() - startedAt)}`
     updateSplashState({
       phase: 'App is ready',
@@ -747,9 +979,15 @@ async function runTargetedRouteWarmup() {
       progressLabel: 'App is ready',
       activity: completedMessage,
     })
+    writeWarmupReadyFile('warmup-complete')
     console.log(formatStatusOutput(completedMessage, runtimeReadyProgressCurrent, 'App is ready'))
   } catch (error) {
+    if (generation !== runtimeWarmupState.generation) {
+      return
+    }
+
     runtimeWarmupState.promise = null
+    runtimeWarmupState.abortController = null
 
     if (isAbortLikeError(error) || isWarmupTransientError(error)) {
       runtimeWarmupState.started = false
@@ -793,21 +1031,46 @@ async function runTargetedRouteWarmup() {
       return
     }
 
-    const warmupWarning = `⚠️ Warmup incomplete: ${error instanceof Error ? error.message : 'unknown error'}`
+    const errorMessage = error instanceof Error ? error.message : 'unknown error'
+    const isCredentialsFailure = error instanceof LoginError && error.status === 401
+    const warmupWarning = `⚠️ Warmup incomplete: ${errorMessage}`
+    const loginUrl = runtimeWarmupState.baseUrl
+      ? `${runtimeWarmupState.baseUrl}/login`
+      : null
+    const failureLines = isCredentialsFailure
+      ? [
+          'Warmup login failed with HTTP 401 — the app is running but warmup credentials are invalid.',
+          'Set OM_INIT_SUPERADMIN_EMAIL and OM_INIT_SUPERADMIN_PASSWORD in .env,',
+          'or run: yarn initialize  (to seed demo data with default credentials).',
+        ]
+      : []
+    runtimeWarmupState.completed = true
+    runtimeWarmupState.failed = false
     updateSplashState({
       phase: 'App is ready',
       detail: warmupWarning,
       failed: false,
-      failureLines: [],
+      failureLines,
       failureCommand: null,
       ready: true,
+      loginUrl,
       progressCurrent: runtimeReadyProgressCurrent,
       progressTotal: startupProgress.total,
       progressPercent: resolveProgressPercent(runtimeReadyProgressCurrent, startupProgress.total),
       progressLabel: 'App is ready',
       activity: warmupWarning,
     })
-    console.log(formatStatusOutput(warmupWarning, runtimeReadyProgressCurrent, 'App is ready'))
+    if (isCredentialsFailure) {
+      writeWarmupReadyFile('warmup-credentials-failed')
+      console.log(formatStatusOutput(
+        '⚠️ Warmup login returned 401 — credentials invalid. Set OM_INIT_SUPERADMIN_EMAIL/PASSWORD in .env or run: yarn initialize',
+        runtimeReadyProgressCurrent,
+        'App is ready',
+      ))
+    } else {
+      writeWarmupReadyFile('warmup-incomplete')
+      console.log(formatStatusOutput(warmupWarning, runtimeReadyProgressCurrent, 'App is ready'))
+    }
   }
 }
 
@@ -958,6 +1221,18 @@ function shutdown(exitCode = 0) {
   if (rawModeEnabled && process.stdin.isTTY && typeof process.stdin.setRawMode === 'function') {
     process.stdin.setRawMode(false)
     rawModeEnabled = false
+  }
+
+  if (!shutdownNoticeOwnedByParent) {
+    const message = 'Shutting down services...'
+    updateSplashState({
+      phase: message,
+      detail: 'Stopping app runtime, workers, and scheduler',
+      ready: false,
+      progressLabel: message,
+      activity: message,
+    })
+    console.log(message)
   }
 
   const alive = Array.from(children).filter((child) => !child.killed)
@@ -1256,6 +1531,28 @@ function classifyWatchLine(line) {
       progressLabel: 'Watching structural module files',
     }
   }
+  if (line.startsWith('[generate:watch] Regenerating')) {
+    return {
+      type: 'status',
+      message: '♻️ Structural change detected; regenerating generated files',
+      splashPhase: startupSplashPhase,
+      splashDetail: 'Regenerating generated files',
+      activity: 'Regenerating generated files',
+      progressCurrent: 2,
+      progressLabel: 'Watching structural module files',
+    }
+  }
+  if (line === '[generate:watch] Generators completed.') {
+    return {
+      type: 'status',
+      message: '♻️ Generated files refreshed',
+      splashPhase: startupSplashPhase,
+      splashDetail: 'Generated files refreshed',
+      activity: 'Generated files refreshed',
+      progressCurrent: 2,
+      progressLabel: 'Watching structural module files',
+    }
+  }
   if (line.startsWith('[generate:watch]')) {
     return {
       type: 'status',
@@ -1295,6 +1592,9 @@ function classifyWatchLine(line) {
 }
 
 function classifyServerLine(line) {
+  if (line.startsWith('[generate:watch]')) {
+    return classifyWatchLine(line)
+  }
   if (line.startsWith('🚀 Running server:dev')) {
     return {
       type: 'status',
@@ -1319,18 +1619,94 @@ function classifyServerLine(line) {
   }
   if (
     line === '[server] Starting workers for all queues...'
+    || line === '[server] Eager worker auto-spawn enabled - starting workers for all queues...'
     || line === '[server] Starting scheduler polling engine...'
+    || line === '[server] Eager scheduler auto-spawn enabled - starting scheduler polling engine...'
+    || line === '[lazy-scheduler] Enabled schedule detected - starting scheduler polling engine.'
     || line.startsWith('🚀 Running queue:worker')
     || line.startsWith('🚀 Running scheduler:start')
   ) {
+    const isLazyTrigger = line === '[lazy-scheduler] Enabled schedule detected - starting scheduler polling engine.'
+    const modes = isLazyTrigger
+      ? { workerMode: runtimeSummaryState.workerMode, schedulerMode: 'lazy' }
+      : runtimeSummaryState
+    const status = formatBackgroundServiceStatus('Starting background services', modes)
     return {
       type: 'status',
-      message: '⚙️ Starting background services',
+      message: `⚙️ ${status}`,
       splashPhase: startupSplashPhase,
-      splashDetail: 'Starting background services',
-      activity: 'Starting queue workers and scheduler',
+      splashDetail: status,
+      activity: status,
       progressCurrent: 3,
-      progressLabel: 'Starting background services',
+      progressLabel: status,
+    }
+  }
+  if (line.startsWith('[server] Lazy worker auto-spawn enabled')) {
+    const status = 'Background workers armed (lazy)'
+    return {
+      type: 'status',
+      message: `⚙️ ${status}`,
+      splashPhase: startupSplashPhase,
+      splashDetail: status,
+      activity: status,
+      progressCurrent: 3,
+      progressLabel: 'Background services (lazy)',
+    }
+  }
+  if (line.startsWith('[server] Lazy scheduler auto-spawn enabled')) {
+    const status = 'Scheduler armed (lazy)'
+    return {
+      type: 'status',
+      message: `⚙️ ${status}`,
+      splashPhase: startupSplashPhase,
+      splashDetail: status,
+      activity: status,
+      progressCurrent: 3,
+      progressLabel: 'Background services (lazy)',
+    }
+  }
+  const lazyWorkerStartMatch = line.match(/^\[lazy-supervisor\] Pending job detected .+ starting worker for queue "(.+)"$/)
+  if (lazyWorkerStartMatch) {
+    const status = `Starting worker "${lazyWorkerStartMatch[1]}" (lazy)`
+    return {
+      type: 'status',
+      message: `⚙️ ${status}`,
+      splashPhase: startupSplashPhase,
+      splashDetail: status,
+      activity: status,
+      progressCurrent: 3,
+      progressLabel: 'Background services (lazy)',
+    }
+  }
+
+  const runtimeRestartMatch = line.match(/^\[server\] Detected (.+?)\. Restarting app runtime\.\.\.$/)
+  if (runtimeRestartMatch) {
+    const reason = runtimeRestartMatch[1]
+    resetWarmupForRuntimeRestart(reason)
+    return {
+      type: 'status',
+      message: `🔄 Restarting app runtime: ${reason}`,
+      splashPhase: 'App runtime is restarting',
+      splashDetail: `Reason: ${reason}`,
+      ready: false,
+      activity: `App runtime restart: ${reason}`,
+      progressCurrent: runtimeProgressCurrent,
+      progressLabel: 'Restarting app runtime',
+    }
+  }
+
+  if (line === '[server] Detected corrupted Turbopack dev cache. Clearing .mercato/next/dev and restarting Next.js once...') {
+    const reason = 'corrupted Turbopack dev cache'
+    resetWarmupForRuntimeRestart(reason)
+    return {
+      type: 'status',
+      message: `🔄 Restarting Next.js dev server: ${reason}`,
+      splashPhase: 'App runtime is restarting',
+      splashDetail: `Reason: ${reason}`,
+      ready: false,
+      activity: `Next.js restart: ${reason}`,
+      progressCurrent: runtimeProgressCurrent,
+      progressLabel: 'Restarting app runtime',
     }
   }
 
@@ -1344,7 +1720,7 @@ function classifyServerLine(line) {
       readyUrl: localMatch[1],
       loginUrl: `${localMatch[1].replace(/\/$/, '')}/login`,
       activity: `App runtime at ${localMatch[1]}`,
-      progressCurrent: 4,
+      progressCurrent: runtimeWarmupProgressCurrent,
       progressLabel: 'Precompiling login page',
     }
   }
@@ -1359,7 +1735,7 @@ function classifyServerLine(line) {
       ready: false,
       runtimeReady: true,
       activity: timing,
-      progressCurrent: 4,
+      progressCurrent: runtimeWarmupProgressCurrent,
       progressLabel: 'Precompiling login page',
     }
   }
@@ -1368,7 +1744,7 @@ function classifyServerLine(line) {
     const target = compiledMatch[1]?.trim()
     const detail = target ? ` ${target}` : ''
     const timing = `⚡ Compiled${detail} in ${parseDurationToken(compiledMatch[2])}`
-    const progressCurrent = splashState.ready ? runtimeReadyProgressCurrent : 3
+    const progressCurrent = splashState.ready ? runtimeReadyProgressCurrent : runtimeWarmupProgressCurrent
     return {
       type: 'status',
       message: timing,
@@ -1422,7 +1798,7 @@ function classifyServerLine(line) {
     }
   }
 
-  if (line.startsWith('⚠ ')) {
+  if (looksLikeWarningLine(line)) {
     return { type: 'status', message: line }
   }
 
@@ -1449,6 +1825,18 @@ function startFilteredChild(args, label, classifyLine) {
   return child
 }
 
+function resolveGenerateWatchMode(env) {
+  const raw = env.OM_DEV_GENERATE_WATCH_MODE
+  if (typeof raw !== 'string') return 'in-process'
+  const normalized = raw.trim().toLowerCase()
+  if (normalized === 'legacy' || normalized === 'sidecar' || normalized === 'out-of-process') {
+    return 'legacy'
+  }
+  return 'in-process'
+}
+
+const generateWatchMode = resolveGenerateWatchMode(process.env)
+
 async function runClassicRuntime() {
   const initialGenerate = spawnMercato(['generate'])
   const initialGenerateResult = await waitForExit(initialGenerate)
@@ -1461,14 +1849,26 @@ async function runClassicRuntime() {
     shutdown(initialGenerateExitCode)
   }
 
-  const watch = spawnMercato(['generate', 'watch', '--skip-initial'])
+  // Default ('in-process'): `mercato server dev` owns the structural
+  // regeneration watcher in-process, so we no longer spawn the dedicated
+  // sidecar. Saves ~190 MB of resident RSS by collapsing one Node process.
+  // Opt back into the sidecar with OM_DEV_GENERATE_WATCH_MODE=legacy.
+  const watchers = []
+  if (generateWatchMode === 'legacy') {
+    watchers.push(['Generator watch (legacy sidecar)', spawnMercato(['generate', 'watch', '--skip-initial'])])
+  }
   const server = spawnMercato(['server', 'dev'])
-  const result = await Promise.race([waitForExit(watch), waitForExit(server)])
+  const waiters = [
+    waitForExit(server, 'App runtime'),
+    ...watchers.map(([label, child]) => waitForExit(child, label)),
+  ]
+  const result = await Promise.race(waiters)
   if (isGracefulShutdownResult(result)) {
     return
   }
 
-  shutdown(resolveChildExitCode(result, 0))
+  reportUnexpectedChildExit(result)
+  shutdown(resolveUnexpectedExitCode(result))
 }
 
 if (classic) {
@@ -1480,10 +1880,22 @@ installLogToggle()
 initializeRuntimeSummary()
 printRuntimePackagesSummary()
 
-const watch = startFilteredChild(['generate', 'watch', '--skip-initial'], 'Generator watch', classifyWatchLine)
+// Default ('in-process'): `mercato server dev` runs the structural
+// regeneration watcher in-process — see packages/cli/src/lib/in-process-generate-watcher.ts
+// — so the orchestrator no longer spawns a dedicated `mercato generate watch`
+// sidecar. Saves ~190 MB of resident RSS by eliminating one Node process.
+// Set OM_DEV_GENERATE_WATCH_MODE=legacy to opt back into the sidecar.
+const sidecarWatch = generateWatchMode === 'legacy'
+  ? startFilteredChild(['generate', 'watch', '--skip-initial'], 'Generator watch (legacy sidecar)', classifyWatchLine)
+  : null
 const server = startFilteredChild(['server', 'dev'], 'App runtime', classifyServerLine)
 
-const result = await Promise.race([waitForExit(watch), waitForExit(server)])
+const waiters = [waitForExit(server, 'App runtime')]
+if (sidecarWatch) {
+  waiters.push(waitForExit(sidecarWatch, 'Generator watch (legacy sidecar)'))
+}
+const result = await Promise.race(waiters)
 if (!isGracefulShutdownResult(result)) {
-  shutdown(resolveChildExitCode(result, 0))
+  reportUnexpectedChildExit(result)
+  shutdown(resolveUnexpectedExitCode(result))
 }

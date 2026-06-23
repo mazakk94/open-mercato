@@ -1,7 +1,6 @@
 "use client";
 
 import * as React from "react";
-import dynamic from "next/dynamic";
 import { useRouter, useSearchParams } from "next/navigation";
 import type { ZodType } from "zod";
 import { Page, PageBody } from "@open-mercato/ui/backend/Page";
@@ -14,9 +13,18 @@ import { createCrud } from "@open-mercato/ui/backend/utils/crud";
 import { createCrudFormError } from "@open-mercato/ui/backend/utils/serverErrors";
 import { flash } from "@open-mercato/ui/backend/FlashMessages";
 import { TagsInput } from "@open-mercato/ui/backend/inputs/TagsInput";
+import MarkdownField from "@open-mercato/ui/backend/inputs/MarkdownField";
 import { Button } from "@open-mercato/ui/primitives/button";
 import { Input } from "@open-mercato/ui/primitives/input";
 import { Label } from "@open-mercato/ui/primitives/label";
+import { RadioGroup, Radio } from "@open-mercato/ui/primitives/radio";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@open-mercato/ui/primitives/select";
 import { cn } from "@open-mercato/shared/lib/utils";
 import {
   Plus,
@@ -69,6 +77,7 @@ import {
   updateDimensionValue,
   updateWeightValue,
   isConfigurableProductType,
+  buildComplianceProductPayload,
 } from "@open-mercato/core/modules/catalog/components/products/productForm";
 import { CATALOG_PRODUCT_TYPES } from "@open-mercato/core/modules/catalog/data/types";
 import {
@@ -76,6 +85,7 @@ import {
   slugifyAttachmentFileName,
 } from "@open-mercato/core/modules/attachments/lib/imageUrls";
 import { ProductUomSection } from "@open-mercato/core/modules/catalog/components/products/ProductUomSection";
+import { ProductComplianceSection } from "@open-mercato/core/modules/catalog/components/products/ProductComplianceSection";
 import { canonicalizeUnitCode } from "@open-mercato/core/modules/catalog/lib/unitCodes";
 import {
   UNIT_PRICE_REFERENCE_UNITS,
@@ -99,22 +109,6 @@ type VariantPriceRequest = {
   taxRateId: string | null;
   taxRateValue: number | null;
 };
-
-type UiMarkdownEditorProps = {
-  value?: string;
-  height?: number;
-  onChange?: (value?: string) => void;
-  previewOptions?: { remarkPlugins?: unknown[] };
-};
-
-const MarkdownEditor = dynamic(() => import("@uiw/react-md-editor"), {
-  ssr: false,
-  loading: () => (
-    <div className="flex h-48 items-center justify-center text-sm text-muted-foreground">
-      Loading editor…
-    </div>
-  ),
-}) as unknown as React.ComponentType<UiMarkdownEditorProps>;
 
 type ProductFormStep = (typeof PRODUCT_FORM_STEPS)[number];
 
@@ -157,6 +151,33 @@ const STEP_FIELD_MATCHERS: Record<
     matchField("unitPriceReferenceUnit"),
     matchField("unitPriceBaseQuantity"),
     matchPrefix("unitConversions"),
+  ],
+  compliance: [
+    matchField("countryOfOriginCode"),
+    matchField("pkwiuCode"),
+    matchField("cnCode"),
+    matchField("hsCode"),
+    matchField("taxClassificationCode"),
+    matchField("gtuCodes"),
+    matchField("ageMin"),
+    matchField("isExciseGood"),
+    matchField("exciseCategory"),
+    matchField("requiresPrescription"),
+    matchPrefix("hazmat"),
+    matchField("unNumber"),
+    matchField("containsLithiumBattery"),
+    matchField("launchAt"),
+    matchField("endOfLifeAt"),
+    matchField("availableFrom"),
+    matchField("availableUntil"),
+    matchField("minOrderQty"),
+    matchField("maxOrderQty"),
+    matchField("orderQtyIncrement"),
+    matchField("requiresShipping"),
+    matchField("isQuoteOnly"),
+    matchField("seoTitle"),
+    matchField("seoDescription"),
+    matchField("canonicalUrl"),
   ],
   variants: [
     matchField("hasVariants"),
@@ -312,6 +333,7 @@ export default function CreateCatalogProductPage() {
           values,
           setValue,
           errors,
+          requiredFieldIds,
         }: CrudFormGroupComponentProps) => (
           <ProductBuilder
             values={values as ProductFormValues}
@@ -319,6 +341,7 @@ export default function CreateCatalogProductPage() {
             errors={errors}
             priceKinds={priceKinds}
             taxRates={taxRates}
+            requiredFieldIds={requiredFieldIds}
           />
         ),
       },
@@ -548,6 +571,7 @@ export default function CreateCatalogProductPage() {
               unitPriceBaseQuantity: unitPriceEnabled
                 ? unitPriceBaseQuantity
                 : undefined,
+              ...buildComplianceProductPayload(formValues),
             };
             if (optionSchemaDefinition) {
               productPayload.optionSchema = optionSchemaDefinition;
@@ -793,7 +817,7 @@ export default function CreateCatalogProductPage() {
                   `/backend/inbox-ops/proposals/${encodeURIComponent(inboxDraft.proposalId)}`,
                 );
               } else {
-                router.push("/backend/catalog/products");
+                router.push(`/backend/catalog/products/${productId}`);
               }
             } catch (err) {
               await cleanupFailedProduct(
@@ -835,6 +859,7 @@ type ProductBuilderProps = {
   errors: Record<string, string>;
   priceKinds: PriceKindSummary[];
   taxRates: TaxRateSummary[];
+  requiredFieldIds?: ReadonlySet<string>;
 };
 
 type ProductMetaSectionProps = {
@@ -992,6 +1017,7 @@ function ProductBuilder({
   errors,
   priceKinds,
   taxRates,
+  requiredFieldIds,
 }: ProductBuilderProps) {
   const t = useT();
   const steps = PRODUCT_FORM_STEPS;
@@ -1316,6 +1342,8 @@ function ProductBuilder({
               t("catalog.products.create.steps.organize", "Organize")}
             {step === "uom" &&
               t("catalog.products.uom.title", "Units of measure")}
+            {step === "compliance" &&
+              t("catalog.products.compliance.title", "Compliance & commerce")}
             {step === "variants" &&
               t("catalog.products.create.steps.variants", "Variants")}
             {(stepErrors[step]?.length ?? 0) > 0 ? (
@@ -1333,10 +1361,10 @@ function ProductBuilder({
 
       {currentStepKey === "general" ? (
         <div className="space-y-6">
-          <div className="space-y-2">
+          <div className="space-y-2" data-crud-field-id="title">
             <Label className="flex items-center gap-1">
               {t("catalog.products.form.title", "Title")}
-              <span className="text-red-600">*</span>
+              <span className="text-status-error-text">*</span>
             </Label>
             <Input
               value={values.title}
@@ -1347,14 +1375,17 @@ function ProductBuilder({
               )}
             />
             {errors.title ? (
-              <p className="text-xs text-red-600">{errors.title}</p>
+              <p className="text-xs text-status-error-text">{errors.title}</p>
             ) : null}
           </div>
 
-          <div className="space-y-2">
+          <div className="space-y-2" data-crud-field-id="description">
             <div className="flex items-center justify-between">
-              <Label>
+              <Label className="flex items-center gap-1">
                 {t("catalog.products.form.description", "Description")}
+                {requiredFieldIds?.has("description") ? (
+                  <span className="text-status-error-text">*</span>
+                ) : null}
               </Label>
               <Button
                 type="button"
@@ -1380,17 +1411,10 @@ function ProductBuilder({
               </Button>
             </div>
             {values.useMarkdown ? (
-              <div
-                data-color-mode="light"
-                className="overflow-hidden rounded-md border"
-              >
-                <MarkdownEditor
-                  value={values.description}
-                  height={260}
-                  onChange={(val) => setValue("description", val ?? "")}
-                  previewOptions={{ remarkPlugins: [] }}
-                />
-              </div>
+              <MarkdownField
+                value={values.description}
+                onChange={(val) => setValue("description", val ?? "")}
+              />
             ) : (
               <textarea
                 className="min-h-[180px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
@@ -1404,6 +1428,9 @@ function ProductBuilder({
                 )}
               />
             )}
+            {errors.description ? (
+              <p className="text-xs text-status-error-text">{errors.description}</p>
+            ) : null}
           </div>
 
           <ProductMediaManager
@@ -1432,6 +1459,15 @@ function ProductBuilder({
 
       {currentStepKey === "uom" ? (
         <ProductUomSection
+          values={values as ProductFormValues}
+          setValue={setValue}
+          errors={errors}
+          embedded
+        />
+      ) : null}
+
+      {currentStepKey === "compliance" ? (
+        <ProductComplianceSection
           values={values as ProductFormValues}
           setValue={setValue}
           errors={errors}
@@ -1496,7 +1532,7 @@ function ProductBuilder({
               </div>
               {(Array.isArray(values.options) ? values.options : []).map(
                 (option) => (
-                  <div key={option.id} className="rounded-md bg-muted/40 p-4">
+                  <div key={option.id} className="rounded-md bg-muted/50 p-4">
                     <div className="flex items-center gap-2">
                       <Input
                         value={option.title}
@@ -1551,9 +1587,15 @@ function ProductBuilder({
           ) : null}
 
           <div className="rounded-lg border">
+            <RadioGroup
+              className="contents"
+              name="defaultVariant"
+              value={(Array.isArray(values.variants) ? values.variants : []).find((v) => v.isDefault)?.id ?? ''}
+              onValueChange={(next) => markDefaultVariant(next)}
+            >
             <div className="w-full overflow-x-auto">
               <table className="w-full min-w-[900px] table-fixed border-collapse text-sm">
-                <thead className="bg-muted/40">
+                <thead className="bg-muted/50">
                   <tr>
                     <th className="px-3 py-2 text-left">
                       {t(
@@ -1642,12 +1684,7 @@ function ProductBuilder({
                     <tr key={variant.id} className="border-t">
                       <td className="px-3 py-2">
                         <label className="inline-flex items-center gap-1 text-xs">
-                          <input
-                            type="radio"
-                            name="defaultVariant"
-                            checked={variant.isDefault}
-                            onChange={() => markDefaultVariant(variant.id)}
-                          />
+                          <Radio value={variant.id} />
                           {variant.isDefault
                             ? t(
                                 "catalog.products.create.variantsBuilder.defaultLabel",
@@ -1697,35 +1734,36 @@ function ProductBuilder({
                         />
                       </td>
                       <td className="px-3 py-2">
-                        <select
-                          className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
-                          value={variant.taxRateId ?? ""}
-                          onChange={(event) =>
-                            setVariantField(
-                              variant.id,
-                              "taxRateId",
-                              event.target.value || null,
-                            )
+                        <Select
+                          value={variant.taxRateId || undefined}
+                          onValueChange={(value) =>
+                            setVariantField(variant.id, "taxRateId", value || null)
                           }
                           disabled={!taxRates.length}
                         >
-                          <option value="">
-                            {defaultTaxRateLabel
-                              ? t(
-                                  "catalog.products.create.variantsBuilder.vatOptionDefault",
-                                  "Use product tax class ({{label}})",
-                                ).replace("{{label}}", defaultTaxRateLabel)
-                              : t(
-                                  "catalog.products.create.variantsBuilder.vatOptionNone",
-                                  "No tax class",
-                                )}
-                          </option>
-                          {taxRates.map((rate) => (
-                            <option key={rate.id} value={rate.id}>
-                              {formatTaxRateLabel(rate)}
-                            </option>
-                          ))}
-                        </select>
+                          <SelectTrigger>
+                            <SelectValue
+                              placeholder={
+                                defaultTaxRateLabel
+                                  ? t(
+                                      "catalog.products.create.variantsBuilder.vatOptionDefault",
+                                      "Use product tax class ({{label}})",
+                                    ).replace("{{label}}", defaultTaxRateLabel)
+                                  : t(
+                                      "catalog.products.create.variantsBuilder.vatOptionNone",
+                                      "No tax class",
+                                    )
+                              }
+                            />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {taxRates.map((rate) => (
+                              <SelectItem key={rate.id} value={rate.id}>
+                                {formatTaxRateLabel(rate)}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
                       </td>
                       {priceKinds.map((kind) => (
                         <td key={kind.id} className="px-3 py-2">
@@ -1733,9 +1771,8 @@ function ProductBuilder({
                             <span className="text-xs text-muted-foreground">
                               {kind.currencyCode ?? "—"}
                             </span>
-                            <input
+                            <Input
                               type="number"
-                              className="w-full rounded-md border px-2 py-1"
                               value={variant.prices?.[kind.id]?.amount ?? ""}
                               onChange={(event) =>
                                 setVariantPrice(
@@ -1753,7 +1790,7 @@ function ProductBuilder({
                       <td className="px-3 py-2 text-center">
                         <input
                           type="checkbox"
-                          className="h-4 w-4 rounded border disabled:cursor-not-allowed disabled:opacity-60"
+                          className="h-4 w-4 rounded border disabled:cursor-not-allowed disabled:opacity-50"
                           checked={variant.manageInventory}
                           onChange={(event) =>
                             setVariantField(
@@ -1769,7 +1806,7 @@ function ProductBuilder({
                       <td className="px-3 py-2 text-center">
                         <input
                           type="checkbox"
-                          className="h-4 w-4 rounded border disabled:cursor-not-allowed disabled:opacity-60"
+                          className="h-4 w-4 rounded border disabled:cursor-not-allowed disabled:opacity-50"
                           checked={variant.allowBackorder}
                           onChange={(event) =>
                             setVariantField(
@@ -1785,7 +1822,7 @@ function ProductBuilder({
                       <td className="px-3 py-2 text-center">
                         <input
                           type="checkbox"
-                          className="h-4 w-4 rounded border disabled:cursor-not-allowed disabled:opacity-60"
+                          className="h-4 w-4 rounded border disabled:cursor-not-allowed disabled:opacity-50"
                           checked={variant.hasInventoryKit}
                           onChange={(event) =>
                             setVariantField(
@@ -1803,6 +1840,7 @@ function ProductBuilder({
                 </tbody>
               </table>
             </div>
+            </RadioGroup>
             {!priceKinds.length ? (
               <div className="flex items-center gap-2 border-t px-4 py-3 text-sm text-muted-foreground">
                 <AlertCircle className="h-4 w-4" />
@@ -1964,44 +2002,34 @@ function ProductMetaSection({
         <Label>
           {t("catalog.products.form.productType", "Product type")}
         </Label>
-        <select
-          className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+        <Select
           value={values.productType || "simple"}
-          onChange={(event) => {
-            const nextType = event.target.value;
+          onValueChange={(value) => {
+            const nextType = value;
             setValue("productType", nextType);
-            const nextIsConfigurable =
-              isConfigurableProductType(nextType);
+            const nextIsConfigurable = isConfigurableProductType(nextType);
             if (nextIsConfigurable && !values.hasVariants) {
               setValue("hasVariants", true);
-            } else if (
-              !nextIsConfigurable &&
-              values.hasVariants
-            ) {
+            } else if (!nextIsConfigurable && values.hasVariants) {
               setValue("hasVariants", false);
             }
           }}
         >
-          {CATALOG_PRODUCT_TYPES.map((type) => {
-            const isDisabled =
-              type === "bundle" || type === "grouped";
-            return (
-              <option
-                key={type}
-                value={type}
-                disabled={isDisabled}
-              >
-                {t(
-                  `catalog.products.types.${type}`,
-                  type,
-                )}
-                {isDisabled
-                  ? ` (${t("common.comingSoon", "Coming soon")})`
-                  : ""}
-              </option>
-            );
-          })}
-        </select>
+          <SelectTrigger>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {CATALOG_PRODUCT_TYPES.map((type) => {
+              const isDisabled = type === "bundle" || type === "grouped";
+              return (
+                <SelectItem key={type} value={type} disabled={isDisabled}>
+                  {t(`catalog.products.types.${type}`, type)}
+                  {isDisabled ? ` (${t("common.comingSoon", "Coming soon")})` : ""}
+                </SelectItem>
+              );
+            })}
+          </SelectContent>
+        </Select>
         {errors.productType ? (
           <p className="text-xs text-red-600">
             {errors.productType}
@@ -2042,31 +2070,28 @@ function ProductMetaSection({
             </span>
           </Button>
         </div>
-        <select
-          className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-          value={values.taxRateId ?? ""}
-          onChange={(event) =>
-            setValue("taxRateId", event.target.value || null)
-          }
+        <Select
+          value={values.taxRateId || undefined}
+          onValueChange={(value) => setValue("taxRateId", value || null)}
           disabled={!taxRates.length}
         >
-          <option value="">
-            {taxRates.length
-              ? t(
-                  "catalog.products.create.taxRates.noneSelected",
-                  "No tax class selected",
-                )
-              : t(
-                  "catalog.products.create.taxRates.emptyOption",
-                  "No tax classes available",
-                )}
-          </option>
-          {taxRates.map((rate) => (
-            <option key={rate.id} value={rate.id}>
-              {formatTaxRateLabel(rate)}
-            </option>
-          ))}
-        </select>
+          <SelectTrigger>
+            <SelectValue
+              placeholder={
+                taxRates.length
+                  ? t("catalog.products.create.taxRates.noneSelected", "No tax class selected")
+                  : t("catalog.products.create.taxRates.emptyOption", "No tax classes available")
+              }
+            />
+          </SelectTrigger>
+          <SelectContent>
+            {taxRates.map((rate) => (
+              <SelectItem key={rate.id} value={rate.id}>
+                {formatTaxRateLabel(rate)}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
         <p className="text-xs text-muted-foreground">
           {taxRates.length
             ? t(

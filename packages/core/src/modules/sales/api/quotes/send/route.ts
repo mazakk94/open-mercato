@@ -5,7 +5,7 @@ import { getAuthFromRequest } from '@open-mercato/shared/lib/auth/server'
 import { resolveOrganizationScopeForRequest } from '@open-mercato/core/modules/directory/utils/organizationScope'
 import type { CommandRuntimeContext } from '@open-mercato/shared/lib/commands'
 import { resolveTranslations, detectLocale } from '@open-mercato/shared/lib/i18n/server'
-import { CrudHttpError } from '@open-mercato/shared/lib/crud/errors'
+import { CrudHttpError, isCrudHttpError } from '@open-mercato/shared/lib/crud/errors'
 import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
 import {
   bridgeLegacyGuard,
@@ -16,6 +16,8 @@ import {
 import type { EntityManager } from '@mikro-orm/postgresql'
 import crypto from 'node:crypto'
 import { withScopedPayload } from '../../utils'
+import { hashAuthToken } from '../../../../auth/lib/tokenHash'
+import { findOneWithDecryption } from '@open-mercato/shared/lib/encryption/find'
 import { SalesQuote } from '../../../data/entities'
 import { quoteSendSchema } from '../../../data/validators'
 import { sendEmail } from '@open-mercato/shared/lib/email/send'
@@ -143,7 +145,8 @@ export async function POST(req: Request) {
     }
 
     const em = (ctx.container.resolve('em') as EntityManager).fork()
-    const quote = await em.findOne(SalesQuote, { id: input.quoteId, deletedAt: null })
+    const tenantScope = ctx.auth?.tenantId ? { tenantId: ctx.auth.tenantId } : undefined
+    const quote = await findOneWithDecryption(em, SalesQuote, { id: input.quoteId, deletedAt: null }, {}, tenantScope)
     if (!quote) {
       throw new CrudHttpError(404, { error: translate('sales.documents.detail.error', 'Document not found or inaccessible.') })
     }
@@ -164,21 +167,27 @@ export async function POST(req: Request) {
     const validUntil = new Date(now)
     validUntil.setUTCDate(validUntil.getUTCDate() + input.validForDays)
 
-    quote.validUntil = validUntil
-    quote.acceptanceToken = crypto.randomUUID()
-    quote.sentAt = now
-    quote.status = 'sent'
-    quote.statusEntryId = await resolveStatusEntryIdByValue(em, {
-      tenantId: quote.tenantId,
-      organizationId: quote.organizationId,
-      value: 'sent',
+    const rawAcceptanceToken = crypto.randomUUID()
+
+    // Persist the send state (status/token/sentAt) atomically and commit it
+    // BEFORE the email goes out, so a customer never receives a link whose
+    // acceptance token was not durably stored.
+    await em.transactional(async (tx) => {
+      quote.validUntil = validUntil
+      quote.acceptanceToken = hashAuthToken(rawAcceptanceToken)
+      quote.sentAt = now
+      quote.status = 'sent'
+      quote.statusEntryId = await resolveStatusEntryIdByValue(tx, {
+        tenantId: quote.tenantId,
+        organizationId: quote.organizationId,
+        value: 'sent',
+      })
+      quote.updatedAt = now
+      tx.persist(quote)
     })
-    quote.updatedAt = now
-    em.persist(quote)
-    await em.flush()
 
     const appUrl = process.env.APP_URL || ''
-    const url = appUrl ? `${appUrl.replace(/\/$/, '')}/quote/${quote.acceptanceToken}` : `/quote/${quote.acceptanceToken}`
+    const url = appUrl ? `${appUrl.replace(/\/$/, '')}/quote/${rawAcceptanceToken}` : `/quote/${rawAcceptanceToken}`
 
     const locale = await detectLocale()
     const validUntilFormatted = validUntil.toLocaleDateString(locale, {
@@ -199,6 +208,7 @@ export async function POST(req: Request) {
       footer: translate('sales.quotes.email.footer', 'Open Mercato'),
     }
 
+    // Side effect after commit: an email failure must not roll back the send state.
     await sendEmail({
       to: email,
       subject: translate('sales.quotes.email.subject', 'Quote {quoteNumber}', { quoteNumber: quote.quoteNumber }),
@@ -220,7 +230,7 @@ export async function POST(req: Request) {
 
     return NextResponse.json({ ok: true })
   } catch (err) {
-    if (err instanceof CrudHttpError) {
+    if (isCrudHttpError(err)) {
       return NextResponse.json(err.body, { status: err.status })
     }
     const { translate } = await resolveTranslations()

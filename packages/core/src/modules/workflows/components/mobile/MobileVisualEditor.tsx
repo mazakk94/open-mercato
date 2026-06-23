@@ -1,7 +1,7 @@
 'use client'
 
 import { useState } from 'react'
-import type { Node, Edge, NodeChange, EdgeChange, Connection } from '@xyflow/react'
+import type { Node, Edge, Connection } from '@xyflow/react'
 import { Button } from '@open-mercato/ui/primitives/button'
 import {
   Dialog,
@@ -21,8 +21,8 @@ export interface MobileVisualEditorProps {
   isSaving: boolean
   nodes: Node[]
   edges: Edge[]
-  onNodesChange: (changes: NodeChange[]) => void
-  onEdgesChange: (changes: EdgeChange[]) => void
+  onNodesChange: (nodes: Node[]) => void
+  onEdgesChange: (edges: Edge[]) => void
   onNodeClick: (event: React.MouseEvent, node: Node) => void
   onEdgeClick: (event: React.MouseEvent, edge: Edge) => void
   onConnect: (connection: Connection) => void
@@ -119,7 +119,7 @@ export function MobileVisualEditor({
               <button
                 key={nodeType}
                 onClick={() => onAddNode(nodeType)}
-                className="flex shrink-0 items-center gap-1 rounded-md border bg-background px-2 py-1.5 text-xs hover:bg-muted active:bg-muted/80"
+                className="flex shrink-0 items-center gap-1 rounded-md border bg-background px-2 py-1.5 text-xs hover:bg-muted active:bg-muted/50"
               >
                 <Icon className="h-3.5 w-3.5" />
                 <span>{NODE_TYPE_LABELS[nodeType].title}</span>

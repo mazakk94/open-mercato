@@ -1,5 +1,6 @@
 {
   "webhooks.deliveries.actions.retry": "Retry",
+  "webhooks.deliveries.actions.viewDetails": "Zobacz szczegóły",
   "webhooks.deliveries.autoRefreshHint": "The delivery log refreshes automatically while this page is open.",
   "webhooks.deliveries.columns.attempts": "Attempts",
   "webhooks.deliveries.columns.createdAt": "Time",
@@ -28,6 +29,7 @@
   "webhooks.detail.actions.deactivate": "Deactivate",
   "webhooks.detail.actions.rotateSecret": "Rotate Secret",
   "webhooks.detail.actions.test": "Send Test",
+  "webhooks.detail.backToList": "Wróć do webhooków",
   "webhooks.detail.consecutiveFailures": "Consecutive Failures",
   "webhooks.detail.deliveryTip": "Start with a test delivery before enabling a broad event pattern. The delivery log below shows exactly what your consumer returned.",
   "webhooks.detail.loadError": "Failed to load webhook.",

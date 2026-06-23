@@ -1,5 +1,6 @@
 import type { EntityManager } from '@mikro-orm/postgresql'
 import type { CacheStrategy } from '@open-mercato/cache'
+import { enforceCommandOptimisticLock } from '@open-mercato/shared/lib/crud/optimistic-lock-command'
 import { Perspective, RolePerspective } from '../data/entities'
 import type {
   PerspectiveSettings,
@@ -95,26 +96,54 @@ function isPerspectivesState(value: unknown): value is PerspectivesState {
   return true
 }
 
+/**
+ * Defensive migration for legacy filter state shapes captured before the
+ * advanced-filter tree (SPEC-048). Existing perspectives only store either
+ * advanced-filter URL params (tree shape with `v:2` or a `root` key) or
+ * undefined — this helper is a safety net for legacy `FilterValues`-shaped
+ * records (flat key/value records of column filters) that could only appear
+ * if old saved-view JSON were imported.
+ *
+ * - Tree-shaped state (`v:2` or `root` key) is passed through unchanged.
+ * - Undefined / null filters are passed through unchanged.
+ * - Legacy `FilterValues`-shaped records are dropped (set to `undefined`)
+ *   because there is no reliable mapping back to the new operator model;
+ *   the user sees an empty tree and can recreate.
+ */
+export function maybeMigrateLegacyFilterValues(settings: PerspectiveSettings): PerspectiveSettings {
+  const filters = settings.filters
+  if (!filters || typeof filters !== 'object') return settings
+  const record = filters as Record<string, unknown>
+  if ('v' in record && record.v === 2) return settings
+  if ('root' in record) return settings
+  if (typeof console !== 'undefined') {
+    console.warn('[perspectives] Dropping legacy filterValues shape; please re-create the perspective with the new filter UI.')
+  }
+  return { ...settings, filters: undefined }
+}
+
 function toResolvedPerspective(entity: Perspective): ResolvedPerspective {
+  const settings = maybeMigrateLegacyFilterValues((entity.settingsJson ?? {}) as PerspectiveSettings)
   return {
     id: entity.id,
     name: entity.name,
     tableId: entity.tableId,
     isDefault: !!entity.isDefault,
-    settings: (entity.settingsJson ?? {}) as PerspectiveSettings,
+    settings,
     createdAt: entity.createdAt.toISOString(),
     updatedAt: entity.updatedAt ? entity.updatedAt.toISOString() : null,
   }
 }
 
 function toResolvedRolePerspective(entity: RolePerspective): ResolvedRolePerspective {
+  const settings = maybeMigrateLegacyFilterValues((entity.settingsJson ?? {}) as PerspectiveSettings)
   return {
     id: entity.id,
     roleId: entity.roleId,
     tableId: entity.tableId,
     name: entity.name,
     isDefault: !!entity.isDefault,
-    settings: (entity.settingsJson ?? {}) as PerspectiveSettings,
+    settings,
     tenantId: nullish(entity.tenantId),
     organizationId: nullish(entity.organizationId),
     createdAt: entity.createdAt.toISOString(),
@@ -188,7 +217,12 @@ export async function loadPerspectivesState(
 export async function saveUserPerspective(
   em: EntityManager,
   cache: CacheStrategy | null | undefined,
-  options: { scope: PerspectiveScope; tableId: string; input: PerspectiveSaveInput },
+  options: {
+    scope: PerspectiveScope
+    tableId: string
+    input: PerspectiveSaveInput
+    request?: Request | Headers | null
+  },
 ): Promise<ResolvedPerspective> {
   const { scope, tableId, input } = options
   const tenantId = scope.tenantId ?? null
@@ -207,6 +241,12 @@ export async function saveUserPerspective(
     if (!entity) {
       throw Object.assign(new Error('Perspective not found'), { code: 'NOT_FOUND' })
     }
+    enforceCommandOptimisticLock({
+      resourceKind: 'perspectives.perspective',
+      resourceId: entity.id,
+      current: entity.updatedAt ?? null,
+      request: options.request ?? null,
+    })
   } else {
     entity = await em.findOne(Perspective, {
       userId: scope.userId,
@@ -269,7 +309,7 @@ export async function deleteUserPerspective(
   em: EntityManager,
   cache: CacheStrategy | null | undefined,
   options: { scope: PerspectiveScope; tableId: string; perspectiveId: string },
-): Promise<void> {
+): Promise<boolean> {
   const { scope, tableId, perspectiveId } = options
   const tenantId = scope.tenantId ?? null
   const organizationId = scope.organizationId ?? null
@@ -282,7 +322,7 @@ export async function deleteUserPerspective(
     tableId,
     deletedAt: null,
   })
-  if (!existing) return
+  if (!existing) return false
 
   existing.deletedAt = new Date()
   existing.isDefault = false
@@ -291,6 +331,8 @@ export async function deleteUserPerspective(
   if (cache?.deleteByTags) {
     await cache.deleteByTags([userTag(scope, tableId)])
   }
+
+  return true
 }
 
 export async function saveRolePerspectives(
@@ -311,15 +353,23 @@ export async function saveRolePerspectives(
 
   const results: ResolvedRolePerspective[] = []
 
-  for (const roleId of input.roleIds) {
-    let record = await em.findOne(RolePerspective, {
-      roleId,
+  // Prefetch every matching role perspective in a single query, then index by role id
+  // so the loop resolves create/update without a lookup per role.
+  const recordByRole = new Map<string, RolePerspective>()
+  if (input.roleIds.length) {
+    const existingRecords = await em.find(RolePerspective, {
+      roleId: { $in: input.roleIds },
       tableId,
       tenantId,
       organizationId,
       name: input.name,
       deletedAt: null,
     })
+    for (const existing of existingRecords) recordByRole.set(existing.roleId, existing)
+  }
+
+  for (const roleId of input.roleIds) {
+    let record = recordByRole.get(roleId) ?? null
     if (!record) {
       record = em.create(RolePerspective, {
         roleId,
@@ -333,6 +383,7 @@ export async function saveRolePerspectives(
         updatedAt: now,
       })
       em.persist(record)
+      recordByRole.set(roleId, record)
     } else {
       record.settingsJson = input.settings
       record.updatedAt = now
@@ -381,13 +432,13 @@ export async function clearRolePerspectives(
     organizationId?: string | null
     roleIds: string[]
   },
-): Promise<void> {
+): Promise<number> {
   const { tableId, roleIds } = options
   const tenantId = options.tenantId ?? null
   const organizationId = options.organizationId ?? null
-  if (!roleIds.length) return
+  if (!roleIds.length) return 0
 
-  await em.nativeUpdate(
+  const affected = await em.nativeUpdate(
     RolePerspective,
     {
       roleId: { $in: roleIds as any },
@@ -403,4 +454,6 @@ export async function clearRolePerspectives(
     const tags = roleIds.map((roleId) => roleTag(roleId, tableId, tenantId))
     await cache.deleteByTags(tags)
   }
+
+  return affected
 }

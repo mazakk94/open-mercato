@@ -1,4 +1,4 @@
-import type { Knex } from 'knex'
+import { type Kysely, sql, type SqlBool } from 'kysely'
 import type {
   SearchStrategy,
   SearchStrategyId,
@@ -18,6 +18,17 @@ export type TokenStrategyConfig = {
   defaultLimit?: number
 }
 
+function normalizeOrganizationIds(options: SearchOptions): string[] | null {
+  const single = typeof options.organizationId === 'string' ? options.organizationId.trim() : ''
+  if (single) return [single]
+  if (!Array.isArray(options.organizationIds)) return null
+  return Array.from(new Set(
+    options.organizationIds
+      .map((value) => (typeof value === 'string' ? value.trim() : ''))
+      .filter((value) => value.length > 0),
+  ))
+}
+
 /**
  * TokenSearchStrategy provides hash-based search using the existing search_tokens table.
  * This strategy is always available and serves as a fallback when other strategies fail.
@@ -34,7 +45,7 @@ export class TokenSearchStrategy implements SearchStrategy {
   private readonly defaultLimit: number
 
   constructor(
-    private readonly knex: Knex,
+    private readonly db: Kysely<any>,
     config?: TokenStrategyConfig,
   ) {
     this.minMatchRatio = config?.minMatchRatio ?? 0.5
@@ -50,6 +61,9 @@ export class TokenSearchStrategy implements SearchStrategy {
   }
 
   async search(query: string, options: SearchOptions): Promise<SearchResult[]> {
+    const organizationIds = normalizeOrganizationIds(options)
+    if (organizationIds && organizationIds.length === 0) return []
+
     // Dynamically import tokenization to avoid circular dependencies
     const { tokenizeText } = await import('@open-mercato/shared/lib/search/tokenize')
     const { resolveSearchConfig } = await import('@open-mercato/shared/lib/search/config')
@@ -63,25 +77,35 @@ export class TokenSearchStrategy implements SearchStrategy {
     const minMatches = Math.max(1, Math.ceil(hashes.length * this.minMatchRatio))
     const limit = options.limit ?? this.defaultLimit
 
-    let queryBuilder = this.knex('search_tokens')
-      .select('entity_type', 'entity_id')
-      .count('* as match_count')
-      .whereIn('token_hash', hashes)
-      .where('tenant_id', options.tenantId)
-      .groupBy('entity_type', 'entity_id')
-      .havingRaw('COUNT(DISTINCT token_hash) >= ?', [minMatches])
-      .orderByRaw('COUNT(DISTINCT token_hash) DESC')
+    let queryBuilder = this.db
+      .selectFrom('search_tokens' as any)
+      .select([
+        'entity_type' as any,
+        'entity_id' as any,
+        'organization_id' as any,
+        sql<string>`count(*)`.as('match_count'),
+      ])
+      .where('token_hash' as any, 'in', hashes)
+      .where('tenant_id' as any, '=', options.tenantId)
+      .groupBy(['entity_type' as any, 'entity_id' as any, 'organization_id' as any])
+      .having(sql<SqlBool>`count(distinct token_hash) >= ${minMatches}`)
+      .orderBy(sql`count(distinct token_hash) desc`)
       .limit(limit)
 
-    if (options.organizationId) {
-      queryBuilder = queryBuilder.where('organization_id', options.organizationId)
+    if (organizationIds) {
+      queryBuilder = queryBuilder.where('organization_id' as any, 'in', organizationIds)
     }
 
     if (options.entityTypes?.length) {
-      queryBuilder = queryBuilder.whereIn('entity_type', options.entityTypes)
+      queryBuilder = queryBuilder.where('entity_type' as any, 'in', options.entityTypes)
     }
 
-    const rows = await queryBuilder as Array<{ entity_type: string; entity_id: string; match_count: string | number }>
+    const rows = await queryBuilder.execute() as Array<{
+      entity_type: string
+      entity_id: string
+      organization_id: string | null
+      match_count: string | number
+    }>
 
     return rows.map((row) => {
       const matchCount = typeof row.match_count === 'string'
@@ -95,6 +119,7 @@ export class TokenSearchStrategy implements SearchStrategy {
         recordId: row.entity_id,
         score,
         source: this.id,
+        organizationId: row.organization_id ?? null,
       }
     })
   }
@@ -105,7 +130,7 @@ export class TokenSearchStrategy implements SearchStrategy {
       '@open-mercato/core/modules/query_index/lib/search-tokens'
     )
 
-    await replaceSearchTokensForRecord(this.knex, {
+    await replaceSearchTokensForRecord(this.db, {
       entityType: record.entityId,
       recordId: record.recordId,
       tenantId: record.tenantId,
@@ -120,7 +145,7 @@ export class TokenSearchStrategy implements SearchStrategy {
       '@open-mercato/core/modules/query_index/lib/search-tokens'
     )
 
-    await deleteSearchTokensForRecord(this.knex, {
+    await deleteSearchTokensForRecord(this.db, {
       entityType: entityId,
       recordId,
       tenantId,
@@ -142,12 +167,19 @@ export class TokenSearchStrategy implements SearchStrategy {
       doc: record.fields as Record<string, unknown>,
     }))
 
-    await replaceSearchTokensForBatch(this.knex, payloads)
+    await replaceSearchTokensForBatch(this.db, payloads)
   }
 
-  async purge(entityId: EntityId, tenantId: string): Promise<void> {
-    await this.knex('search_tokens')
-      .where({ entity_type: entityId, tenant_id: tenantId })
-      .del()
+  async purge(entityId: EntityId, tenantId: string, organizationId?: string | null): Promise<void> {
+    const normalizedOrganizationId =
+      typeof organizationId === 'string' && organizationId.trim().length > 0 ? organizationId.trim() : null
+    let query = this.db
+      .deleteFrom('search_tokens' as any)
+      .where('entity_type' as any, '=', entityId)
+      .where('tenant_id' as any, '=', tenantId)
+    if (normalizedOrganizationId !== null) {
+      query = query.where('organization_id' as any, '=', normalizedOrganizationId)
+    }
+    await query.execute()
   }
 }

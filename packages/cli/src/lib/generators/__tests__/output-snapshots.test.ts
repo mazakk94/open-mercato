@@ -198,7 +198,7 @@ export class OrderItem {
   )
   touchFile(
     pkgModulePath('orders', 'i18n', 'pl.json'),
-    JSON.stringify({ orders: { list: { title: 'Zamówienia' } } }),
+    JSON.stringify({ orders: { list: { title: 'Zam\u00f3wienia' } } }),
   )
 
   // -- Events --
@@ -367,6 +367,22 @@ export default analyticsConfig
   },
 ]
 export default aiTools
+`,
+  )
+
+  // -- AI agents --
+  touchFile(
+    pkgModulePath('orders', 'ai-agents.ts'),
+    `export const aiAgents = [
+  {
+    id: 'orders.assistant',
+    module: 'orders',
+    displayName: 'Orders Assistant',
+    allowedTools: ['list_orders'],
+    readOnly: true,
+  },
+]
+export default aiAgents
 `,
   )
 
@@ -593,6 +609,11 @@ export default notificationTypes
     appModulePath('custom_app', 'di.ts'),
     'export function register(container: any) { /* custom_app DI */ }\n',
   )
+  // -- App-level worker (exercises .ts source metadata extraction with variable reference) --
+  touchFile(
+    appModulePath('custom_app', 'workers', 'background-task.ts'),
+    "const CUSTOM_QUEUE = 'custom-app-tasks'\nexport const metadata = { queue: CUSTOM_QUEUE, concurrency: 3 }\nexport default async function handler() {}\n",
+  )
   touchFile(
     appModulePath('custom_app', 'events.ts'),
     `export const eventsConfig = {
@@ -647,6 +668,7 @@ function captureGeneratedFiles(): Map<string, string> {
 describe('generator output compatibility', () => {
   const registryFiles = [
     'ai-tools.generated.ts',
+    'ai-agents.generated.ts',
     'analytics.generated.ts',
     'api-routes.generated.ts',
     'backend-middleware.generated.ts',
@@ -699,6 +721,7 @@ describe('generator output compatibility', () => {
       'entity-fields-registry.ts',
       'modules.app.generated.ts',
       'modules.cli.generated.ts',
+      'enabled-module-ids.generated.ts',
     ]))
   })
 
@@ -726,6 +749,18 @@ describe('generator output compatibility', () => {
     expect(secondRun).toEqual(firstRun)
   })
 
+  it('includes app-level workers with variable-referenced queue names in generated output', async () => {
+    const enabled = scaffoldFixture()
+    const resolver = createMockResolver(enabled)
+
+    await generateModuleRegistry({ resolver, quiet: true })
+
+    const modulesContent = readGenerated('modules.generated.ts')
+    expect(modulesContent).not.toBeNull()
+    expect(modulesContent).toContain('custom-app-tasks')
+    expect(modulesContent).toContain('background-task')
+  })
+
   it('writes the expected minimal inventory with zero modules enabled', async () => {
     const resolver = createMockResolver([])
 
@@ -745,6 +780,34 @@ describe('generator output compatibility', () => {
       'entity-fields-registry.ts',
       'modules.app.generated.ts',
       'modules.cli.generated.ts',
+      'enabled-module-ids.generated.ts',
     ]))
+  })
+
+  it('bootstrap-registrations always registers backend route manifests (issue #1595)', async () => {
+    const resolver = createMockResolver([])
+
+    await generateModuleRegistry({ resolver, quiet: true })
+
+    const content = readGenerated('bootstrap-registrations.generated.ts')
+    expect(content).not.toBeNull()
+    expect(content).toContain(`import { backendRoutes } from "./backend-routes.generated"`)
+    expect(content).toContain(`import { frontendRoutes } from "./frontend-routes.generated"`)
+    expect(content).toContain(
+      `import { registerBackendRouteManifests, registerFrontendRouteManifests } from '@open-mercato/shared/modules/registry'`,
+    )
+    expect(content).toMatch(/export function runBootstrapRegistrations\(\): void \{[\s\S]*registerBackendRouteManifests\(backendRoutes\)[\s\S]*\}/)
+    expect(content).toMatch(/export function runBootstrapRegistrations\(\): void \{[\s\S]*registerFrontendRouteManifests\(frontendRoutes\)[\s\S]*\}/)
+  })
+
+  it('bootstrap-registrations includes backend routes alongside plugin hooks', async () => {
+    const enabled = scaffoldFixture()
+    const resolver = createMockResolver(enabled)
+
+    await generateModuleRegistry({ resolver, quiet: true })
+
+    const content = readGenerated('bootstrap-registrations.generated.ts')
+    expect(content).not.toBeNull()
+    expect(content).toContain(`registerBackendRouteManifests(backendRoutes)`)
   })
 })

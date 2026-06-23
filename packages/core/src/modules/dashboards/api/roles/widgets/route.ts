@@ -3,9 +3,15 @@ import { z } from 'zod'
 import { getAuthFromRequest } from '@open-mercato/shared/lib/auth/server'
 import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
 import { DashboardRoleWidgets } from '@open-mercato/core/modules/dashboards/data/entities'
+import { Role } from '@open-mercato/core/modules/auth/data/entities'
 import { roleWidgetSettingsSchema } from '@open-mercato/core/modules/dashboards/data/validators'
 import { loadAllWidgets } from '@open-mercato/core/modules/dashboards/lib/widgets'
+import { resolveWidgetAssignmentReadScope } from '@open-mercato/core/modules/dashboards/lib/widgetAssignmentScope'
 import { hasFeature } from '@open-mercato/shared/security/features'
+import {
+  runCrudMutationGuardAfterSuccess,
+  validateCrudMutationGuard,
+} from '@open-mercato/shared/lib/crud/mutation-guard'
 import type { OpenApiMethodDoc, OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
 import {
   dashboardsTag,
@@ -15,6 +21,7 @@ import {
 } from '../../openapi'
 
 const FEATURE = 'dashboards.admin.assign-widgets'
+const RESOURCE_KIND = 'dashboards.roleWidgets'
 
 function pickBestRecord(records: DashboardRoleWidgets[], tenantId: string | null, organizationId: string | null): DashboardRoleWidgets | null {
   let best: DashboardRoleWidgets | null = null
@@ -46,8 +53,6 @@ export async function GET(req: Request) {
   const url = new URL(req.url)
   const roleId = url.searchParams.get('roleId')
   if (!roleId) return NextResponse.json({ error: 'roleId is required' }, { status: 400 })
-  const tenantId = url.searchParams.get('tenantId') || auth.tenantId || null
-  const organizationId = url.searchParams.get('organizationId') || null
 
   const container = await createRequestContainer()
   const em = container.resolve('em') as any
@@ -55,6 +60,18 @@ export async function GET(req: Request) {
   const acl = await rbac.loadAcl(auth.sub, { tenantId: auth.tenantId ?? null, organizationId: auth.orgId ?? null })
   if (!acl.isSuperAdmin && !hasFeature(acl.features, FEATURE)) {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+  }
+
+  const { tenantId, organizationId } = resolveWidgetAssignmentReadScope({
+    auth: { tenantId: auth.tenantId ?? null, orgId: auth.orgId ?? null },
+    isSuperAdmin: !!acl.isSuperAdmin,
+    queryTenantId: url.searchParams.get('tenantId'),
+    queryOrganizationId: url.searchParams.get('organizationId'),
+  })
+
+  const role = await em.findOne(Role, { id: roleId, deletedAt: null })
+  if (!role || (tenantId && role.tenantId !== tenantId)) {
+    return NextResponse.json({ error: 'Role not found' }, { status: 404 })
   }
 
   const records = await em.find(DashboardRoleWidgets, { roleId, deletedAt: null })
@@ -87,7 +104,8 @@ export async function PUT(req: Request) {
     return NextResponse.json({ error: 'Invalid payload', issues: parsed.error.issues }, { status: 400 })
   }
 
-  const { resolve } = await createRequestContainer()
+  const container = await createRequestContainer()
+  const { resolve } = container
   const em = resolve('em') as any
   const rbac = resolve('rbacService') as any
   const acl = await rbac.loadAcl(auth.sub, { tenantId: auth.tenantId ?? null, organizationId: auth.orgId ?? null })
@@ -99,8 +117,28 @@ export async function PUT(req: Request) {
   const validWidgetIds = new Set(widgets.map((w) => w.metadata.id))
   const widgetIds = parsed.data.widgetIds.filter((id) => validWidgetIds.has(id))
 
-  const tenantId = parsed.data.tenantId ?? auth.tenantId ?? null
-  const organizationId = parsed.data.organizationId ?? null
+  const tenantId = auth.tenantId ?? null
+  const organizationId = auth.orgId ?? null
+
+  const role = await em.findOne(Role, { id: parsed.data.roleId, deletedAt: null })
+  if (!role || (tenantId && role.tenantId !== tenantId)) {
+    return NextResponse.json({ error: 'Role not found' }, { status: 404 })
+  }
+
+  const guardResult = await validateCrudMutationGuard(container, {
+    tenantId: tenantId ?? '',
+    organizationId,
+    userId: String(auth.sub),
+    resourceKind: RESOURCE_KIND,
+    resourceId: parsed.data.roleId,
+    operation: 'update',
+    requestMethod: req.method,
+    requestHeaders: req.headers,
+    mutationPayload: { roleId: parsed.data.roleId, widgetIds },
+  })
+  if (guardResult && !guardResult.ok) {
+    return NextResponse.json(guardResult.body, { status: guardResult.status })
+  }
 
   let record = await em.findOne(DashboardRoleWidgets, {
     roleId: parsed.data.roleId,
@@ -111,7 +149,20 @@ export async function PUT(req: Request) {
 
   if (!widgetIds.length) {
     if (record) {
-      await em.removeAndFlush(record)
+      await em.remove(record).flush()
+    }
+    if (guardResult?.ok && guardResult.shouldRunAfterSuccess) {
+      await runCrudMutationGuardAfterSuccess(container, {
+        tenantId: tenantId ?? '',
+        organizationId,
+        userId: String(auth.sub),
+        resourceKind: RESOURCE_KIND,
+        resourceId: parsed.data.roleId,
+        operation: 'update',
+        requestMethod: req.method,
+        requestHeaders: req.headers,
+        metadata: guardResult.metadata ?? null,
+      })
     }
     return NextResponse.json({ ok: true, widgetIds: [] })
   }
@@ -128,6 +179,20 @@ export async function PUT(req: Request) {
     record.widgetIdsJson = widgetIds
   }
   await em.flush()
+
+  if (guardResult?.ok && guardResult.shouldRunAfterSuccess) {
+    await runCrudMutationGuardAfterSuccess(container, {
+      tenantId: tenantId ?? '',
+      organizationId,
+      userId: String(auth.sub),
+      resourceKind: RESOURCE_KIND,
+      resourceId: parsed.data.roleId,
+      operation: 'update',
+      requestMethod: req.method,
+      requestHeaders: req.headers,
+      metadata: guardResult.metadata ?? null,
+    })
+  }
 
   return NextResponse.json({ ok: true, widgetIds })
 }
@@ -160,7 +225,7 @@ const roleWidgetsPutDoc: OpenApiMethodDoc = {
   requestBody: {
     contentType: 'application/json',
     schema: roleWidgetSettingsSchema,
-    description: 'Role identifier, optional scope, and the widget ids that should remain assigned.',
+    description: 'Role identifier and the widget ids that should remain assigned. Scope is derived from the authenticated session.',
   },
   responses: [
     { status: 200, description: 'Widgets updated successfully.', schema: dashboardRoleWidgetsUpdateResponseSchema },

@@ -73,6 +73,12 @@ describe('sales command registration', () => {
         'sales.orders.adjustments.delete',
         'sales.quotes.adjustments.upsert',
         'sales.quotes.adjustments.delete',
+        'sales.invoices.create',
+        'sales.invoices.update',
+        'sales.invoices.delete',
+        'sales.credit_memos.create',
+        'sales.credit_memos.update',
+        'sales.credit_memos.delete',
       ],
     },
     {
@@ -89,6 +95,11 @@ describe('sales command registration', () => {
       label: '../shipments',
       path: '../shipments',
       expected: ['sales.shipments.create', 'sales.shipments.update', 'sales.shipments.delete'],
+    },
+    {
+      label: '../returns',
+      path: '../returns',
+      expected: ['sales.returns.create', 'sales.returns.update', 'sales.returns.delete'],
     },
     {
       label: '../statuses',

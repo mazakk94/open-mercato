@@ -4,11 +4,13 @@ import * as React from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { Page, PageBody } from '@open-mercato/ui/backend/Page'
 import { CrudForm } from '@open-mercato/ui/backend/CrudForm'
+import { ErrorMessage, RecordNotFoundState } from '@open-mercato/ui/backend/detail'
 import { collectCustomFieldValues } from '@open-mercato/ui/backend/utils/customFieldValues'
 import { updateCrud, deleteCrud } from '@open-mercato/ui/backend/utils/crud'
 import { readApiResultOrThrow } from '@open-mercato/ui/backend/utils/apiCall'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
+import { extractCustomFieldEntries } from '@open-mercato/shared/lib/crud/custom-fields-client'
 import { useChannelFields, buildChannelPayload, type ChannelFormValues } from '@open-mercato/core/modules/sales/components/channels/channelFormFields'
 import { E } from '#generated/entities.ids.generated'
 import { SalesChannelOffersPanel } from '@open-mercato/core/modules/sales/components/channels/SalesChannelOffersPanel'
@@ -27,6 +29,7 @@ export default function EditChannelPage({ params }: { params?: { channelId?: str
   const [initialValues, setInitialValues] = React.useState<ChannelFormValues | null>(null)
   const [loading, setLoading] = React.useState(true)
   const [error, setError] = React.useState<string | null>(null)
+  const [isNotFound, setIsNotFound] = React.useState(false)
   const [activeTab, setActiveTab] = React.useState<'settings' | 'offers'>('settings')
 
   React.useEffect(() => {
@@ -44,6 +47,7 @@ export default function EditChannelPage({ params }: { params?: { channelId?: str
     async function loadChannel() {
       setLoading(true)
       setError(null)
+      setIsNotFound(false)
       try {
         const payload = await readApiResultOrThrow<ChannelApiResponse>(
           `/api/sales/channels?id=${encodeURIComponent(channelId)}&pageSize=1`,
@@ -52,14 +56,21 @@ export default function EditChannelPage({ params }: { params?: { channelId?: str
         )
         const item = Array.isArray(payload.items) ? payload.items[0] : null
         if (!item) {
-          throw new Error('not_found')
+          if (!cancelled) setIsNotFound(true)
+          return
         }
         if (!cancelled) {
           setInitialValues(mapChannelToFormValues(item))
         }
       } catch (err) {
         console.error('sales.channels.load', err)
-        if (!cancelled) setError(t('sales.channels.form.errors.load', 'Failed to load channel.'))
+        if (!cancelled) {
+          if ((err as { status?: number }).status === 404) {
+            setIsNotFound(true)
+          } else {
+            setError(t('sales.channels.form.errors.load', 'Failed to load channel.'))
+          }
+        }
       } finally {
         if (!cancelled) setLoading(false)
       }
@@ -101,7 +112,7 @@ export default function EditChannelPage({ params }: { params?: { channelId?: str
     <button
       key={value}
       type="button"
-      className={`px-4 py-2 text-sm font-medium border-b-2 ${activeTab === value ? 'border-primary text-primary' : 'border-transparent text-muted-foreground'}`}
+      className={`px-4 py-2 text-sm font-medium border-b-2 ${activeTab === value ? 'border-accent-indigo text-foreground' : 'border-transparent text-muted-foreground'}`}
       onClick={() => handleTabSelect(value)}
     >
       {label}
@@ -115,14 +126,33 @@ export default function EditChannelPage({ params }: { params?: { channelId?: str
     </div>
   ), [tabButton, t])
 
+  if (isNotFound) {
+    return (
+      <Page>
+        <PageBody>
+          <RecordNotFoundState
+            label={t('sales.channels.form.errors.notFound', 'Channel not found.')}
+            backHref="/backend/sales/channels"
+            backLabel={t('sales.channels.actions.backToList', 'Back to channels')}
+          />
+        </PageBody>
+      </Page>
+    )
+  }
+
+  if (error && !loading && !initialValues) {
+    return (
+      <Page>
+        <PageBody>
+          <ErrorMessage label={error} />
+        </PageBody>
+      </Page>
+    )
+  }
+
   return (
     <Page>
       <PageBody>
-        {error ? (
-          <div className="mb-4 rounded border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">
-            {error}
-          </div>
-        ) : null}
         {activeTab === 'settings' ? (
           <CrudForm<ChannelFormValues>
             title={t('sales.channels.form.editTitle', 'Edit channel')}
@@ -151,6 +181,7 @@ export default function EditChannelPage({ params }: { params?: { channelId?: str
               { id: 'custom', title: t('entities.customFields.title', 'Custom Attributes'), column: 2, kind: 'customFields' },
             ]}
             initialValues={initialValues ?? undefined}
+            optimisticLockUpdatedAt={typeof initialValues?.updatedAt === 'string' ? initialValues.updatedAt : null}
             isLoading={loading}
             loadingMessage={t('sales.channels.form.loading', 'Loading channel…')}
             submitLabel={t('sales.channels.form.updateSubmit', 'Save changes')}
@@ -195,32 +226,11 @@ function mapChannelToFormValues(item: Record<string, unknown>): ChannelFormValue
         ? item.status_entry_id
         : null,
     isActive: item.isActive === true || item.is_active === true,
+    updatedAt: typeof item.updatedAt === 'string'
+      ? item.updatedAt
+      : typeof item.updated_at === 'string'
+        ? item.updated_at
+        : null,
   }
-  const mergeCustomObject = (source: unknown) => {
-    if (!source || typeof source !== 'object' || Array.isArray(source)) return
-    for (const [key, value] of Object.entries(source as Record<string, unknown>)) {
-      if (!key) continue
-      values[`cf_${key}`] = value
-    }
-  }
-  const mergeCustomArray = (source: unknown) => {
-    if (!Array.isArray(source)) return
-    source.forEach((entry) => {
-      if (!entry || typeof entry !== 'object') return
-      const key = typeof (entry as Record<string, unknown>).key === 'string'
-        ? (entry as Record<string, unknown>).key
-        : null
-      if (!key) return
-      values[`cf_${key}`] = (entry as Record<string, unknown>).value
-    })
-  }
-  mergeCustomObject(item.customValues)
-  mergeCustomObject((item as Record<string, unknown>).custom_values)
-  mergeCustomObject(item.customFields)
-  mergeCustomObject((item as Record<string, unknown>).custom_fields)
-  mergeCustomArray(item.customFields)
-  mergeCustomArray((item as Record<string, unknown>).custom_fields)
-  mergeCustomArray((item as Record<string, unknown>).customFieldEntries)
-  mergeCustomArray((item as Record<string, unknown>).custom_field_entries)
-  return values
+  return { ...values, ...extractCustomFieldEntries(item) }
 }

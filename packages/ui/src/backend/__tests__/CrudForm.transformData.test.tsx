@@ -1,4 +1,5 @@
 /** @jest-environment jsdom */
+jest.setTimeout(15000)
 
 const pushMock = jest.fn()
 const confirmDialogMock = jest.fn()
@@ -10,7 +11,6 @@ jest.mock('next/navigation', () => ({
   useSearchParams: () => new URLSearchParams(),
 }))
 jest.mock('remark-gfm', () => ({ __esModule: true, default: {} }))
-jest.mock('@uiw/react-md-editor', () => ({ __esModule: true, default: () => null }))
 jest.mock('../confirm-dialog', () => ({
   useConfirmDialog: () => ({
     confirm: confirmDialogMock,

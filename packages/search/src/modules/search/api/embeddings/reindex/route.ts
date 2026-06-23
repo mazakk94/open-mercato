@@ -4,8 +4,9 @@ import { getAuthFromRequest } from '@open-mercato/shared/lib/auth/server'
 import type { SearchIndexer } from '../../../../../indexer/search-indexer'
 import type { EmbeddingService } from '../../../../../vector'
 import type { ProgressService } from '@open-mercato/core/modules/progress/lib/progressService'
-import type { Knex } from 'knex'
+
 import type { EntityManager } from '@mikro-orm/postgresql'
+import type { Kysely } from 'kysely'
 import { recordIndexerLog } from '@open-mercato/shared/lib/indexers/status-log'
 import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
 import { resolveEmbeddingConfig } from '../../../lib/embedding-config'
@@ -13,6 +14,7 @@ import type { EntityId } from '@open-mercato/shared/modules/entities'
 import { searchDebug, searchDebugWarn, searchError } from '../../../../../lib/debug'
 import { acquireReindexLock, clearReindexLock, getReindexLockStatus } from '../../../lib/reindex-lock'
 import {
+  completeReindexProgress,
   ensureReindexProgressJob,
   failReindexProgress,
 } from '../../../lib/reindex-progress'
@@ -42,10 +44,10 @@ export async function POST(req: Request) {
   const container = await createRequestContainer()
   const em = container.resolve('em') as EntityManager
   const progressService = container.resolve('progressService') as ProgressService
-  const knex = (em.getConnection() as unknown as { getKnex: () => Knex }).getKnex()
+  const db = (em as unknown as { getKysely: () => Kysely<any> }).getKysely()
 
   // Check if another vector reindex operation is already in progress
-  const existingLock = await getReindexLockStatus(knex, auth.tenantId, { type: 'vector' })
+  const existingLock = await getReindexLockStatus(db, auth.tenantId, { type: 'vector' })
   if (existingLock) {
     const startedAt = new Date(existingLock.startedAt)
     return NextResponse.json(
@@ -65,7 +67,7 @@ export async function POST(req: Request) {
   }
 
   // Acquire lock before starting the operation
-  const { acquired: lockAcquired } = await acquireReindexLock(knex, {
+  const { acquired: lockAcquired } = await acquireReindexLock(db, {
     type: 'vector',
     action: entityId ? `reindex:${entityId}` : 'reindex:all',
     tenantId: auth.tenantId,
@@ -163,6 +165,34 @@ export async function POST(req: Request) {
         ? `Vector reindex ${entityId} (queued)`
         : 'Vector reindex all entities (queued)',
     })
+
+    if ((result.jobsEnqueued ?? 0) === 0) {
+      if (result.success) {
+        await completeReindexProgress({
+          em,
+          progressService,
+          type: 'vector',
+          tenantId: auth.tenantId,
+          organizationId: auth.orgId ?? null,
+          resultSummary: {
+            entitiesProcessed: result.entitiesProcessed,
+            recordsIndexed: result.recordsIndexed,
+            jobsEnqueued: result.jobsEnqueued ?? 0,
+            errors: result.errors.length,
+          },
+        })
+      } else {
+        await failReindexProgress({
+          em,
+          progressService,
+          type: 'vector',
+          tenantId: auth.tenantId,
+          organizationId: auth.orgId ?? null,
+          errorMessage: result.errors[0]?.error ?? 'Vector reindex failed before queueing work',
+        })
+      }
+      await clearReindexLock(db, auth.tenantId, 'vector', auth.orgId ?? null)
+    }
 
     await recordIndexerLog(
       { em: em ?? undefined },

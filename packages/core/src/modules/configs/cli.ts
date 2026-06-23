@@ -12,8 +12,15 @@ import {
   previewCachePurge,
   type CachePurgeRequest,
 } from './lib/cache-cli'
+import { touchGeneratedBarrels } from './lib/touchGeneratedBarrels'
 
 type ParsedArgs = Record<string, string | boolean>
+
+export const STRUCTURAL_CACHE_REQUESTS: CachePurgeRequest[] = [
+  { kind: 'pattern', pattern: 'nav:*' },
+  { kind: 'segment', segment: 'admin-nav' },
+  { kind: 'segment', segment: 'portal-nav' },
+]
 
 type CacheScope = {
   label: string
@@ -156,7 +163,7 @@ function printCacheHelp() {
   console.log('ℹ️ Notes:')
   console.log('  `stats` mirrors the cache admin page segment overview for CRUD/widget caches.')
   console.log('  `purge --id` removes every key whose name contains the provided token (for example a user id or entity id).')
-  console.log('  `structural` targets navigation caches (`nav:*`) and is the recommended post-step after module/sidebar structure changes.')
+  console.log('  `structural` targets navigation/sidebar caches and is the recommended post-step after module/sidebar structure changes.')
   console.log('  When no scope flag is supplied, this command uses the global cache scope only.')
 }
 
@@ -200,11 +207,14 @@ async function runCacheStats(args: ParsedArgs) {
   }
 }
 
-async function runCachePurge(args: ParsedArgs) {
+async function runCachePurgeRequest(
+  args: ParsedArgs,
+  request: CachePurgeRequest,
+  emitOutput = true,
+) {
   const json = flagEnabled(args, 'json')
   const quiet = flagEnabled(args, 'quiet')
   const dryRun = flagEnabled(args, 'dry-run', 'dryRun')
-  const request = resolveCachePurgeRequest(args)
   const container = await createRequestContainer()
   try {
     const em = container.resolve('em') as EntityManager
@@ -227,13 +237,13 @@ async function runCachePurge(args: ParsedArgs) {
       })
     }
 
-    if (json) {
+    if (json && emitOutput) {
       console.log(JSON.stringify(results, null, 2))
-      return
+      return results
     }
 
-    if (quiet) {
-      return
+    if (quiet || !emitOutput) {
+      return results
     }
 
     for (const result of results) {
@@ -245,21 +255,45 @@ async function runCachePurge(args: ParsedArgs) {
         }
       }
     }
+    return results
   } finally {
     await disposeContainer(container)
   }
 }
 
+async function runCachePurge(args: ParsedArgs) {
+  await runCachePurgeRequest(args, resolveCachePurgeRequest(args))
+}
+
 async function runStructuralCachePurge(args: ParsedArgs) {
-  const nextArgs: ParsedArgs = {
-    ...args,
-    pattern: 'nav:*',
+  const json = flagEnabled(args, 'json')
+  const structuralResults: Array<{
+    request: CachePurgeRequest
+    results: Awaited<ReturnType<typeof runCachePurgeRequest>>
+  }> = []
+  for (const request of STRUCTURAL_CACHE_REQUESTS) {
+    const results = await runCachePurgeRequest(args, request, !json)
+    structuralResults.push({ request, results })
   }
-  await runCachePurge(nextArgs)
+  if (json) {
+    console.log(JSON.stringify(structuralResults, null, 2))
+  }
+  const quiet = flagEnabled(args, 'quiet')
+  try {
+    touchGeneratedBarrels({ quiet: quiet || json })
+  } catch (err) {
+    if (!quiet && !json) {
+      console.warn(
+        `[structural] failed to touch generated barrels: ${(err as Error).message ?? err}`,
+      )
+    }
+  }
 }
 
 function envDisablesAutoIndexing(): boolean {
-  const raw = process.env.DISABLE_VECTOR_SEARCH_AUTOINDEXING
+  const raw =
+    process.env.OM_DISABLE_VECTOR_SEARCH_AUTOINDEXING ??
+    process.env.DISABLE_VECTOR_SEARCH_AUTOINDEXING
   if (!raw) return false
   return parseBooleanToken(raw) === true
 }
@@ -296,7 +330,9 @@ const restoreDefaults: ModuleCli = {
       )
       console.log(
         `[configs] Vector auto-indexing default set to ${defaultEnabled ? 'enabled' : 'disabled'}${
-          disabledByEnv ? ' (forced by DISABLE_VECTOR_SEARCH_AUTOINDEXING)' : ''
+          disabledByEnv
+            ? ' (forced by OM_DISABLE_VECTOR_SEARCH_AUTOINDEXING or legacy DISABLE_VECTOR_SEARCH_AUTOINDEXING)'
+            : ''
         }.`,
       )
     } finally {

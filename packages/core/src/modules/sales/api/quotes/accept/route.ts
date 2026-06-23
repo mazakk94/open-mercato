@@ -3,9 +3,17 @@ import { z } from 'zod'
 import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
 import type { CommandBus, CommandRuntimeContext } from '@open-mercato/shared/lib/commands'
 import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
-import { CrudHttpError } from '@open-mercato/shared/lib/crud/errors'
+import { CrudHttpError, isCrudHttpError } from '@open-mercato/shared/lib/crud/errors'
 import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
 import type { EntityManager } from '@mikro-orm/postgresql'
+import { LockMode } from '@mikro-orm/core'
+import { getAuthFromRequest } from '@open-mercato/shared/lib/auth/server'
+import { findOneWithDecryption } from '@open-mercato/shared/lib/encryption/find'
+import { getCachedRateLimiterService } from '@open-mercato/core/bootstrap'
+import { readEndpointRateLimitConfig } from '@open-mercato/shared/lib/ratelimit/config'
+import { checkRateLimit, getClientIp, rateLimitErrorSchema } from '@open-mercato/shared/lib/ratelimit/helpers'
+import { validateSameOriginMutationRequest } from './originGuard'
+import { hashAuthToken } from '../../../../auth/lib/tokenHash'
 import { SalesOrder, SalesQuote } from '../../../data/entities'
 import { quoteAcceptSchema } from '../../../data/validators'
 import { sendEmail } from '@open-mercato/shared/lib/email/send'
@@ -21,54 +29,108 @@ export const metadata = {
   POST: { requireAuth: false },
 }
 
+const quoteAcceptRateLimitConfig = readEndpointRateLimitConfig('SALES_QUOTES_ACCEPT', {
+  points: 10,
+  duration: 60,
+  blockDuration: 300,
+  keyPrefix: 'sales_quote_accept',
+})
+
 export async function POST(req: Request) {
   try {
+    const { translate } = await resolveTranslations()
+    const sameOriginViolation = validateSameOriginMutationRequest(req)
+    if (sameOriginViolation) {
+      return NextResponse.json(
+        { error: translate('sales.quotes.accept.forbidden', 'Cross-site quote acceptance is not allowed.') },
+        { status: 403 },
+      )
+    }
+
+    const rateLimiterService = getCachedRateLimiterService()
+    const clientIp = rateLimiterService ? getClientIp(req, rateLimiterService.trustProxyDepth) : null
+    if (rateLimiterService && clientIp) {
+      const rateLimitResponse = await checkRateLimit(
+        rateLimiterService,
+        quoteAcceptRateLimitConfig,
+        clientIp,
+        translate('api.errors.rateLimit', 'Too many requests. Please try again later.'),
+      )
+      if (rateLimitResponse) return rateLimitResponse
+    }
+
     const { token } = quoteAcceptSchema.parse(await req.json().catch(() => ({})))
+    const auth = await getAuthFromRequest(req)
     const container = await createRequestContainer()
     const em = (container.resolve('em') as EntityManager).fork()
-    const { translate } = await resolveTranslations()
 
-    const quote = await em.findOne(SalesQuote, { acceptanceToken: token, deletedAt: null })
-    if (!quote) {
-      throw new CrudHttpError(404, { error: translate('sales.quotes.accept.notFound', 'Quote not found.') })
-    }
-
-    const now = new Date()
-    if (quote.validUntil && quote.validUntil.getTime() < now.getTime()) {
-      throw new CrudHttpError(400, { error: translate('sales.quotes.accept.expired', 'This quote has expired.') })
-    }
-
-    if ((quote.status ?? null) !== 'sent') {
-      throw new CrudHttpError(400, {
-        error: translate('sales.quotes.accept.invalidStatus', 'This quote cannot be accepted in its current status.'),
-      })
-    }
-
-    // Mark accepted before conversion so the created order inherits the confirmed status.
-    quote.status = 'confirmed'
-    quote.statusEntryId = await resolveStatusEntryIdByValue(em, {
-      tenantId: quote.tenantId,
-      organizationId: quote.organizationId,
-      value: 'confirmed',
-    })
-    quote.updatedAt = now
-    em.persist(quote)
-    await em.flush()
+    const hashedToken = hashAuthToken(token)
+    const tenantScope = auth?.tenantId ? { tenantId: auth.tenantId } : undefined
 
     const commandBus = container.resolve('commandBus') as CommandBus
-    const ctx: CommandRuntimeContext = {
-      container,
-      auth: null,
-      organizationScope: null,
-      selectedOrganizationId: quote.organizationId,
-      organizationIds: [quote.organizationId],
-      request: req,
-    }
 
-    const result = (await commandBus.execute('sales.quotes.convert_to_order', { input: { quoteId: quote.id }, ctx })) as ConvertToOrderResult | null
-    const orderId = result?.result?.orderId ?? result?.orderId ?? quote.id
+    // Lock the quote, flip it to confirmed, and convert it to an order inside a
+    // single transaction. The conversion command reuses this transaction (and its
+    // PESSIMISTIC_WRITE lock) via ctx.transactionalEm, so the status flip and the
+    // order creation are atomic: if conversion fails the whole transaction rolls
+    // back, leaving the quote in its prior 'sent' state with no partial order and
+    // no need for an out-of-band compensating write.
+    const { quote, orderId } = await em.transactional(async (trx) => {
+      const findQuoteByToken = (acceptanceToken: string) =>
+        findOneWithDecryption(
+          trx,
+          SalesQuote,
+          {
+            acceptanceToken,
+            ...(auth?.tenantId ? { tenantId: auth.tenantId } : {}),
+            deletedAt: null,
+          },
+          { lockMode: LockMode.PESSIMISTIC_WRITE },
+          tenantScope,
+        )
+      const quote = (await findQuoteByToken(hashedToken)) ?? (await findQuoteByToken(token))
+      if (!quote) {
+        throw new CrudHttpError(404, { error: translate('sales.quotes.accept.notFound', 'Quote not found.') })
+      }
 
-    const order = await em.findOne(SalesOrder, { id: orderId, deletedAt: null })
+      const now = new Date()
+      if (quote.validUntil && quote.validUntil.getTime() < now.getTime()) {
+        throw new CrudHttpError(400, { error: translate('sales.quotes.accept.expired', 'This quote has expired.') })
+      }
+
+      if ((quote.status ?? null) !== 'sent') {
+        throw new CrudHttpError(400, {
+          error: translate('sales.quotes.accept.invalidStatus', 'This quote cannot be accepted in its current status.'),
+        })
+      }
+
+      quote.status = 'confirmed'
+      quote.statusEntryId = await resolveStatusEntryIdByValue(trx, {
+        tenantId: quote.tenantId,
+        organizationId: quote.organizationId,
+        value: 'confirmed',
+      })
+      quote.updatedAt = now
+      trx.persist(quote)
+      await trx.flush()
+
+      const ctx: CommandRuntimeContext = {
+        container,
+        auth: null,
+        organizationScope: null,
+        selectedOrganizationId: quote.organizationId,
+        organizationIds: [quote.organizationId],
+        request: req,
+        transactionalEm: trx,
+      }
+
+      const result = (await commandBus.execute('sales.quotes.convert_to_order', { input: { quoteId: quote.id }, ctx })) as ConvertToOrderResult | null
+      const orderId = result?.result?.orderId ?? result?.orderId ?? quote.id
+
+      return { quote, orderId }
+    })
+
+    const order = await findOneWithDecryption(em, SalesOrder, { id: orderId, deletedAt: null }, {}, tenantScope)
     const orderNumber = order?.orderNumber ?? orderId
 
     // Admin notification should not block acceptance.
@@ -104,7 +166,7 @@ export async function POST(req: Request) {
 
     return NextResponse.json({ orderId, orderNumber })
   } catch (err) {
-    if (err instanceof CrudHttpError) {
+    if (isCrudHttpError(err)) {
       return NextResponse.json(err.body, { status: err.status })
     }
     const { translate } = await resolveTranslations()
@@ -130,7 +192,9 @@ export const openApi: OpenApiRouteDoc = {
           schema: z.object({ orderId: z.string().uuid(), orderNumber: z.string() }),
         },
         { status: 400, description: 'Invalid or expired quote', schema: z.object({ error: z.string() }) },
+        { status: 403, description: 'Cross-site request rejected', schema: z.object({ error: z.string() }) },
         { status: 404, description: 'Quote not found', schema: z.object({ error: z.string() }) },
+        { status: 429, description: 'Too many requests', schema: rateLimitErrorSchema },
       ],
     },
   },

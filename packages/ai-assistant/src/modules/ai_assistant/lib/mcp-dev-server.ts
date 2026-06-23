@@ -7,6 +7,7 @@ import { executeTool } from './tool-executor'
 import { loadAllModuleTools, indexToolsForSearch } from './tool-loader'
 import { authenticateMcpRequest, extractApiKeyFromHeaders, hasRequiredFeatures } from './auth'
 import { jsonSchemaToZod } from './schema-utils'
+import { getApiKeyFromMcpJson } from './mcp-dev-key-resolution'
 import type { McpToolContext } from './types'
 import type { SearchService } from '@open-mercato/search/service'
 import type { RbacService } from '@open-mercato/core/modules/auth/services/rbacService'
@@ -15,42 +16,6 @@ const DEFAULT_PORT = 3001
 
 const log = (message: string, ...args: unknown[]) => {
   console.error(`[MCP Dev] ${message}`, ...args)
-}
-
-async function getApiKeyFromMcpJson(): Promise<string | undefined> {
-  const { readFile, access } = await import('node:fs/promises')
-  const { resolve, dirname } = await import('node:path')
-
-  // Search for .mcp.json starting from cwd and walking up to project root
-  const findMcpJson = async (startDir: string): Promise<string | null> => {
-    let dir = startDir
-    const root = resolve('/')
-    while (dir !== root) {
-      const candidate = resolve(dir, '.mcp.json')
-      try {
-        await access(candidate)
-        return candidate
-      } catch {
-        dir = dirname(dir)
-      }
-    }
-    return null
-  }
-
-  try {
-    const mcpJsonPath = await findMcpJson(process.cwd())
-    if (!mcpJsonPath) {
-      return undefined
-    }
-
-    const content = await readFile(mcpJsonPath, 'utf-8')
-    const config = JSON.parse(content)
-    const serverConfig = config?.mcpServers?.['open-mercato']
-
-    return serverConfig?.headers?.['x-api-key']
-  } catch {
-    return undefined
-  }
 }
 
 /**
@@ -278,18 +243,12 @@ export async function runMcpDevServer(): Promise<void> {
     log('OpenAPI spec caching skipped:', error instanceof Error ? error.message : error)
   }
 
-  // Index tools, API endpoints, and entity schemas for search (if search service available)
+  // Index tools and entity schemas for search (if search service available)
   try {
     const searchService = container.resolve('searchService') as SearchService
     await indexToolsForSearch(searchService)
 
-    const { indexApiEndpoints } = await import('./api-endpoint-index')
-    const endpointCount = await indexApiEndpoints(searchService)
-    if (endpointCount > 0) {
-      log(`Indexed ${endpointCount} API endpoints for discovery`)
-    }
-
-    // Index entity schemas for discover_schema tool
+    // Index entity schemas for hybrid search
     try {
       const { getCachedEntityGraph } = await import('./entity-graph')
       const { indexEntitiesForSearch } = await import('./entity-index')

@@ -2,17 +2,26 @@ import { NextResponse } from 'next/server'
 import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
 import { findWithDecryption } from '@open-mercato/shared/lib/encryption/find'
 import { readJsonSafe } from '@open-mercato/shared/lib/http/readJsonSafe'
+import { checkRateLimit, getClientIp, RATE_LIMIT_ERROR_FALLBACK } from '@open-mercato/shared/lib/ratelimit/helpers'
+import type { RateLimiterService } from '@open-mercato/shared/lib/ratelimit/service'
 import type { EntityManager } from '@mikro-orm/postgresql'
 import type { CredentialsService } from '../../../../integrations/lib/credentials-service'
 import { CarrierShipment } from '../../../data/entities'
 import { getShippingAdapter } from '../../../lib/adapter-registry'
-import type { ShippingCarrierService } from '../../../lib/shipping-service'
 import { getShippingCarrierQueue } from '../../../lib/queue'
 import { shippingCarriersTag } from '../../openapi'
 
 export const metadata = {
   path: '/shipping-carriers/webhook/[provider]',
   POST: { requireAuth: false },
+}
+
+const WEBHOOK_VERIFICATION_FAILED = 'Webhook verification failed'
+
+const shippingCarrierWebhookRateLimitConfig = {
+  points: 60,
+  duration: 60,
+  keyPrefix: 'shipping_carriers:webhook',
 }
 
 function readCarrierShipmentId(payload: Record<string, unknown> | null): string | null {
@@ -35,14 +44,16 @@ export async function POST(req: Request, { params }: { params: Promise<{ provide
     return NextResponse.json({ error: `No shipping adapter for provider: ${providerKey}` }, { status: 404 })
   }
 
+  const container = await createRequestContainer()
+  const rateLimitResponse = await checkProviderWebhookRateLimit(container, req, providerKey)
+  if (rateLimitResponse) return rateLimitResponse
+
   const rawBody = await req.text()
   const headers: Record<string, string> = {}
   req.headers.forEach((value, key) => {
     headers[key] = value
   })
 
-  const container = await createRequestContainer()
-  const service = container.resolve('shippingCarrierService') as ShippingCarrierService
   const em = container.resolve('em') as EntityManager
   const integrationCredentialsService = container.resolve('integrationCredentialsService') as CredentialsService
   const queue = getShippingCarrierQueue('shipping-carriers-webhook')
@@ -50,6 +61,12 @@ export async function POST(req: Request, { params }: { params: Promise<{ provide
   const carrierShipmentId = readCarrierShipmentId(payload)
 
   try {
+    // The webhook endpoint is unauthenticated. Tenant/organization scope MUST come from a
+    // CarrierShipment whose per-tenant credentials successfully verify the inbound
+    // signature — NEVER from attacker-controlled payload metadata or an unsigned retry.
+    // If no candidate shipment can be located by the provider-reported carrierShipmentId,
+    // or no candidate's credentials can verify the signature, we fail closed with 401.
+    // This mirrors the fix landed for payment_gateways in PR #1311.
     const candidates = carrierShipmentId
       ? await findWithDecryption(
         em,
@@ -63,9 +80,9 @@ export async function POST(req: Request, { params }: { params: Promise<{ provide
       )
       : []
 
-    let shipment = null as CarrierShipment | null
-    let matchedScope = null as { organizationId: string; tenantId: string } | null
-    let event = null as Awaited<ReturnType<typeof adapter.verifyWebhook>> | null
+    let shipment: CarrierShipment | null = null
+    let matchedScope: { organizationId: string; tenantId: string } | null = null
+    let event: Awaited<ReturnType<typeof adapter.verifyWebhook>> | null = null
     let lastVerificationError: unknown = null
 
     for (const candidate of candidates) {
@@ -81,39 +98,48 @@ export async function POST(req: Request, { params }: { params: Promise<{ provide
       }
     }
 
-    if (!event) {
-      try {
-        event = await adapter.verifyWebhook({ rawBody, headers, credentials: {} })
-      } catch (error: unknown) {
-        throw lastVerificationError ?? error
-      }
+    if (!event || !shipment || !matchedScope) {
+      throw lastVerificationError ?? new Error('Webhook verification failed: no matching shipment')
     }
-    if (!event) {
-      throw new Error('Webhook verification failed')
-    }
-
-    if (!shipment && carrierShipmentId && matchedScope) {
-      shipment = await service.findShipmentByCarrierId(providerKey, carrierShipmentId, matchedScope)
-    }
-
-    const scope = shipment
-      ? { organizationId: shipment.organizationId, tenantId: shipment.tenantId }
-      : matchedScope
 
     await queue.enqueue({
       name: 'shipping-carrier-webhook',
       payload: {
         providerKey,
         event,
-        shipmentId: shipment?.id ?? null,
-        scope,
+        shipmentId: shipment.id,
+        scope: matchedScope,
       },
     })
 
     return NextResponse.json({ received: true, queued: true }, { status: 202 })
   } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : 'Webhook verification failed'
-    return NextResponse.json({ error: message }, { status: 401 })
+    console.warn(`[shipping_carriers] Webhook verification failed for provider "${providerKey}"`, error)
+    return NextResponse.json({ error: WEBHOOK_VERIFICATION_FAILED }, { status: 401 })
+  }
+}
+
+async function checkProviderWebhookRateLimit(
+  container: { resolve: (name: string) => unknown },
+  req: Request,
+  providerKey: string,
+): Promise<NextResponse | null> {
+  const rateLimiterService = tryResolve<RateLimiterService>(container, 'rateLimiterService')
+  if (!rateLimiterService) return null
+
+  return checkRateLimit(
+    rateLimiterService,
+    shippingCarrierWebhookRateLimitConfig,
+    `${providerKey}:${getClientIp(req, rateLimiterService.trustProxyDepth) ?? 'unknown'}`,
+    RATE_LIMIT_ERROR_FALLBACK,
+  )
+}
+
+function tryResolve<T>(container: { resolve: (name: string) => unknown }, name: string): T | null {
+  try {
+    return container.resolve(name) as T
+  } catch {
+    return null
   }
 }
 

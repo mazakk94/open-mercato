@@ -1,7 +1,9 @@
 import type { EntityManager } from '@mikro-orm/postgresql'
 import { z } from 'zod'
 import { registerCommand, type CommandHandler } from '@open-mercato/shared/lib/commands'
+import { withAtomicFlush } from '@open-mercato/shared/lib/commands/flush'
 import { extractUndoPayload, type UndoPayload } from '@open-mercato/shared/lib/commands/undo'
+import { findOneWithDecryption, findWithDecryption } from '@open-mercato/shared/lib/encryption/find'
 import { Message, MessageObject, MessageRecipient, type MessageActionData } from '../data/entities'
 import { emitMessagesEvent } from '../events'
 import {
@@ -11,7 +13,7 @@ import {
   updateDraftSchema,
 } from '../data/validators'
 import { linkAttachmentsToMessage, linkLibraryAttachmentsToMessage, copyAttachmentsForForwardMessages } from '../lib/attachments'
-import { MESSAGE_ATTACHMENT_ENTITY_ID } from '../lib/constants'
+import { MESSAGE_ATTACHMENT_ENTITY_ID, MESSAGE_ENTITY_ID } from '../lib/constants'
 import { getMessageTypeOrDefault } from '../lib/message-types-registry'
 import { validateMessageObjectsForType } from '../lib/object-validation'
 import { buildForwardBodyFromLegacyInput, buildForwardPreviewFromThreadSlice, buildForwardThreadSlice } from '../lib/forwarding'
@@ -50,7 +52,67 @@ async function emitMessageDeletedEvent(_container: ContainerWithResolve, payload
   tenantId: string
   organizationId: string | null
 }) {
-  await emitMessagesEvent('messages.message.deleted', payload, { persistent: true })
+  await emitMessagesEvent(
+    'messages.message.deleted',
+    { ...payload, recipientUserId: payload.actorUserId },
+    { persistent: true },
+  )
+}
+
+async function emitMessageGloballyDeletedEvent(_container: ContainerWithResolve, payload: {
+  messageId: string
+  actorUserId: string
+  recipientUserIds: string[]
+  tenantId: string
+  organizationId: string | null
+}) {
+  const audience = Array.from(new Set([payload.actorUserId, ...payload.recipientUserIds]))
+  await emitMessagesEvent(
+    'messages.message.deleted',
+    {
+      messageId: payload.messageId,
+      actorUserId: payload.actorUserId,
+      target: 'global',
+      recipientUserIds: audience,
+      tenantId: payload.tenantId,
+      organizationId: payload.organizationId,
+    },
+    { persistent: true },
+  )
+}
+
+async function emitMessageIndexUpsert(
+  container: ContainerWithResolve,
+  payload: {
+    messageId: string
+    tenantId: string
+    organizationId: string | null
+  },
+) {
+  let bus: { emitEvent: (name: string, body: unknown, options?: unknown) => Promise<void> } | null = null
+  try {
+    bus = container.resolve('eventBus') as { emitEvent: (name: string, body: unknown, options?: unknown) => Promise<void> }
+  } catch {
+    bus = null
+  }
+
+  if (!bus) return
+
+  await bus.emitEvent(
+    'query_index.upsert_one',
+    {
+      entityType: MESSAGE_ENTITY_ID,
+      recordId: payload.messageId,
+      tenantId: payload.tenantId,
+      organizationId: payload.organizationId,
+      crudAction: 'updated',
+      coverageBaseDelta: 1,
+    },
+    {
+      tenantId: payload.tenantId,
+      organizationId: payload.organizationId,
+    },
+  ).catch(() => undefined)
 }
 
 const scopeSchema = z.object({
@@ -63,6 +125,10 @@ const composeCommandSchema = composeMessageSchema.safeExtend({
   tenantId: scopeSchema.shape.tenantId,
   organizationId: scopeSchema.shape.organizationId,
   userId: scopeSchema.shape.userId,
+  // Optional dedup key (inbound email ingest sets it; other callers leave it
+  // undefined). When set, a re-issued compose returns the first message instead
+  // of creating a duplicate.
+  idempotencyKey: z.string().min(1).max(255).optional(),
 })
 
 const updateDraftCommandSchema = updateDraftSchema.safeExtend({
@@ -126,17 +192,68 @@ async function requireMessageById(
   scope: MessageScopeInput,
   messageId: string,
 ) {
-  const message = await em.findOne(Message, {
-    id: messageId,
-    tenantId: scope.tenantId,
-    deletedAt: null,
-  })
+  const message = await findOneWithDecryption(
+    em,
+    Message,
+    {
+      id: messageId,
+      tenantId: scope.tenantId,
+      deletedAt: null,
+    },
+    undefined,
+    {
+      tenantId: scope.tenantId,
+      organizationId: scope.organizationId,
+    },
+  )
   if (!message) throw new Error('Message not found')
   assertOrganizationAccess(scope, message)
   return message
 }
 
-const composeMessageCommand: CommandHandler<unknown, { id: string; threadId: string | null; externalEmail: string | null; isDraft: boolean; recipientUserIds: string[] }> = {
+function isUniqueViolation(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false
+  const code = (err as { code?: string }).code
+  if (code === '23505') return true
+  const message = (err as { message?: string }).message
+  return typeof message === 'string' && /duplicate key value|unique constraint/i.test(message)
+}
+
+type ComposeMessageResult = {
+  id: string
+  threadId: string | null
+  externalEmail: string | null
+  isDraft: boolean
+  recipientUserIds: string[]
+  /**
+   * True when this was an idempotent replay — an existing message was returned
+   * and nothing was written. Signals `buildLog` to skip the audit/undo entry.
+   */
+  deduplicated?: boolean
+}
+
+async function buildComposeResultFromExisting(
+  em: EntityManager,
+  message: Message,
+): Promise<ComposeMessageResult> {
+  const recipients = await findWithDecryption(
+    em,
+    MessageRecipient,
+    { messageId: message.id, deletedAt: null },
+    undefined,
+    { tenantId: message.tenantId, organizationId: message.organizationId ?? null },
+  )
+  return {
+    id: message.id,
+    threadId: message.threadId ?? null,
+    externalEmail: message.externalEmail ?? null,
+    isDraft: message.isDraft,
+    recipientUserIds: recipients.map((recipient) => recipient.recipientUserId),
+    deduplicated: true,
+  }
+}
+
+const composeMessageCommand: CommandHandler<unknown, { id: string; threadId: string | null; externalEmail: string | null; isDraft: boolean; recipientUserIds: string[]; deduplicated?: boolean }> = {
   id: 'messages.messages.compose',
   async execute(rawInput, ctx) {
     const input = composeCommandSchema.parse(rawInput)
@@ -146,19 +263,42 @@ const composeMessageCommand: CommandHandler<unknown, { id: string; threadId: str
     }
 
     const em = (ctx.container.resolve('em') as EntityManager).fork()
+    const scope = { tenantId: input.tenantId, organizationId: input.organizationId }
+
+    // Idempotency fast-path: a retried inbound-email ingest re-issues compose
+    // for the same source message (the first attempt committed the message but a
+    // downstream transient failure rolled the ingest back). Return that message
+    // so the retry cannot create a duplicate.
+    if (input.idempotencyKey) {
+      const existing = await findOneWithDecryption(
+        em,
+        Message,
+        { tenantId: input.tenantId, idempotencyKey: input.idempotencyKey },
+        undefined,
+        scope,
+      )
+      if (existing) return buildComposeResultFromExisting(em, existing)
+    }
+
     let messageId = ''
     let responseThreadId: string | null = null
     let responseExternalEmail: string | null = null
 
-    await em.transactional(async (trx) => {
+    const composeTx = em.transactional(async (trx) => {
       const threadId = input.parentMessageId
         ? (
-          await trx.findOne(Message, {
-            id: input.parentMessageId,
-            tenantId: input.tenantId,
-            organizationId: input.organizationId,
-            deletedAt: null,
-          })
+          await findOneWithDecryption(
+            trx,
+            Message,
+            {
+              id: input.parentMessageId,
+              tenantId: input.tenantId,
+              organizationId: input.organizationId,
+              deletedAt: null,
+            },
+            undefined,
+            scope,
+          )
         )?.threadId ?? input.parentMessageId
         : undefined
 
@@ -183,11 +323,12 @@ const composeMessageCommand: CommandHandler<unknown, { id: string; threadId: str
         sentAt: input.isDraft ? null : new Date(),
         actionData: input.actionData as MessageActionData | undefined,
         sendViaEmail,
+        idempotencyKey: input.idempotencyKey ?? null,
         tenantId: input.tenantId,
         organizationId: input.organizationId,
       })
 
-      await trx.persistAndFlush(message)
+      await trx.persist(message).flush()
       if (!threadId && !input.isDraft && !message.threadId) {
         message.threadId = message.id
         await trx.flush()
@@ -242,6 +383,24 @@ const composeMessageCommand: CommandHandler<unknown, { id: string; threadId: str
       responseThreadId = message.threadId ?? null
       responseExternalEmail = message.externalEmail ?? null
     })
+    try {
+      await composeTx
+    } catch (err) {
+      // Lost a concurrent race on the same idempotency key — return the message
+      // the winning compose created. A propagated 23505 would otherwise be
+      // classified permanent and dead-letter the inbound mail.
+      if (input.idempotencyKey && isUniqueViolation(err)) {
+        const existing = await findOneWithDecryption(
+          em.fork(),
+          Message,
+          { tenantId: input.tenantId, idempotencyKey: input.idempotencyKey },
+          undefined,
+          scope,
+        )
+        if (existing) return buildComposeResultFromExisting(em.fork(), existing)
+      }
+      throw err
+    }
 
     if (!input.isDraft) {
       await emitMessageSentEvent(ctx.container, {
@@ -254,6 +413,12 @@ const composeMessageCommand: CommandHandler<unknown, { id: string; threadId: str
         organizationId: input.organizationId,
       })
     }
+
+    await emitMessageIndexUpsert(ctx.container, {
+      messageId,
+      tenantId: input.tenantId,
+      organizationId: input.organizationId,
+    })
 
     return {
       id: messageId,
@@ -268,6 +433,11 @@ const composeMessageCommand: CommandHandler<unknown, { id: string; threadId: str
     return loadMessageAggregateSnapshot(em, result.id)
   },
   buildLog: async ({ input, result, snapshots }) => {
+    // Idempotent replay: execute returned a pre-existing message without writing
+    // anything. Skip the audit entry entirely — logging it as a fresh "Compose
+    // message" would both misrepresent the dedup and expose an undo that
+    // soft-deletes a legitimately-received inbound message.
+    if (result.deduplicated) return { skipLog: true }
     const parsed = composeCommandSchema.parse(input)
     return {
       actionLabel: parsed.isDraft ? 'Create draft message' : 'Compose message',
@@ -292,6 +462,15 @@ const composeMessageCommand: CommandHandler<unknown, { id: string; threadId: str
     if (!message) return
     message.deletedAt = new Date()
     await em.flush()
+    if (!after.message.isDraft) {
+      await emitMessageGloballyDeletedEvent(ctx.container, {
+        messageId: after.message.id,
+        actorUserId: after.message.senderUserId,
+        recipientUserIds: after.recipients.map((recipient) => recipient.recipientUserId),
+        tenantId: after.message.tenantId,
+        organizationId: after.message.organizationId,
+      })
+    }
   },
 }
 
@@ -314,6 +493,20 @@ const updateDraftCommand: CommandHandler<unknown, { ok: true; id: string }> = {
     if (message.senderUserId !== input.userId) throw new Error('Access denied')
     if (!message.isDraft) throw new Error('Only draft messages can be edited')
 
+    const isSending = input.isDraft === false
+    const preloadedRecipients = isSending && !input.recipients
+      ? await findWithDecryption(
+        em,
+        MessageRecipient,
+        { messageId: message.id, deletedAt: null },
+        undefined,
+        {
+          tenantId: input.tenantId,
+          organizationId: input.organizationId,
+        },
+      )
+      : null
+
     const nextMessageType = input.type ?? message.type
     if (input.objects) {
       const objectValidationError = validateMessageObjectsForType(nextMessageType, input.objects)
@@ -333,74 +526,130 @@ const updateDraftCommand: CommandHandler<unknown, { ok: true; id: string }> = {
       }
     }
 
-    if (input.type !== undefined) message.type = input.type
-    if (input.visibility !== undefined) message.visibility = input.visibility
-    if (input.sourceEntityType !== undefined) message.sourceEntityType = input.sourceEntityType
-    if (input.sourceEntityId !== undefined) message.sourceEntityId = input.sourceEntityId
-    if (input.externalEmail !== undefined) message.externalEmail = input.externalEmail
-    if (input.externalName !== undefined) message.externalName = input.externalName
-    if (input.subject !== undefined) message.subject = input.subject
-    if (input.body !== undefined) message.body = input.body
-    if (input.bodyFormat !== undefined) message.bodyFormat = input.bodyFormat
-    if (input.priority !== undefined) message.priority = input.priority
-    if (input.actionData !== undefined) message.actionData = input.actionData
-    if (input.sendViaEmail !== undefined) message.sendViaEmail = input.sendViaEmail
-
-    if (input.recipients) {
-      await em.nativeDelete(MessageRecipient, { messageId: message.id })
-      for (const recipient of input.recipients) {
-        em.persist(em.create(MessageRecipient, {
-          messageId: message.id,
-          recipientUserId: recipient.userId,
-          recipientType: recipient.type,
-          status: 'unread',
-        }))
+    // Validate the send transition BEFORE the atomic-flush block so a rejected
+    // send never mutates or flushes anything (everything checked here is known
+    // from the parsed input + the loaded message).
+    if (isSending) {
+      const finalVisibility = input.visibility ?? message.visibility
+      const finalSubject = input.subject ?? message.subject
+      const finalBody = input.body ?? message.body
+      const finalRecipientCount = input.recipients
+        ? input.recipients.length
+        : (preloadedRecipients?.length ?? 0)
+      if (finalVisibility !== 'public' && finalRecipientCount === 0) {
+        throw new Error('at least one recipient is required')
       }
+      if (!finalSubject?.trim()) throw new Error('subject is required')
+      if (!finalBody?.trim()) throw new Error('body is required')
     }
 
-    if (input.objects) {
-      await em.nativeDelete(MessageObject, { messageId: message.id })
-      for (const object of input.objects) {
-        em.persist(em.create(MessageObject, {
-          messageId: message.id,
-          entityModule: object.entityModule,
-          entityType: object.entityType,
-          entityId: object.entityId,
-          actionRequired: object.actionRequired,
-          actionType: object.actionType,
-          actionLabel: object.actionLabel,
-        }))
+    // Phase 1 mutates the managed `message` scalars; the per-phase flush issues
+    // those changes before phase 2's interleaved reads run (e.g.
+    // `linkAttachmentsToMessage` issues an `em.find`). Under MikroORM v7 a read
+    // between a scalar mutation and the terminal flush on the same EntityManager
+    // silently drops the pending changeset, so keeping the scalar edits in their
+    // own phase guarantees subject/body/etc. are persisted (SPEC-018 Problem 1).
+    await withAtomicFlush(em, [() => {
+      if (input.type !== undefined) message.type = input.type
+      if (input.visibility !== undefined) message.visibility = input.visibility
+      if (input.sourceEntityType !== undefined) message.sourceEntityType = input.sourceEntityType
+      if (input.sourceEntityId !== undefined) message.sourceEntityId = input.sourceEntityId
+      if (input.externalEmail !== undefined) message.externalEmail = input.externalEmail
+      if (input.externalName !== undefined) message.externalName = input.externalName
+      if (input.subject !== undefined) message.subject = input.subject
+      if (input.body !== undefined) message.body = input.body
+      if (input.bodyFormat !== undefined) message.bodyFormat = input.bodyFormat
+      if (input.priority !== undefined) message.priority = input.priority
+      if (input.actionData !== undefined) message.actionData = input.actionData
+      if (input.sendViaEmail !== undefined) message.sendViaEmail = input.sendViaEmail
+    }, async () => {
+      if (input.recipients) {
+        await em.nativeDelete(MessageRecipient, { messageId: message.id })
+        for (const recipient of input.recipients) {
+          em.persist(em.create(MessageRecipient, {
+            messageId: message.id,
+            recipientUserId: recipient.userId,
+            recipientType: recipient.type,
+            status: 'unread',
+          }))
+        }
       }
+
+      if (input.objects) {
+        await em.nativeDelete(MessageObject, { messageId: message.id })
+        for (const object of input.objects) {
+          em.persist(em.create(MessageObject, {
+            messageId: message.id,
+            entityModule: object.entityModule,
+            entityType: object.entityType,
+            entityId: object.entityId,
+            actionRequired: object.actionRequired,
+            actionType: object.actionType,
+            actionLabel: object.actionLabel,
+          }))
+        }
+      }
+
+      if (input.attachmentIds) {
+        const { Attachment } = await import('@open-mercato/core/modules/attachments/data/entities')
+        if (input.attachmentIds.length === 0) {
+          await em.nativeDelete(Attachment, {
+            entityId: MESSAGE_ATTACHMENT_ENTITY_ID,
+            recordId: message.id,
+            tenantId: input.tenantId,
+            organizationId: input.organizationId,
+          })
+        } else {
+          await em.nativeDelete(Attachment, {
+            entityId: MESSAGE_ATTACHMENT_ENTITY_ID,
+            recordId: message.id,
+            tenantId: input.tenantId,
+            organizationId: input.organizationId,
+            id: { $nin: input.attachmentIds },
+          })
+        }
+        await linkAttachmentsToMessage(
+          em,
+          message.id,
+          input.attachmentIds,
+          input.organizationId,
+          input.tenantId,
+        )
+      }
+
+      if (isSending) {
+        // Send transition was validated before the block; just apply the
+        // status mutations here (persisted by this phase's boundary flush).
+        message.isDraft = false
+        message.status = 'sent'
+        message.sentAt = new Date()
+        if (!message.threadId) message.threadId = message.id
+      }
+    }], { transaction: true })
+
+    await emitMessageIndexUpsert(ctx.container, {
+      messageId: message.id,
+      tenantId: input.tenantId,
+      organizationId: input.organizationId,
+    })
+
+    if (isSending) {
+      const recipientUserIds = input.recipients
+        ? input.recipients.map((r) => r.userId)
+        : (preloadedRecipients ?? []).map((r) => r.recipientUserId)
+      const resolvedVisibility = input.visibility ?? message.visibility
+      const resolvedSendViaEmail = input.sendViaEmail ?? message.sendViaEmail
+      await emitMessageSentEvent(ctx.container, {
+        messageId: message.id,
+        senderUserId: input.userId,
+        recipientUserIds,
+        sendViaEmail: resolvedVisibility === 'public' ? true : resolvedSendViaEmail,
+        externalEmail: message.externalEmail ?? null,
+        tenantId: input.tenantId,
+        organizationId: input.organizationId,
+      })
     }
 
-    if (input.attachmentIds) {
-      const { Attachment } = await import('@open-mercato/core/modules/attachments/data/entities')
-      if (input.attachmentIds.length === 0) {
-        await em.nativeDelete(Attachment, {
-          entityId: MESSAGE_ATTACHMENT_ENTITY_ID,
-          recordId: message.id,
-          tenantId: input.tenantId,
-          organizationId: input.organizationId,
-        })
-      } else {
-        await em.nativeDelete(Attachment, {
-          entityId: MESSAGE_ATTACHMENT_ENTITY_ID,
-          recordId: message.id,
-          tenantId: input.tenantId,
-          organizationId: input.organizationId,
-          id: { $nin: input.attachmentIds },
-        })
-      }
-      await linkAttachmentsToMessage(
-        em,
-        message.id,
-        input.attachmentIds,
-        input.organizationId,
-        input.tenantId,
-      )
-    }
-
-    await em.flush()
     return { ok: true, id: message.id }
   },
   async captureAfter(rawInput, _result, ctx) {
@@ -414,7 +663,7 @@ const updateDraftCommand: CommandHandler<unknown, { ok: true; id: string }> = {
   buildLog: async ({ input, snapshots }) => {
     const parsed = updateDraftCommandSchema.parse(input)
     return {
-      actionLabel: 'Update draft message',
+      actionLabel: parsed.isDraft === false ? 'Send draft message' : 'Update draft message',
       resourceKind: 'messages.message',
       resourceId: parsed.messageId,
       tenantId: parsed.tenantId,
@@ -508,7 +757,7 @@ const replyMessageCommand: CommandHandler<unknown, { id: string; externalEmail: 
         tenantId: input.tenantId,
         organizationId: input.organizationId,
       })
-      await trx.persistAndFlush(message)
+      await trx.persist(message).flush()
       for (const recipientUserId of recipientIds) {
         trx.persist(trx.create(MessageRecipient, {
           messageId: message.id,
@@ -550,6 +799,11 @@ const replyMessageCommand: CommandHandler<unknown, { id: string; externalEmail: 
       tenantId: input.tenantId,
       organizationId: input.organizationId,
     })
+    await emitMessageIndexUpsert(ctx.container, {
+      messageId,
+      tenantId: input.tenantId,
+      organizationId: input.organizationId,
+    })
 
     return {
       id: messageId,
@@ -588,6 +842,13 @@ const replyMessageCommand: CommandHandler<unknown, { id: string; externalEmail: 
     if (!message) return
     message.deletedAt = new Date()
     await em.flush()
+    await emitMessageGloballyDeletedEvent(ctx.container, {
+      messageId: after.message.id,
+      actorUserId: after.message.senderUserId,
+      recipientUserIds: after.recipients.map((recipient) => recipient.recipientUserId),
+      tenantId: after.message.tenantId,
+      organizationId: after.message.organizationId,
+    })
   },
 }
 
@@ -645,7 +906,7 @@ const forwardMessageCommand: CommandHandler<unknown, { id: string; externalEmail
         tenantId: input.tenantId,
         organizationId: input.organizationId,
       })
-      await trx.persistAndFlush(newMessage)
+      await trx.persist(newMessage).flush()
       for (const recipient of input.recipients) {
         trx.persist(trx.create(MessageRecipient, {
           messageId: newMessage.id,
@@ -690,6 +951,11 @@ const forwardMessageCommand: CommandHandler<unknown, { id: string; externalEmail
       tenantId: input.tenantId,
       organizationId: input.organizationId,
     })
+    await emitMessageIndexUpsert(ctx.container, {
+      messageId: newMessageId,
+      tenantId: input.tenantId,
+      organizationId: input.organizationId,
+    })
 
     return {
       id: newMessageId,
@@ -728,6 +994,13 @@ const forwardMessageCommand: CommandHandler<unknown, { id: string; externalEmail
     if (!message) return
     message.deletedAt = new Date()
     await em.flush()
+    await emitMessageGloballyDeletedEvent(ctx.container, {
+      messageId: after.message.id,
+      actorUserId: after.message.senderUserId,
+      recipientUserIds: after.recipients.map((recipient) => recipient.recipientUserId),
+      tenantId: after.message.tenantId,
+      organizationId: after.message.organizationId,
+    })
   },
 }
 
@@ -775,12 +1048,16 @@ const deleteForActorCommand: CommandHandler<unknown, { ok: true }> = {
       return { ok: true }
     }
     if (message.senderUserId === input.userId) {
+      const recipientRows = await em.find(MessageRecipient, { messageId: input.messageId })
       message.deletedAt = new Date()
       await em.flush()
-      await emitMessageDeletedEvent(ctx.container, {
+      const recipientUserIds = recipientRows
+        .map((row) => row.recipientUserId)
+        .filter((value): value is string => typeof value === 'string' && value.length > 0)
+      await emitMessageGloballyDeletedEvent(ctx.container, {
         messageId: input.messageId,
         actorUserId: input.userId,
-        target: 'sender',
+        recipientUserIds,
         tenantId: input.tenantId,
         organizationId: input.organizationId,
       })

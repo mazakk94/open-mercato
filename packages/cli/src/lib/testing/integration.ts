@@ -1,5 +1,4 @@
-import { GenericContainer } from 'testcontainers'
-import { spawn, type ChildProcess, type StdioOptions } from 'node:child_process'
+import type { ChildProcess, StdioOptions } from 'node:child_process'
 import { createServer } from 'node:net'
 import { existsSync, readFileSync } from 'node:fs'
 import { mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
@@ -7,7 +6,10 @@ import { createHash } from 'node:crypto'
 import path from 'node:path'
 import { createInterface, type Interface } from 'node:readline/promises'
 import { stdin as input, stdout as output } from 'node:process'
+import spawn from 'cross-spawn'
+import { fetchWithTimeout, type FetchWithTimeoutInit } from '@open-mercato/shared/lib/http/fetchWithTimeout'
 import { resolveEnvironment } from '../resolver'
+import { resolveSpawnCommand } from '../spawn'
 import { discoverIntegrationSpecFiles as discoverIntegrationSpecFilesShared } from './integration-discovery'
 import { resolveDockerHostFromContext, runCommandAndCapture } from './runtime-utils'
 
@@ -73,6 +75,7 @@ type IntegrationCoverageOptions = {
   verbose: boolean
   workers: number | null
   retries: number | null
+  shard: string | null
   json: boolean
   keepRawV8: boolean
   forceRebuild: boolean
@@ -135,12 +138,16 @@ type EphemeralEnvironmentState = {
   status: 'running'
   baseUrl: string
   port: number
+  databaseUrl: string
+  queueBaseDir: string
   source: string
   captureScreenshots: boolean
   startedAt: string
 }
 
-type PlaywrightRunOptions = Pick<InteractiveIntegrationOptions, 'verbose' | 'captureScreenshots' | 'workers' | 'retries'>
+type PlaywrightRunOptions = Pick<InteractiveIntegrationOptions, 'verbose' | 'captureScreenshots' | 'workers' | 'retries'> & {
+  shard?: string | null
+}
 
 const DEFAULT_APP_READY_TIMEOUT_MS = 90_000
 const APP_READY_INTERVAL_MS = 1_000
@@ -212,6 +219,8 @@ const EPHEMERAL_ENV_FILE_PATH = path.join(projectRootDirectory, '.ai', 'qa', 'ep
 const EPHEMERAL_ENV_LOCK_PATH = path.join(projectRootDirectory, '.ai', 'qa', 'ephemeral-env.lock')
 const LEGACY_EPHEMERAL_ENV_FILE_PATH = path.join(projectRootDirectory, '.ai', 'qa', 'ephemeral-env.md')
 const EPHEMERAL_BUILD_CACHE_STATE_PATH = path.join(projectRootDirectory, '.ai', 'qa', 'ephemeral-build-cache.json')
+const EPHEMERAL_CACHE_DB_PATH = path.join(projectRootDirectory, '.ai', 'qa', 'ephemeral-cache.sqlite')
+const EPHEMERAL_QUEUE_BASE_DIR = path.join(appDirectory, '.mercato', 'queue')
 const PLAYWRIGHT_INTEGRATION_CONFIG_PATH = '.ai/qa/tests/playwright.config.ts'
 const PLAYWRIGHT_RESULTS_JSON_PATH = path.join(projectRootDirectory, '.ai', 'qa', 'test-results', 'results.json')
 const LEGACY_INTEGRATION_TEST_ROOT = path.join(projectRootDirectory, '.ai', 'qa', 'tests')
@@ -251,7 +260,13 @@ const FOLDER_TO_CATEGORY_CODE: Record<string, string> = {
   api: 'API',
   integration: 'INT',
 }
-const BUILD_CACHE_STATE_VERSION = 1
+const BUILD_CACHE_STATE_VERSION = 2
+const BUILD_CACHE_ENV_KEYS = [
+  'NODE_ENV',
+  'OM_ENABLE_ENTERPRISE_MODULES',
+  'OM_ENABLE_ENTERPRISE_MODULES_SSO',
+  'OM_ENABLE_ENTERPRISE_MODULES_SECURITY',
+] as const
 const IGNORED_EPHEMERAL_BUILD_CACHE_DIRS = new Set([
   'node_modules',
   '.next',
@@ -270,6 +285,7 @@ type BuildCacheState = {
   version: number
   builtAt: number
   sourceFingerprint: string
+  environmentFingerprint: string
   artifactPaths: string[]
   projectRoot: string
 }
@@ -280,6 +296,7 @@ type BuildCacheOptions = {
   cacheStatePath?: string
   projectRoot?: string
   precomputedSourceFingerprint?: string
+  environmentFingerprint?: string
 }
 
 type CommandOutputMonitoringResult = {
@@ -311,10 +328,18 @@ type BackendLoginProbeResult = {
   detail: string
 }
 
+type AuthenticatedApiProbeResult = {
+  loginStatus: number | null
+  apiStatus: number | null
+  healthy: boolean
+  detail: string
+}
+
 type ApplicationReadinessProbeResult = {
   ready: boolean
   frontend: LoginPageProbeResult
   backend: BackendLoginProbeResult
+  authenticated: AuthenticatedApiProbeResult
 }
 
 type PlaywrightFailureHealthCheckOptions = {
@@ -338,6 +363,15 @@ function buildEnvironment(overrides: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     ...process.env,
     ...overrides,
   }
+}
+
+function buildEnvironmentFingerprint(environment: NodeJS.ProcessEnv): string {
+  const publicKeys = Object.keys(environment)
+    .filter((key) => key.startsWith('NEXT_PUBLIC_'))
+    .sort((left, right) => left.localeCompare(right))
+  const keys = Array.from(new Set([...BUILD_CACHE_ENV_KEYS, ...publicKeys]))
+  const fingerprintParts = keys.map((key) => `${key}=${environment[key] ?? ''}`)
+  return createHash('sha256').update(fingerprintParts.join('\n'), 'utf8').digest('hex')
 }
 
 async function resetNextBuildOutputDirectories(logPrefix: string): Promise<void> {
@@ -429,10 +463,12 @@ async function runCommandWithOutputMonitoring(
   opts: CommandMonitoringOptions = {},
 ): Promise<CommandOutputMonitoringResult> {
   return new Promise((resolve, reject) => {
-    const commandHandle = spawn(command, commandArgs, {
+    const resolvedSpawn = resolveSpawnCommand(command, commandArgs)
+    const commandHandle = spawn(resolvedSpawn.command, resolvedSpawn.args, {
       cwd: projectRootDirectory,
       env: environment,
       stdio: ['ignore', 'pipe', 'pipe'],
+      ...resolvedSpawn.spawnOptions,
     })
 
     let output = ''
@@ -607,10 +643,12 @@ function runYarnRawCommand(
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const outputMode: StdioOptions = opts.silent ? ['ignore', 'pipe', 'pipe'] : 'inherit'
-    const command: ChildProcess = spawn(resolveYarnBinary(), commandArgs, {
+    const resolvedSpawn = resolveSpawnCommand(resolveYarnBinary(), commandArgs)
+    const command: ChildProcess = spawn(resolvedSpawn.command, resolvedSpawn.args, {
       cwd,
       env: environment,
       stdio: outputMode,
+      ...resolvedSpawn.spawnOptions,
     })
     let bufferedOutput = ''
     if (opts.silent) {
@@ -638,10 +676,12 @@ function runYarnRawCommand(
 function runNpxCommand(args: string[], environment: NodeJS.ProcessEnv): Promise<void> {
   const binary = process.platform === 'win32' ? 'npx.cmd' : 'npx'
   return new Promise((resolve, reject) => {
-    const command = spawn(binary, args, {
+    const resolvedSpawn = resolveSpawnCommand(binary, args)
+    const command = spawn(resolvedSpawn.command, resolvedSpawn.args, {
       cwd: projectRootDirectory,
       env: environment,
       stdio: 'inherit',
+      ...resolvedSpawn.spawnOptions,
     })
     command.on('error', reject)
     command.on('exit', (code) => {
@@ -661,10 +701,12 @@ function startYarnRawCommand(
   cwd: string = projectRootDirectory,
 ): ChildProcess {
   const outputMode: StdioOptions = opts.silent ? ['ignore', 'pipe', 'pipe'] : 'inherit'
-  const processHandle: ChildProcess = spawn(resolveYarnBinary(), commandArgs, {
+  const resolvedSpawn = resolveSpawnCommand(resolveYarnBinary(), commandArgs)
+  const processHandle: ChildProcess = spawn(resolvedSpawn.command, resolvedSpawn.args, {
     cwd,
     env: environment,
     stdio: outputMode,
+    ...resolvedSpawn.spawnOptions,
   })
   if (opts.silent) {
     processHandle.stdout?.on('data', () => {})
@@ -730,6 +772,14 @@ function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, milliseconds)
   })
+}
+
+// Each readiness probe fetch is bounded so a single stuck connection cannot consume the whole
+// readiness budget; on timeout it surfaces as a probe failure and the next cycle retries.
+const READINESS_PROBE_FETCH_TIMEOUT_MS = 15_000
+
+function probeFetch(input: string, init: FetchWithTimeoutInit = {}): Promise<Response> {
+  return fetchWithTimeout(input, { timeoutMs: READINESS_PROBE_FETCH_TIMEOUT_MS, ...init })
 }
 
 export function resolveBuildCacheTtlSeconds(logPrefix: string): number {
@@ -880,7 +930,15 @@ async function hasBuildInputChangesSince(
       }
       seenPaths.add(resolvedPath)
 
-      const fileStat = await stat(resolvedPath)
+      let fileStat: Awaited<ReturnType<typeof stat>>
+      try {
+        fileStat = await stat(resolvedPath)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+          return true
+        }
+        throw error
+      }
       if (fileStat.isFile() && fileStat.mtimeMs > timestampMs) {
         return true
       }
@@ -921,6 +979,9 @@ async function readBuildCacheState(cacheStatePath: string): Promise<BuildCacheSt
   if (typeof maybeState.sourceFingerprint !== 'string' || maybeState.sourceFingerprint.length === 0) {
     return null
   }
+  if (typeof maybeState.environmentFingerprint !== 'string' || maybeState.environmentFingerprint.length === 0) {
+    return null
+  }
   if (!Array.isArray(maybeState.artifactPaths) || maybeState.artifactPaths.length === 0) {
     return null
   }
@@ -932,6 +993,7 @@ async function readBuildCacheState(cacheStatePath: string): Promise<BuildCacheSt
     version: BUILD_CACHE_STATE_VERSION,
     builtAt: maybeState.builtAt,
     sourceFingerprint: maybeState.sourceFingerprint,
+    environmentFingerprint: maybeState.environmentFingerprint,
     artifactPaths: maybeState.artifactPaths.filter((entry): entry is string => typeof entry === 'string'),
     projectRoot: maybeState.projectRoot,
   }
@@ -942,6 +1004,10 @@ async function writeBuildCacheState(
   options: BuildCacheOptions = {},
 ): Promise<void> {
   const defaults = buildCacheDefaults(options)
+  const environmentFingerprint = options.environmentFingerprint ?? ''
+  if (!environmentFingerprint) {
+    throw new Error('Build cache state requires an environment fingerprint.')
+  }
   await mkdir(path.dirname(defaults.cacheStatePath), { recursive: true })
   await writeFile(
     defaults.cacheStatePath,
@@ -950,6 +1016,7 @@ async function writeBuildCacheState(
         version: BUILD_CACHE_STATE_VERSION,
         builtAt: Date.now(),
         sourceFingerprint,
+        environmentFingerprint,
         artifactPaths: defaults.artifactPaths,
         projectRoot: defaults.projectRoot,
       },
@@ -984,10 +1051,15 @@ export async function shouldReuseBuildArtifacts(
 
   const defaults = buildCacheDefaults(options)
   const currentSourceFingerprint = options.precomputedSourceFingerprint ?? (await buildSourceFingerprint(defaults))
+  const currentEnvironmentFingerprint = options.environmentFingerprint ?? ''
   if (!currentSourceFingerprint) {
     console.log(
       `[${logPrefix}] Build cache disabled: unable to collect source fingerprints from tracked sources.`,
     )
+    return false
+  }
+  if (!currentEnvironmentFingerprint) {
+    console.log(`[${logPrefix}] Build cache disabled: missing environment fingerprint for cache validation.`)
     return false
   }
 
@@ -1014,6 +1086,10 @@ export async function shouldReuseBuildArtifacts(
     console.log(`[${logPrefix}] Build cache disabled: source files changed since last build.`)
     return false
   }
+  if (state.environmentFingerprint !== currentEnvironmentFingerprint) {
+    console.log(`[${logPrefix}] Build cache disabled: build-shaping environment changed since last build.`)
+    return false
+  }
 
   for (const artifactPath of defaults.artifactPaths) {
     if (await isBuildArtifactMissing(artifactPath)) {
@@ -1037,10 +1113,17 @@ export async function shouldRebuildBuildArtifacts(
 }
 
 async function getFreePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
+  const tryListen = (host: string): Promise<number | null> => new Promise((resolve, reject) => {
     const server = createServer()
-    server.on('error', reject)
-    server.listen(0, '127.0.0.1', () => {
+    server.on('error', (error) => {
+      const errorCode = (error as NodeJS.ErrnoException).code
+      if (errorCode === 'EAFNOSUPPORT') {
+        resolve(null)
+        return
+      }
+      reject(error)
+    })
+    server.listen(0, host, () => {
       const address = server.address()
       if (!address || typeof address === 'string') {
         server.close()
@@ -1057,6 +1140,8 @@ async function getFreePort(): Promise<number> {
       })
     })
   })
+
+  return (await tryListen('::')) ?? await tryListen('127.0.0.1') ?? Promise.reject(new Error('Unable to allocate free port'))
 }
 
 async function isPortAvailable(port: number): Promise<boolean> {
@@ -1077,17 +1162,17 @@ async function isPortAvailable(port: number): Promise<boolean> {
     })
   })
 
+  const wildcardIpv6Availability = await canBind('::')
+  if (wildcardIpv6Availability === false) {
+    return false
+  }
+
   const ipv4Availability = await canBind('127.0.0.1')
   if (ipv4Availability === false) {
     return false
   }
 
-  const ipv6Availability = await canBind('::1')
-  if (ipv6Availability === false) {
-    return false
-  }
-
-  return ipv4Availability === true || ipv6Availability === true
+  return wildcardIpv6Availability === true || ipv4Availability === true
 }
 
 async function getPreferredPort(preferredPort: number): Promise<number> {
@@ -1102,6 +1187,8 @@ async function getPreferredPort(preferredPort: number): Promise<number> {
 export async function writeEphemeralEnvironmentState(input: {
   baseUrl: string
   port: number
+  databaseUrl: string
+  queueBaseDir: string
   logPrefix: string
   captureScreenshots: boolean
 }): Promise<void> {
@@ -1109,6 +1196,8 @@ export async function writeEphemeralEnvironmentState(input: {
     status: 'running',
     baseUrl: input.baseUrl,
     port: input.port,
+    databaseUrl: input.databaseUrl,
+    queueBaseDir: input.queueBaseDir,
     source: input.logPrefix,
     captureScreenshots: input.captureScreenshots,
     startedAt: new Date().toISOString(),
@@ -1153,6 +1242,12 @@ export async function readEphemeralEnvironmentState(): Promise<EphemeralEnvironm
   if (typeof record.port !== 'number' || !Number.isFinite(record.port) || record.port < 1) {
     return null
   }
+  if (typeof record.databaseUrl !== 'string' || record.databaseUrl.length === 0) {
+    return null
+  }
+  if (typeof record.queueBaseDir !== 'string' || record.queueBaseDir.length === 0) {
+    return null
+  }
   if (typeof record.source !== 'string' || record.source.length === 0) {
     return null
   }
@@ -1167,6 +1262,8 @@ export async function readEphemeralEnvironmentState(): Promise<EphemeralEnvironm
     status: 'running',
     baseUrl: record.baseUrl,
     port: record.port,
+    databaseUrl: record.databaseUrl,
+    queueBaseDir: record.queueBaseDir,
     source: record.source,
     captureScreenshots: record.captureScreenshots,
     startedAt: record.startedAt,
@@ -1183,7 +1280,7 @@ function isSuccessfulBrowserNavigationStatus(status: number): boolean {
 
 async function probeLoginPage(baseUrl: string): Promise<LoginPageProbeResult> {
   try {
-    const response = await fetch(`${baseUrl}/login`, {
+    const response = await probeFetch(`${baseUrl}/login`, {
       method: 'GET',
       redirect: 'manual',
     })
@@ -1229,7 +1326,7 @@ async function probeBackendLoginEndpoint(baseUrl: string): Promise<BackendLoginP
     const form = new URLSearchParams()
     form.set('email', 'integration-healthcheck@example.invalid')
     form.set('password', 'invalid-password')
-    const response = await fetch(`${baseUrl}/api/auth/login`, {
+    const response = await probeFetch(`${baseUrl}/api/auth/login`, {
       method: 'POST',
       redirect: 'manual',
       headers: {
@@ -1256,16 +1353,80 @@ async function probeBackendLoginEndpoint(baseUrl: string): Promise<BackendLoginP
   }
 }
 
+async function probeAuthenticatedApi(baseUrl: string): Promise<AuthenticatedApiProbeResult> {
+  try {
+    const form = new URLSearchParams()
+    form.set('email', 'admin@acme.com')
+    form.set('password', 'secret')
+    const loginResponse = await probeFetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      redirect: 'manual',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: form.toString(),
+    })
+
+    const rawBody = await loginResponse.text().catch(() => '')
+    let token: string | null = null
+    if (rawBody) {
+      try {
+        const parsed = JSON.parse(rawBody) as { token?: unknown }
+        token = typeof parsed.token === 'string' && parsed.token.length > 0 ? parsed.token : null
+      } catch {
+        token = null
+      }
+    }
+
+    if (!loginResponse.ok || !token) {
+      return {
+        loginStatus: loginResponse.status,
+        apiStatus: null,
+        healthy: false,
+        detail: loginResponse.ok
+          ? 'POST /api/auth/login did not return an auth token'
+          : `POST /api/auth/login returned ${loginResponse.status}`,
+      }
+    }
+
+    const apiResponse = await probeFetch(`${baseUrl}/api/customers/people?pageSize=1`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    })
+
+    const healthy = apiResponse.status === 200
+    return {
+      loginStatus: loginResponse.status,
+      apiStatus: apiResponse.status,
+      healthy,
+      detail: healthy
+        ? 'Authenticated GET /api/customers/people returned 200'
+        : `Authenticated GET /api/customers/people returned ${apiResponse.status}`,
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    return {
+      loginStatus: null,
+      apiStatus: null,
+      healthy: false,
+      detail: `Authenticated readiness probe failed: ${message}`,
+    }
+  }
+}
+
 async function probeApplicationReadiness(baseUrl: string): Promise<ApplicationReadinessProbeResult> {
-  const [frontend, backend] = await Promise.all([
+  const [frontend, backend, authenticated] = await Promise.all([
     probeLoginPage(baseUrl),
     probeBackendLoginEndpoint(baseUrl),
+    probeAuthenticatedApi(baseUrl),
   ])
 
   return {
-    ready: frontend.healthy && backend.healthy,
+    ready: frontend.healthy && backend.healthy && authenticated.healthy,
     frontend,
     backend,
+    authenticated,
   }
 }
 
@@ -1484,26 +1645,56 @@ export async function acquireEphemeralRuntimeLock(
   }
 }
 
-function buildReusableEnvironment(baseUrl: string, captureScreenshots: boolean): NodeJS.ProcessEnv {
+function buildReusableEnvironment(
+  baseUrl: string,
+  databaseUrl: string,
+  queueBaseDir: string,
+  captureScreenshots: boolean,
+): NodeJS.ProcessEnv {
   const enterpriseModulesFlag = process.env.OM_ENABLE_ENTERPRISE_MODULES ?? 'false'
   return buildEnvironment({
+    DATABASE_URL: databaseUrl,
     BASE_URL: baseUrl,
     APP_URL: baseUrl,
     NEXT_PUBLIC_APP_URL: baseUrl,
     NODE_ENV: 'production',
     JWT_SECRET: process.env.JWT_SECRET ?? 'om-ephemeral-integration-jwt-secret',
     OM_SECURITY_MFA_SETUP_SECRET: process.env.OM_SECURITY_MFA_SETUP_SECRET ?? 'om-ephemeral-integration-mfa-setup-secret',
+    // Integration probe + tests expect `admin@acme.com / secret` and
+    // `employee@acme.com / secret`. NODE_ENV=production routes derived-user
+    // password resolution through the random-fallback branch unless these
+    // env vars are explicitly set; without the override every fresh
+    // ephemeral run would mint random passwords and the login probe would
+    // never converge. This is the documented production contract: set
+    // OM_INIT_*_PASSWORD to fix the seeded credential.
+    OM_INIT_ADMIN_PASSWORD: process.env.OM_INIT_ADMIN_PASSWORD ?? 'secret',
+    OM_INIT_EMPLOYEE_PASSWORD: process.env.OM_INIT_EMPLOYEE_PASSWORD ?? 'secret',
     OM_INTEGRATION_TEST: 'true',
     OM_ENABLE_ENTERPRISE_MODULES: enterpriseModulesFlag,
     OM_ENABLE_ENTERPRISE_MODULES_SSO: process.env.OM_ENABLE_ENTERPRISE_MODULES_SSO ?? enterpriseModulesFlag,
     OM_ENABLE_ENTERPRISE_MODULES_SECURITY: process.env.OM_ENABLE_ENTERPRISE_MODULES_SECURITY ?? enterpriseModulesFlag,
     OM_TEST_MODE: '1',
+    OM_TEST_AUTH_RATE_LIMIT_MODE: 'opt-in',
+    // Tests assert on access_logs immediately after CRUD reads; keep the
+    // blocking write path on inside the integration runtime so tests do
+    // not have to call flushPendingCrudAccessLogs() explicitly.
+    OM_CRUD_ACCESS_LOG_BLOCKING: process.env.OM_CRUD_ACCESS_LOG_BLOCKING ?? '1',
+    OM_WEBHOOKS_ALLOW_PRIVATE_URLS: process.env.OM_WEBHOOKS_ALLOW_PRIVATE_URLS ?? '1',
+    // Keep the bus in the Playwright process (used by in-test queue-drain helpers)
+    // on the same delivery mode as the app server it drives: inline persistent
+    // delivery so event side effects are deterministic for assertions. See the
+    // matching OM_EVENTS_SINGLE_DELIVERY note on the app server environment below.
+    OM_EVENTS_SINGLE_DELIVERY: process.env.OM_EVENTS_SINGLE_DELIVERY ?? 'false',
     ENABLE_CRUD_API_CACHE: 'true',
+    MOCK_GATEWAY_WEBHOOK_SECRET: 'open-mercato-mock-dev-webhook-secret',
+    MOCK_CARRIER_WEBHOOK_SECRET: 'open-mercato-mock-dev-carrier-webhook-secret',
     NEXT_PUBLIC_OM_EXAMPLE_INJECTION_WIDGETS_ENABLED: 'true',
     NEXT_PUBLIC_UMES_DEVTOOLS: 'true',
     CI: 'true',
+    TENANT_DATA_ENCRYPTION_FALLBACK_KEY: process.env.TENANT_DATA_ENCRYPTION_FALLBACK_KEY ?? 'om-ephemeral-integration-fallback-key',
     OM_CLI_QUIET: '1',
     MERCATO_QUIET: '1',
+    QUEUE_BASE_DIR: queueBaseDir,
     NODE_NO_WARNINGS: '1',
     PW_CAPTURE_SCREENSHOTS: captureScreenshots ? '1' : '0',
   })
@@ -1560,37 +1751,63 @@ export async function tryReuseExistingEnvironment(options: EphemeralRuntimeOptio
   return {
     baseUrl: state.baseUrl,
     port: state.port,
-    databaseUrl: '',
-    commandEnvironment: buildReusableEnvironment(state.baseUrl, state.captureScreenshots),
+    databaseUrl: state.databaseUrl,
+    commandEnvironment: buildReusableEnvironment(
+      state.baseUrl,
+      state.databaseUrl,
+      state.queueBaseDir,
+      state.captureScreenshots,
+    ),
     ownedByCurrentProcess: false,
     stop: async () => {},
   }
 }
 
-async function waitForApplicationReadiness(
+export async function waitForApplicationReadiness(
   baseUrl: string,
   appProcess: ChildProcess,
-  options: { timeoutMs: number },
+  options: { timeoutMs: number; intervalMs?: number; stabilizationMs?: number },
 ): Promise<void> {
   const startTimestamp = Date.now()
-  const exitPromise = getProcessExitPromise(appProcess)
-  const readinessStabilizationMs = 600
+  const intervalMs = options.intervalMs ?? APP_READY_INTERVAL_MS
+  const readinessStabilizationMs = options.stabilizationMs ?? 600
   let lastProbe: ApplicationReadinessProbeResult | null = null
 
+  // Wrap process exit into a single never-rejecting promise so we can race it without piling up
+  // rejection handlers or losing the exit code across loop iterations.
+  let exitCode: number | null = null
+  const exitSignal = getProcessExitPromise(appProcess).then(
+    (code) => {
+      exitCode = code ?? null
+      return { exited: true as const }
+    },
+    () => {
+      exitCode = null
+      return { exited: true as const }
+    },
+  )
+  const exitError = () =>
+    new Error(`Application process exited before readiness check (exit ${exitCode ?? 'unknown'})`)
+
   while (Date.now() - startTimestamp < options.timeoutMs) {
-    const result = await Promise.race([
-      probeApplicationReadiness(baseUrl).then((probe) => ({ kind: 'probe' as const, probe })),
-      exitPromise.then((code) => ({ kind: 'exit' as const, code })),
-      delay(APP_READY_INTERVAL_MS).then(() => ({ kind: 'timeout' as const })),
+    // Run one probe cycle to completion before starting the next. Overlapping cycles (the previous
+    // race-against-a-1s-tick design) abandoned slow probes without cancelling them, so every second
+    // a fresh /api/auth/login attempt piled onto the most expensive endpoint — amplifying the very
+    // contention that delays readiness when 15 ephemeral shards boot in parallel. Each fetch is
+    // independently bounded by fetchWithTimeout, so a stuck connection cannot stall the cycle.
+    const cycle = await Promise.race([
+      probeApplicationReadiness(baseUrl).then((probe) => ({ probe })),
+      exitSignal,
     ])
 
-    if (result.kind === 'probe') {
-      lastProbe = result.probe
-      if (!result.probe.ready) {
-        continue
-      }
+    if ('exited' in cycle) {
+      throw exitError()
+    }
+
+    lastProbe = cycle.probe
+    if (cycle.probe.ready) {
       const processExited = await Promise.race([
-        exitPromise.then(() => true),
+        exitSignal.then(() => true),
         delay(readinessStabilizationMs).then(() => false),
       ])
       if (processExited) {
@@ -1598,15 +1815,24 @@ async function waitForApplicationReadiness(
       }
       return
     }
-    if (result.kind === 'exit') {
-      throw new Error(`Application process exited before readiness check (exit ${result.code ?? 'unknown'})`)
+
+    const remainingMs = options.timeoutMs - (Date.now() - startTimestamp)
+    if (remainingMs <= 0) break
+    const waited = await Promise.race([
+      exitSignal,
+      delay(Math.min(intervalMs, remainingMs)).then(() => null),
+    ])
+    if (waited && 'exited' in waited) {
+      throw exitError()
     }
   }
 
   const lastFrontendDetail = lastProbe?.frontend.detail ?? 'GET /login was never observed'
   const lastBackendDetail = lastProbe?.backend.detail ?? 'POST /api/auth/login was never observed'
+  const lastAuthenticatedDetail = lastProbe?.authenticated.detail ?? 'Authenticated API probe was never observed'
   throw new Error(
-    `Application did not become ready within ${options.timeoutMs / 1000} seconds. Last probe: ${lastFrontendDetail}; ${lastBackendDetail}`,
+    `Application did not become ready within ${options.timeoutMs / 1000} seconds. ` +
+    `Last probe: ${lastFrontendDetail}; ${lastBackendDetail}; ${lastAuthenticatedDetail}`,
   )
 }
 
@@ -1814,6 +2040,7 @@ export function parseIntegrationCoverageOptions(rawArgs: string[]): IntegrationC
   let verbose = false
   let workers: number | null = null
   let retries: number | null = null
+  let shard: string | null = null
   let json = false
   let keepRawV8 = false
   let forceRebuild = false
@@ -1898,6 +2125,26 @@ export function parseIntegrationCoverageOptions(rawArgs: string[]): IntegrationC
       retries = parsed
       continue
     }
+    if (argument === '--shard') {
+      const value = rawArgs[index + 1]
+      if (!value || value.startsWith('--')) {
+        throw new Error('Missing value for --shard')
+      }
+      if (!/^\d+\/\d+$/.test(value)) {
+        throw new Error(`Invalid --shard value: ${value}. Expected format: N/M`)
+      }
+      shard = value
+      index += 1
+      continue
+    }
+    if (argument.startsWith('--shard=')) {
+      const value = argument.slice('--shard='.length)
+      if (!/^\d+\/\d+$/.test(value)) {
+        throw new Error(`Invalid --shard value: ${value}. Expected format: N/M`)
+      }
+      shard = value
+      continue
+    }
     if (argument === '--json') {
       json = true
       continue
@@ -1924,6 +2171,7 @@ export function parseIntegrationCoverageOptions(rawArgs: string[]): IntegrationC
     verbose,
     workers,
     retries,
+    shard,
     json,
     keepRawV8,
     forceRebuild,
@@ -2360,6 +2608,7 @@ export async function runIntegrationCoverageReport(rawArgs: string[]): Promise<v
           captureScreenshots: options.captureScreenshots,
           workers: options.workers,
           retries: options.retries,
+          shard: options.shard,
         },
       )
       return null
@@ -2480,6 +2729,9 @@ async function runPlaywrightSelection(
   }
   if (options.retries !== null) {
     args.push('--retries', String(options.retries))
+  }
+  if (options.shard) {
+    args.push('--shard', options.shard)
   }
   if (Array.isArray(selection) && selection.length > 0) {
     args.push(...selection)
@@ -2692,6 +2944,7 @@ export async function startEphemeralEnvironment(options: EphemeralRuntimeOptions
     const databaseUser = 'mercato'
     const databasePassword = 'secret'
 
+    const { GenericContainer } = await import('testcontainers')
     const databaseContainer = await new GenericContainer('postgres:16')
       .withEnvironment({
         POSTGRES_DB: databaseName,
@@ -2704,19 +2957,37 @@ export async function startEphemeralEnvironment(options: EphemeralRuntimeOptions
     const databaseHost = databaseContainer.getHost()
     const databasePort = databaseContainer.getMappedPort(5432)
     const databaseUrl = `postgres://${databaseUser}:${databasePassword}@${databaseHost}:${databasePort}/${databaseName}`
+    await rm(EPHEMERAL_CACHE_DB_PATH, { force: true }).catch(() => undefined)
+    await rm(EPHEMERAL_QUEUE_BASE_DIR, { recursive: true, force: true }).catch(() => undefined)
     const enterpriseModulesFlag = process.env.OM_ENABLE_ENTERPRISE_MODULES ?? 'false'
     const commandEnvironment = buildEnvironment({
       DATABASE_URL: databaseUrl,
+      CACHE_STRATEGY: 'sqlite',
+      CACHE_SQLITE_PATH: EPHEMERAL_CACHE_DB_PATH,
       BASE_URL: applicationBaseUrl,
       APP_URL: applicationBaseUrl,
       NEXT_PUBLIC_APP_URL: applicationBaseUrl,
       JWT_SECRET: process.env.JWT_SECRET ?? 'om-ephemeral-integration-jwt-secret',
       OM_SECURITY_MFA_SETUP_SECRET: process.env.OM_SECURITY_MFA_SETUP_SECRET ?? 'om-ephemeral-integration-mfa-setup-secret',
       NODE_ENV: 'production',
-      DB_POOL_MIN: '0',
-      DB_POOL_MAX: '5',
-      DB_POOL_IDLE_TIMEOUT: '1000',
-      DB_POOL_ACQUIRE_TIMEOUT: '10000',
+      // See the auth-probe block above: pin derived-user passwords to the
+      // documented 'secret' so the ephemeral login probe converges under
+      // NODE_ENV=production.
+      OM_INIT_ADMIN_PASSWORD: process.env.OM_INIT_ADMIN_PASSWORD ?? 'secret',
+      OM_INIT_EMPLOYEE_PASSWORD: process.env.OM_INIT_EMPLOYEE_PASSWORD ?? 'secret',
+      // Pool sizing for the ephemeral integration runtime. Defaults were once
+      // very aggressive (max=5, idle=1000) which exposed flaky 'timeout exceeded
+      // when trying to connect' errors on `progressService.createJob`-backed
+      // endpoints (sync_excel.import, data_sync.run, progress.jobs) — each
+      // request acquires a transaction connection plus a separate connection
+      // for the encryption subscriber's fetchMap probe, and with 1s idle close
+      // the pool thrashes faster than pg-pool can repopulate. These values
+      // still keep the pool tighter than production but give enough headroom
+      // for the legitimate query bursts.
+      DB_POOL_MIN: '2',
+      DB_POOL_MAX: '20',
+      DB_POOL_IDLE_TIMEOUT: '10000',
+      DB_POOL_ACQUIRE_TIMEOUT: '15000',
       DB_IDLE_SESSION_TIMEOUT_MS: '30000',
       DB_IDLE_IN_TRANSACTION_TIMEOUT_MS: '30000',
       OM_INTEGRATION_TEST: 'true',
@@ -2726,15 +2997,45 @@ export async function startEphemeralEnvironment(options: EphemeralRuntimeOptions
       OM_TEST_MODE: '1',
       OM_TEST_AUTH_RATE_LIMIT_MODE: 'opt-in',
       OM_DISABLE_EMAIL_DELIVERY: '1',
+      OM_WEBHOOKS_ALLOW_PRIVATE_URLS: process.env.OM_WEBHOOKS_ALLOW_PRIVATE_URLS ?? '1',
       ENABLE_CRUD_API_CACHE: 'true',
+      MOCK_GATEWAY_WEBHOOK_SECRET: 'open-mercato-mock-dev-webhook-secret',
+      MOCK_CARRIER_WEBHOOK_SECRET: 'open-mercato-mock-dev-carrier-webhook-secret',
       NEXT_PUBLIC_OM_EXAMPLE_INJECTION_WIDGETS_ENABLED: 'true',
       NEXT_PUBLIC_UMES_DEVTOOLS: 'true',
       CI: 'true',
-      TENANT_DATA_ENCRYPTION_FALLBACK_KEY: 'om-ephemeral-integration-fallback-key',
-      AUTO_SPAWN_WORKERS: 'false',
+      TENANT_DATA_ENCRYPTION_FALLBACK_KEY: process.env.TENANT_DATA_ENCRYPTION_FALLBACK_KEY ?? 'om-ephemeral-integration-fallback-key',
+      AUTO_SPAWN_WORKERS: process.env.AUTO_SPAWN_WORKERS ?? 'true',
+      // Process persistent event subscribers INLINE in the request that emits
+      // the event (legacy dual-dispatch), rather than the production default of
+      // worker-only single delivery. Integration specs assert event side effects
+      // (sync mappings, workflow-trigger instances, notifications) immediately
+      // after the emitting API call and poll for them on short budgets; routing
+      // those subscribers through the async events worker makes the side effect
+      // race the poll under the 15-shard CI load, which surfaced as flaky
+      // timeouts in TC-CRM-028 (inbound sync mapping) and TC-WF-008 (event-
+      // triggered workflow) once single-delivery became default-ON. Inline
+      // delivery makes the side effects deterministic for tests; production keeps
+      // the single-delivery default. Honor an explicit override if the caller set one.
+      OM_EVENTS_SINGLE_DELIVERY: process.env.OM_EVENTS_SINGLE_DELIVERY ?? 'false',
       AUTO_SPAWN_SCHEDULER: 'false',
+      // Hide the demo feedback floating action button — it lives at
+      // `fixed bottom-6 right-6 z-banner` and consistently intercepts pointer
+      // events on row-action menus and other bottom-of-viewport UI elements
+      // (e.g. TC-WF-006 Delete menuitem click). The widget is already gated
+      // on `DEMO_MODE !== 'false'` in the backend layout, so opting out here
+      // only affects the integration test runtime — dev + prod stay unchanged.
+      DEMO_MODE: 'false',
+      // Disable the feature-toggle resolution cache. Tests flip overrides
+      // (e.g. example_customers_sync enabled/bidirectional) between cases; the
+      // 1-minute resolution cache can serve a stale value across set/clear
+      // under fast churn, which made the example.todo.* persistent subscribers
+      // skip enqueueing inbound sync jobs (TC-CRM-028 inbound trio flake).
+      // Fresh DB reads make flag-gated sync deterministic in tests only.
+      OM_FEATURE_TOGGLES_CACHE_DISABLED: '1',
       OM_CLI_QUIET: '1',
       MERCATO_QUIET: '1',
+      QUEUE_BASE_DIR: EPHEMERAL_QUEUE_BASE_DIR,
       NODE_NO_WARNINGS: '1',
       PORT: String(applicationPort),
       PW_CAPTURE_SCREENSHOTS: options.captureScreenshots ? '1' : '0',
@@ -2761,6 +3062,7 @@ export async function startEphemeralEnvironment(options: EphemeralRuntimeOptions
     try {
       const appReadyTimeoutMs = resolveAppReadyTimeoutMs(options.logPrefix)
       const buildCacheTtlSeconds = resolveBuildCacheTtlSeconds(options.logPrefix)
+      const environmentFingerprint = buildEnvironmentFingerprint(commandEnvironment)
       let sourceFingerprintValue: string | null = null
       let needsBuild = true
       let shouldPersistBuildCache = true
@@ -2770,6 +3072,7 @@ export async function startEphemeralEnvironment(options: EphemeralRuntimeOptions
         needsBuild = options.forceRebuild
           ? true
           : await shouldRebuildBuildArtifacts(buildCacheTtlSeconds, options.logPrefix, {
+              environmentFingerprint,
               precomputedSourceFingerprint: sourceFingerprintValue ?? undefined,
             })
       } catch (error) {
@@ -2835,7 +3138,7 @@ export async function startEphemeralEnvironment(options: EphemeralRuntimeOptions
       }
 
       if (shouldPersistBuildCache && sourceFingerprintValue) {
-        await writeBuildCacheState(sourceFingerprintValue)
+        await writeBuildCacheState(sourceFingerprintValue, { environmentFingerprint })
       }
 
       console.log(`[${options.logPrefix}] Starting application on ${applicationBaseUrl}...`)
@@ -2857,6 +3160,8 @@ export async function startEphemeralEnvironment(options: EphemeralRuntimeOptions
       await writeEphemeralEnvironmentState({
         baseUrl: applicationBaseUrl,
         port: applicationPort,
+        databaseUrl,
+        queueBaseDir: EPHEMERAL_QUEUE_BASE_DIR,
         logPrefix: options.logPrefix,
         captureScreenshots: options.captureScreenshots,
       })

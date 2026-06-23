@@ -2,9 +2,40 @@
 
 The `integrations` module is the foundation layer for all external connectors (payment gateways, shipping carriers, communication channels, data sync providers, etc.). It provides three shared mechanisms: **Integration Registry**, **Credentials API**, and **Operation Logs**.
 
-**Spec**: `.ai/specs/SPEC-045-2026-02-24-integration-marketplace.md` + `.ai/specs/SPEC-045a-foundation.md`
+**Spec**: `.ai/specs/implemented/SPEC-045-2026-02-24-integration-marketplace.md` + `.ai/specs/implemented/SPEC-045a-foundation.md`
 
 ---
+
+## Always
+
+- **Always scope by organizationId + tenantId** — every entity query and service call
+- **Use `findWithDecryption`/`findOneWithDecryption`** for credential reads
+- **New providers MUST support provider-owned env preconfiguration** when credentials/settings are deployment-managed; implement it in the provider package, not in core
+- **Health check services** must be registered in DI by the provider module, not by integrations
+- **API routes must export `openApi`** for documentation generation
+- **All user-facing strings** via i18n keys in `i18n/en.json`
+- **Keep ACL default export shape** consistent: `export const features = [...]; export default features`
+- **Registry/type contracts** live in `@open-mercato/shared/modules/integrations/types`
+
+## Ask First
+
+- Ask before changing credential resolution order, registry type contracts, canonical API routes, or compatibility surfaces.
+- Ask before moving provider-specific logic into this module.
+- Ask before changing health-check timeouts, log retention semantics, or credential redaction behavior.
+
+## Never
+
+- Never import from provider modules — integrations module is generic; providers import from integrations, not vice versa.
+- Never log credential values — log service strips secret fields from payload.
+- Never special-case provider env presets, credentials, mappings, or enabled state in core.
+- Never remove legacy `integrations.detail:tabs` fallback without a compatibility plan.
+
+## Validation Commands
+
+```bash
+yarn generate
+yarn workspace @open-mercato/core build
+```
 
 ## Module Structure
 
@@ -35,7 +66,8 @@ packages/core/src/modules/integrations/
 │       ├── version/route.ts     # PUT — change API version
 │       └── health/route.ts      # POST — trigger health check
 ├── workers/
-│   └── log-pruner.ts            # Scheduled log retention cleanup
+│   ├── log-pruner.ts            # Scheduled log retention cleanup
+│   └── health-probe.ts          # Periodic health checks (queue: integration-health-probe)
 ├── backend/
 │   └── integrations/
 │       ├── page.tsx             # Marketplace listing page
@@ -62,7 +94,9 @@ packages/core/src/modules/integrations/
 | `integrationCredentialsService` | `createCredentialsService(em)` | Encrypted credential CRUD with bundle fallthrough |
 | `integrationStateService` | `createIntegrationStateService(em)` | Upsert integration state (enabled, version, health, reauth) |
 | `integrationLogService` | `createIntegrationLogService(em)` | Structured logging: write, query, prune, scoped logger |
-| `integrationHealthService` | `createHealthService(container, stateService, logService)` | Resolves named health check service from DI, runs check, updates state |
+| `integrationHealthService` | `createHealthService(container, stateService, logService)` | Resolves named health check service from DI, runs check with **10s timeout**, returns `unconfigured` when no checker/credentials, persists latency, updates state |
+
+Scheduled **integration-health-probe** jobs (15m interval) are registered from `setup.seedDefaults` when `schedulerService` is available; target payload is `{ scope: { organizationId, tenantId } }`.
 
 ## Adding a New Integration Provider
 
@@ -98,6 +132,15 @@ For platform connectors with multiple integrations (e.g., MedusaJS):
 2. If `bundleId` is set, fallback to bundle's credentials
 3. Return `null` if neither exists
 
+## Per-User Credential Scoping
+
+`IntegrationScope` carries an optional `userId?: string | null` (added 2026-05-26 for per-user email channels). Every `createCredentialsService` method scopes by it:
+
+- **Omit `scope.userId`** (or pass `null`) for tenant-wide credentials (shared API keys, e.g. Stripe/Akeneo) — the filter pins `user_id IS NULL`, the historical behaviour.
+- **Pass `scope.userId`** for per-user credentials (Gmail/IMAP mailboxes) — reads and writes land on that user's own row.
+
+Uniqueness across `(integration_id, organization_id, tenant_id, user_id)` is enforced by the partial unique index `integration_credentials_user_lookup_idx` (`WHERE user_id IS NOT NULL AND deleted_at IS NULL`). **Callers MUST thread the correct `userId` on every per-user read AND write** — a tenant-wide scope can never read a user-scoped row and vice versa, so a missing `userId` silently resolves the wrong (or no) credentials.
+
 ## Events
 
 | Event ID | Emitted When |
@@ -115,7 +158,7 @@ For platform connectors with multiple integrations (e.g., MedusaJS):
 
 ## UMES Extensibility
 
-Integration provider modules can leverage the full **Unified Module Extension System (UMES)** — see `.ai/specs/SPEC-041-2026-02-24-universal-module-extension-system.md` for details.
+Integration provider modules can leverage the full **Unified Module Extension System (UMES)** — see `.ai/specs/implemented/SPEC-041-2026-02-24-universal-module-extension-system.md` for details.
 
 ### Available Extension Points for Providers
 
@@ -189,16 +232,3 @@ The integrations module itself uses UMES to inject external ID displays on any e
 - Module-local integration tests go under `__integration__/`
 - Use helpers from `@open-mercato/core/modules/core/__integration__/helpers/*`
 - Tests must create prerequisites via API and clean up in `finally`
-
-## MUST Rules
-
-- **Never import from provider modules** — integrations module is generic; providers import from integrations, not vice versa
-- **Always scope by organizationId + tenantId** — every entity query and service call
-- **Use `findWithDecryption`/`findOneWithDecryption`** for credential reads
-- **New providers MUST support provider-owned env preconfiguration** when credentials/settings are deployment-managed; implement it in the provider package, not in core
-- **Never log credential values** — log service strips secret fields from payload
-- **Health check services** must be registered in DI by the provider module, not by integrations
-- **API routes must export `openApi`** for documentation generation
-- **All user-facing strings** via i18n keys in `i18n/en.json`
-- **Keep ACL default export shape** consistent: `export const features = [...]; export default features`
-- **Registry/type contracts** live in `@open-mercato/shared/modules/integrations/types`

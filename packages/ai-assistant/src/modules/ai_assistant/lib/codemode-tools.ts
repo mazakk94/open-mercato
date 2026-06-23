@@ -9,11 +9,13 @@
  */
 
 import { z } from 'zod'
+import type { RbacService } from '@open-mercato/core/modules/auth/services/rbacService'
 import { registerMcpTool } from './tool-registry'
 import type { McpToolContext } from './types'
 import { createSandbox } from './sandbox'
 import { truncateResult } from './truncate'
-import { getRawOpenApiSpec } from './api-endpoint-index'
+import { hasRequiredFeatures } from './auth'
+import { getApiEndpoints, getRawOpenApiSpec, type ApiEndpoint } from './api-endpoint-index'
 import {
   getCachedEntityGraph,
   inferModuleFromEntity,
@@ -26,6 +28,15 @@ import {
   buildSearchLabel,
   incrementToolCallCount,
 } from './session-memory'
+import { fetchWithTimeout, resolveTimeoutMs } from '@open-mercato/shared/lib/http/fetchWithTimeout'
+
+const DEFAULT_AI_API_REQUEST_TIMEOUT_MS = 30_000
+
+function resolveAiApiRequestTimeoutMs(): number {
+  const raw = process.env.AI_API_REQUEST_TIMEOUT_MS
+  const parsed = raw ? Number.parseInt(raw, 10) : undefined
+  return resolveTimeoutMs(parsed, DEFAULT_AI_API_REQUEST_TIMEOUT_MS)
+}
 
 /**
  * Cached spec object combining OpenAPI paths + entity schemas.
@@ -37,6 +48,8 @@ let cachedCodeModeSpec: Record<string, unknown> | null = null
  * Generated once at startup from the OpenAPI spec.
  */
 let cachedCommonTypes: string | null = null
+
+export const CODE_MODE_REQUIRED_FEATURES = ['ai_assistant.view'] as const
 
 /**
  * Build the merged spec object for the search tool.
@@ -515,7 +528,6 @@ function formatValidationError(data: unknown): string {
 
 /**
  * Build entity schema array from the entity graph.
- * Same structure as buildEntityResult in entity-graph-tools.ts.
  */
 function buildEntitySchemas(graph: EntityGraph) {
   return graph.nodes.map((node) => {
@@ -538,22 +550,10 @@ function buildEntitySchemas(graph: EntityGraph) {
   })
 }
 
-/**
- * Detect mutation HTTP methods in code via static analysis.
- * Returns which methods were found (POST, PUT, PATCH, DELETE).
- */
-function detectMutationInCode(code: string): { hasMutation: boolean; methods: string[] } {
-  const methods: string[] = []
-  const pattern = /method:\s*['"](\w+)['"]/gi
-  let match
-  while ((match = pattern.exec(code)) !== null) {
-    const method = match[1].toUpperCase()
-    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
-      methods.push(method)
-    }
-  }
-  return { hasMutation: methods.length > 0, methods }
-}
+/** Maximum api.request() calls allowed per execute() run, regardless of method. */
+export const CODE_MODE_MAX_API_CALLS = 50
+/** Maximum mutation (non-GET/HEAD/OPTIONS) api.request() calls allowed per execute() run. */
+export const CODE_MODE_MAX_MUTATION_CALLS = 20
 
 /**
  * Load and register the two Code Mode tools.
@@ -584,7 +584,7 @@ Use BEFORE execute to learn endpoint schemas for CREATE/UPDATE. Skip for common 
             'An async arrow function that queries spec, e.g. async () => spec.paths["/api/customers/companies"]'
           ),
       }),
-      requiredFeatures: [],
+      requiredFeatures: [...CODE_MODE_REQUIRED_FEATURES],
       handler: async (input: { code: string }, ctx: McpToolContext) => {
         const codePreview = input.code.slice(0, 120).replace(/\n/g, ' ')
         console.error(`[AI Usage] search: code="${codePreview}${input.code.length > 120 ? '...' : ''}"`)
@@ -672,7 +672,7 @@ RULES: For FIND/LIST → GET only (1 call). For UPDATE → PUT to collection pat
             'Async arrow function. For reads: async () => api.request({ method: "GET", path: "/api/customers/companies" }). For updates: async () => api.request({ method: "PUT", path: "/api/customers/companies", body: { id: "<uuid>", name: "New Name" } }). id goes in BODY not URL.'
           ),
       }),
-      requiredFeatures: [], // ACL checked at API level
+      requiredFeatures: [...CODE_MODE_REQUIRED_FEATURES],
       handler: async (input: { code: string }, ctx: McpToolContext) => {
         const codePreview = input.code.slice(0, 120).replace(/\n/g, ' ')
         console.error(`[AI Usage] execute: code="${codePreview}${input.code.length > 120 ? '...' : ''}" user=${ctx.userId || 'unknown'}`)
@@ -689,18 +689,23 @@ RULES: For FIND/LIST → GET only (1 call). For UPDATE → PUT to collection pat
           }
         }
 
-        // Detect mutations via static analysis — cap API calls for safety
-        const mutationInfo = detectMutationInCode(input.code)
-        const maxApiCalls = mutationInfo.hasMutation ? 20 : 50
-        if (mutationInfo.hasMutation) {
-          console.error(`[AI Usage] execute: MUTATION DETECTED (${mutationInfo.methods.join(',')}) — capping API calls to ${maxApiCalls}`)
-        }
+        // Cap API calls for safety. The mutation cap is enforced against the
+        // actually-observed HTTP method, not a static scan of the source — so a
+        // dynamically-built method (e.g. 'PO' + 'ST') can never escape it.
+        const maxApiCalls = CODE_MODE_MAX_API_CALLS
         let apiCallCount = 0
+        let mutationCallCount = 0
 
-        const apiRequestFn = createApiRequestFn(ctx, () => {
+        const apiRequestFn = createApiRequestFn(ctx, (normalizedMethod) => {
           apiCallCount++
           if (apiCallCount > maxApiCalls) {
             throw new Error(`API call limit exceeded (max ${maxApiCalls})`)
+          }
+          if (isUnsafeHttpMethod(normalizedMethod)) {
+            mutationCallCount++
+            if (mutationCallCount > CODE_MODE_MAX_MUTATION_CALLS) {
+              throw new Error(`Mutation API call limit exceeded (max ${CODE_MODE_MAX_MUTATION_CALLS})`)
+            }
           }
         })
 
@@ -748,11 +753,10 @@ RULES: For FIND/LIST → GET only (1 call). For UPDATE → PUT to collection pat
 
 /**
  * Create the api.request() function for the execute sandbox.
- * Replicates the authenticated API call logic from api-discovery-tools.ts.
  */
-function createApiRequestFn(
+export function createApiRequestFn(
   ctx: McpToolContext,
-  onCall: () => void
+  onCall: (normalizedMethod: string) => void
 ): (params: {
   method: string
   path: string
@@ -766,19 +770,32 @@ function createApiRequestFn(
     'http://localhost:3000'
 
   return async (params) => {
-    onCall()
-
     const { method, path, query, body } = params
     const callStart = Date.now()
+    const normalizedMethod = String(method ?? '').toUpperCase()
+    onCall(normalizedMethod)
+    const apiPath = normalizeApiRequestPath(path)
+    const authorization = await authorizeCodeModeApiRequest(ctx, normalizedMethod, apiPath)
 
-    // Ensure path starts with /api
-    const apiPath = path.startsWith('/api') ? path : `/api${path}`
+    if (!authorization.allowed) {
+      const callDuration = Date.now() - callStart
+      console.error(
+        `[AI Usage] api.request: ${normalizedMethod} ${apiPath} → ${authorization.statusCode} in ${callDuration}ms (blocked by Code Mode RBAC)`
+      )
+      return {
+        success: false,
+        statusCode: authorization.statusCode,
+        error: authorization.error,
+        details: authorization.details,
+      }
+    }
+
     let url = `${baseUrl}${apiPath}`
 
     // Build query parameters
     const queryParams: Record<string, string> = { ...query }
 
-    if (method === 'GET') {
+    if (normalizedMethod === 'GET') {
       if (ctx.tenantId) queryParams.tenantId = ctx.tenantId
       if (ctx.organizationId) queryParams.organizationId = ctx.organizationId
     }
@@ -790,7 +807,7 @@ function createApiRequestFn(
 
     // Build request body with context injection
     let requestBody: Record<string, unknown> | undefined
-    if (['POST', 'PUT', 'PATCH'].includes(method.toUpperCase())) {
+    if (['POST', 'PUT', 'PATCH'].includes(normalizedMethod)) {
       requestBody = { ...body }
       if (ctx.tenantId) requestBody.tenantId = ctx.tenantId
       if (ctx.organizationId) requestBody.organizationId = ctx.organizationId
@@ -805,10 +822,11 @@ function createApiRequestFn(
     if (ctx.organizationId) headers['X-Organization-Id'] = ctx.organizationId
 
     // Execute request using host fetch (not sandbox)
-    const response = await globalThis.fetch(url, {
-      method: method.toUpperCase(),
+    const response = await fetchWithTimeout(url, {
+      method: normalizedMethod,
       headers,
       body: requestBody ? JSON.stringify(requestBody) : undefined,
+      timeoutMs: resolveAiApiRequestTimeoutMs(),
     })
 
     const responseText = await response.text()
@@ -816,7 +834,7 @@ function createApiRequestFn(
     const callDuration = Date.now() - callStart
 
     if (!response.ok) {
-      console.error(`[AI Usage] api.request: ${method.toUpperCase()} ${apiPath} → ${response.status} in ${callDuration}ms`)
+      console.error(`[AI Usage] api.request: ${normalizedMethod} ${apiPath} → ${response.status} in ${callDuration}ms`)
 
       // Format 400 validation errors into a clear fix instruction for the LLM
       if (response.status === 400) {
@@ -835,10 +853,10 @@ function createApiRequestFn(
       }
     }
 
-    console.error(`[AI Usage] api.request: ${method.toUpperCase()} ${apiPath} → ${response.status} in ${callDuration}ms (${responseText.length} bytes)`)
+    console.error(`[AI Usage] api.request: ${normalizedMethod} ${apiPath} → ${response.status} in ${callDuration}ms (${responseText.length} bytes)`)
 
     // Add mutation warning for non-GET calls
-    if (!['GET', 'HEAD', 'OPTIONS'].includes(method.toUpperCase())) {
+    if (!['GET', 'HEAD', 'OPTIONS'].includes(normalizedMethod)) {
       return {
         success: true,
         statusCode: response.status,
@@ -853,6 +871,173 @@ function createApiRequestFn(
       data,
     }
   }
+}
+
+type CodeModeApiAuthorization =
+  | { allowed: true; endpoint: ApiEndpoint }
+  | { allowed: false; statusCode: number; error: string; details?: Record<string, unknown> }
+
+export async function authorizeCodeModeApiRequest(
+  ctx: McpToolContext,
+  method: string,
+  path: string
+): Promise<CodeModeApiAuthorization> {
+  const normalizedMethod = method.toUpperCase()
+
+  if (isUnsafeApiRequestPath(path)) {
+    return {
+      allowed: false,
+      statusCode: 403,
+      error: `Code Mode rejected unsafe API path: ${normalizedMethod} ${path}`,
+    }
+  }
+
+  const normalizedPath = normalizeApiRequestPath(path)
+  const endpoint = await findCodeModeApiEndpoint(normalizedMethod, normalizedPath)
+
+  if (!endpoint) {
+    return {
+      allowed: false,
+      statusCode: 403,
+      error: `Code Mode cannot call undocumented API endpoint ${normalizedMethod} ${normalizedPath}`,
+    }
+  }
+
+  const rbacService = resolveRbacService(ctx)
+  const requiredFeatures = endpoint.requiredFeatures ?? []
+
+  if (requiredFeatures.length > 0) {
+    if (hasRequiredFeatures(requiredFeatures, ctx.userFeatures, ctx.isSuperAdmin, rbacService)) {
+      return { allowed: true, endpoint }
+    }
+
+    return {
+      allowed: false,
+      statusCode: 403,
+      error: `Insufficient permissions for ${normalizedMethod} ${normalizedPath}`,
+      details: { requiredFeatures, operationId: endpoint.operationId },
+    }
+  }
+
+  if (isUnsafeHttpMethod(normalizedMethod)) {
+    return {
+      allowed: false,
+      statusCode: 403,
+      error: `Code Mode cannot call mutation endpoint without declared required features: ${normalizedMethod} ${normalizedPath}`,
+      details: { operationId: endpoint.operationId },
+    }
+  }
+
+  return { allowed: true, endpoint }
+}
+
+function resolveRbacService(ctx: McpToolContext): RbacService | undefined {
+  try {
+    return ctx.container.resolve('rbacService') as RbacService
+  } catch {
+    return undefined
+  }
+}
+
+async function findCodeModeApiEndpoint(
+  method: string,
+  path: string
+): Promise<ApiEndpoint | null> {
+  const endpoints = await getApiEndpoints()
+  const exactMatch = endpoints.find((endpoint) => endpoint.method === method && endpoint.path === path)
+  if (exactMatch) {
+    return exactMatch
+  }
+
+  return endpoints.find((endpoint) => endpoint.method === method && matchApiEndpointPath(endpoint.path, path)) ?? null
+}
+
+export function matchApiEndpointPath(endpointPath: string, requestPath: string): boolean {
+  const normalizedEndpointPath = normalizeApiRequestPath(endpointPath)
+  const normalizedRequestPath = normalizeApiRequestPath(requestPath)
+
+  if (normalizedEndpointPath === normalizedRequestPath) {
+    return true
+  }
+
+  const endpointSegments = normalizedEndpointPath.split('/').filter(Boolean)
+  const requestSegments = normalizedRequestPath.split('/').filter(Boolean)
+
+  if (endpointSegments.length !== requestSegments.length) {
+    return false
+  }
+
+  return endpointSegments.every((segment, index) => {
+    if (isPathParameterSegment(segment)) {
+      return requestSegments[index].length > 0
+    }
+    return segment === requestSegments[index]
+  })
+}
+
+function normalizeApiRequestPath(path: string): string {
+  const [rawPath] = path.split('?')
+  const normalizedPath = rawPath.startsWith('/api')
+    ? rawPath
+    : `/api${rawPath.startsWith('/') ? rawPath : `/${rawPath}`}`
+
+  if (normalizedPath.length > 1 && normalizedPath.endsWith('/')) {
+    return normalizedPath.slice(0, -1)
+  }
+
+  return normalizedPath
+}
+
+const SINGLE_DOT_SEGMENTS = new Set(['.', '%2e'])
+const DOUBLE_DOT_SEGMENTS = new Set(['..', '.%2e', '%2e.', '%2e%2e'])
+
+/**
+ * Rejects request paths that the WHATWG URL parser would rewrite before the
+ * actual fetch (`..`/`.` path segments — including their percent-encoded forms
+ * — backslashes, and percent-encoded separators). Code Mode authorizes the
+ * literal path it was given, but `new URL()` collapses dot segments and
+ * normalizes backslashes for http(s) URLs, so without this guard the wire
+ * request can resolve to a different endpoint than the one that was authorized.
+ */
+export function isUnsafeApiRequestPath(path: string): boolean {
+  const [rawPath] = String(path ?? '').split('?')
+
+  // The WHATWG URL parser strips ASCII tab/newline/carriage-return from the URL
+  // before parsing, so a smuggled `.<TAB>.` segment collapses to `..` on the
+  // wire even though the literal segment never equals a dot segment here. Raw
+  // control characters never appear in legitimate REST paths, so reject them.
+  if (/[\u0000-\u001f]/.test(rawPath)) {
+    return true
+  }
+
+  // http(s) URLs treat backslashes as path separators, so they can smuggle
+  // separators past the segment-based authorizer.
+  if (rawPath.includes('\\')) {
+    return true
+  }
+
+  // Percent-encoded separators never appear in legitimate REST paths and let
+  // the literal-'/' segment split desync from the parsed request URL.
+  if (/%2f/i.test(rawPath) || /%5c/i.test(rawPath)) {
+    return true
+  }
+
+  return rawPath.split('/').some((segment) => {
+    const lowered = segment.toLowerCase()
+    return SINGLE_DOT_SEGMENTS.has(lowered) || DOUBLE_DOT_SEGMENTS.has(lowered)
+  })
+}
+
+function isPathParameterSegment(segment: string): boolean {
+  return (
+    (segment.startsWith('{') && segment.endsWith('}')) ||
+    (segment.startsWith('[') && segment.endsWith(']')) ||
+    segment.startsWith(':')
+  )
+}
+
+export function isUnsafeHttpMethod(method: string): boolean {
+  return !['GET', 'HEAD', 'OPTIONS'].includes(method.toUpperCase())
 }
 
 function tryParseJson(text: string): unknown {

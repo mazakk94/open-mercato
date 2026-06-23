@@ -2,15 +2,30 @@
 
 import * as React from 'react'
 import { useSearchParams } from 'next/navigation'
-import { Plus, Pencil, Trash2 } from 'lucide-react'
+import { Book, Plus, Pencil, Trash2 } from 'lucide-react'
+import { EmptyState } from '@open-mercato/ui/primitives/empty-state'
 import { Button } from '@open-mercato/ui/primitives/button'
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@open-mercato/ui/primitives/dialog'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@open-mercato/ui/primitives/select'
 import { Spinner } from '@open-mercato/ui/primitives/spinner'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
-import { apiCall } from '@open-mercato/ui/backend/utils/apiCall'
+import { apiCall, withScopedApiRequestHeaders } from '@open-mercato/ui/backend/utils/apiCall'
+import { buildOptimisticLockHeader } from '@open-mercato/ui/backend/utils/optimisticLock'
+import { surfaceRecordConflict } from '@open-mercato/ui/backend/conflicts'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
 import { useConfirmDialog } from '@open-mercato/ui/backend/confirm-dialog'
 import { DictionaryEntriesEditor } from './DictionaryEntriesEditor'
+import {
+  DEFAULT_DICTIONARY_ENTRY_SORT_MODE,
+  dictionaryEntrySortModes,
+  type DictionaryEntrySortMode,
+} from '../lib/entrySort'
 
 export type DictionarySummary = {
   id: string
@@ -19,14 +34,23 @@ export type DictionarySummary = {
   description?: string | null
   isSystem?: boolean
   isActive?: boolean
+  entrySortMode: DictionaryEntrySortMode
   organizationId: string
   isInherited: boolean
   managerVisibility: 'default' | 'hidden'
+  updatedAt?: string | null
 }
 
 type DialogState = {
   mode: 'create' | 'edit'
   dictionary?: DictionarySummary
+}
+
+type DictionaryFormState = {
+  key: string
+  name: string
+  description: string
+  entrySortMode: DictionaryEntrySortMode
 }
 
 export function DictionariesManager() {
@@ -37,7 +61,12 @@ export function DictionariesManager() {
   const [selectedId, setSelectedId] = React.useState<string | null>(null)
   const [loading, setLoading] = React.useState(true)
   const [dialog, setDialog] = React.useState<DialogState | null>(null)
-  const [form, setForm] = React.useState({ key: '', name: '', description: '' })
+  const [form, setForm] = React.useState<DictionaryFormState>({
+    key: '',
+    name: '',
+    description: '',
+    entrySortMode: DEFAULT_DICTIONARY_ENTRY_SORT_MODE,
+  })
   const [errors, setErrors] = React.useState<{ key?: string; name?: string }>({})
   const [submitting, setSubmitting] = React.useState(false)
   const [deleting, setDeleting] = React.useState<string | null>(null)
@@ -45,6 +74,24 @@ export function DictionariesManager() {
   const inheritedManageMessage = t('dictionaries.config.error.inheritedManage', 'Inherited dictionaries must be managed at the parent organization.')
   const requestedDictionaryId = searchParams?.get('dictionaryId') ?? null
   const requestedDictionaryKey = searchParams?.get('key')?.trim().toLowerCase() ?? null
+  const entrySortOptions = React.useMemo(
+    () => dictionaryEntrySortModes.map((mode) => ({
+      value: mode,
+      label:
+        mode === 'label_asc'
+          ? t('dictionaries.config.sortModes.labelAsc', 'A to Z')
+          : mode === 'label_desc'
+            ? t('dictionaries.config.sortModes.labelDesc', 'Z to A')
+            : mode === 'value_asc'
+              ? t('dictionaries.config.sortModes.valueAsc', 'Value A to Z')
+              : mode === 'value_desc'
+                ? t('dictionaries.config.sortModes.valueDesc', 'Value Z to A')
+                : mode === 'created_at_asc'
+                  ? t('dictionaries.config.sortModes.createdAtAsc', 'Oldest first')
+                  : t('dictionaries.config.sortModes.createdAtDesc', 'Newest first'),
+    })),
+    [t],
+  )
 
   const loadDictionaries = React.useCallback(async () => {
     setLoading(true)
@@ -62,10 +109,14 @@ export function DictionariesManager() {
             description: typeof item.description === 'string' ? item.description : null,
             isSystem: Boolean(item.isSystem),
             isActive: item.isActive !== false,
+            entrySortMode: dictionaryEntrySortModes.includes(item.entrySortMode as DictionaryEntrySortMode)
+              ? (item.entrySortMode as DictionaryEntrySortMode)
+              : DEFAULT_DICTIONARY_ENTRY_SORT_MODE,
             organizationId: typeof item.organizationId === 'string' ? item.organizationId : '',
             isInherited: item.isInherited === true,
             managerVisibility:
               item.managerVisibility === 'hidden' ? 'hidden' : 'default',
+            updatedAt: typeof item.updatedAt === 'string' ? item.updatedAt : null,
           }))
         : []
       const filtered = list.filter((dictionary: DictionarySummary) => dictionary.managerVisibility !== 'hidden')
@@ -107,7 +158,12 @@ export function DictionariesManager() {
   }, [items, requestedDictionaryId, requestedDictionaryKey, selectedId])
 
   const openCreateDialog = React.useCallback(() => {
-    setForm({ key: '', name: '', description: '' })
+    setForm({
+      key: '',
+      name: '',
+      description: '',
+      entrySortMode: DEFAULT_DICTIONARY_ENTRY_SORT_MODE,
+    })
     setDialog({ mode: 'create' })
     setErrors({})
   }, [])
@@ -117,14 +173,24 @@ export function DictionariesManager() {
       flash(inheritedManageMessage, 'info')
       return
     }
-    setForm({ key: dictionary.key, name: dictionary.name, description: dictionary.description ?? '' })
+    setForm({
+      key: dictionary.key,
+      name: dictionary.name,
+      description: dictionary.description ?? '',
+      entrySortMode: dictionary.entrySortMode,
+    })
     setDialog({ mode: 'edit', dictionary })
     setErrors({})
   }, [inheritedManageMessage])
 
   const closeDialog = React.useCallback(() => {
     setDialog(null)
-    setForm({ key: '', name: '', description: '' })
+    setForm({
+      key: '',
+      name: '',
+      description: '',
+      entrySortMode: DEFAULT_DICTIONARY_ENTRY_SORT_MODE,
+    })
     setErrors({})
   }, [])
 
@@ -157,6 +223,7 @@ export function DictionariesManager() {
         key: trimmedKey,
         name: trimmedName,
         description: form.description.trim() || undefined,
+        entrySortMode: form.entrySortMode,
       }
       if (dialog.mode === 'create') {
         const call = await apiCall<Record<string, unknown>>('/api/dictionaries', {
@@ -169,13 +236,20 @@ export function DictionariesManager() {
         }
         flash(t('dictionaries.config.success.create', 'Dictionary created.'), 'success')
       } else if (dialog.dictionary) {
-        const call = await apiCall<Record<string, unknown>>(`/api/dictionaries/${dialog.dictionary.id}`, {
-          method: 'PATCH',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(payload),
-        })
+        const call = await withScopedApiRequestHeaders(
+          buildOptimisticLockHeader(dialog.dictionary.updatedAt),
+          () =>
+            apiCall<Record<string, unknown>>(`/api/dictionaries/${dialog.dictionary!.id}`, {
+              method: 'PATCH',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify(payload),
+            }),
+        )
         if (!call.ok) {
-          throw new Error(typeof call.result?.error === 'string' ? call.result.error : 'Failed to update dictionary')
+          throw Object.assign(
+            new Error(typeof call.result?.error === 'string' ? call.result.error : 'Failed to update dictionary'),
+            { status: call.status, ...(call.result && typeof call.result === 'object' ? call.result : {}) },
+          )
         }
         flash(t('dictionaries.config.success.update', 'Dictionary updated.'), 'success')
       }
@@ -183,12 +257,15 @@ export function DictionariesManager() {
       await loadDictionaries()
       setErrors({})
     } catch (err) {
+      if (surfaceRecordConflict(err, t)) {
+        return
+      }
       console.error('Failed to save dictionary', err)
       flash(t('dictionaries.config.error.save', 'Failed to save dictionary.'), 'error')
     } finally {
       setSubmitting(false)
     }
-  }, [closeDialog, dialog, form.description, form.key, form.name, inheritedManageMessage, loadDictionaries, t])
+  }, [closeDialog, dialog, form.description, form.entrySortMode, form.key, form.name, inheritedManageMessage, loadDictionaries, t])
 
   const handleDelete = React.useCallback(
     async (dictionary: DictionarySummary) => {
@@ -211,13 +288,22 @@ export function DictionariesManager() {
       if (!confirmed) return
       setDeleting(dictionary.id)
       try {
-        const call = await apiCall<Record<string, unknown>>(`/api/dictionaries/${dictionary.id}`, { method: 'DELETE' })
+        const call = await withScopedApiRequestHeaders(
+          buildOptimisticLockHeader(dictionary.updatedAt),
+          () => apiCall<Record<string, unknown>>(`/api/dictionaries/${dictionary.id}`, { method: 'DELETE' }),
+        )
         if (!call.ok) {
-          throw new Error(typeof call.result?.error === 'string' ? call.result.error : 'Failed to delete dictionary')
+          throw Object.assign(
+            new Error(typeof call.result?.error === 'string' ? call.result.error : 'Failed to delete dictionary'),
+            { status: call.status, ...(call.result && typeof call.result === 'object' ? call.result : {}) },
+          )
         }
         flash(t('dictionaries.config.success.delete', 'Dictionary deleted.'), 'success')
         await loadDictionaries()
       } catch (err) {
+        if (surfaceRecordConflict(err, t)) {
+          return
+        }
         console.error('Failed to delete dictionary', err)
         flash(t('dictionaries.config.error.delete', 'Failed to delete dictionary.'), 'error')
       } finally {
@@ -274,7 +360,7 @@ export function DictionariesManager() {
                       <div className="flex items-center gap-2 font-medium">
                         <span>{dictionary.name}</span>
                         {dictionary.isInherited ? (
-                          <span className="rounded-full border border-border px-2 py-0.5 text-[11px] font-normal uppercase tracking-wide text-muted-foreground">
+                          <span className="rounded-full border border-border px-2 py-0.5 text-overline font-normal uppercase tracking-wide text-muted-foreground">
                             {t('dictionaries.config.list.inherited', 'Inherited')}
                           </span>
                         ) : null}
@@ -324,9 +410,11 @@ export function DictionariesManager() {
             readOnly={selectedDictionary.isInherited}
           />
         ) : (
-          <div className="flex h-full flex-col items-center justify-center rounded border border-dashed p-10 text-center text-sm text-muted-foreground">
-            {t('dictionaries.config.entries.placeholder', 'Select a dictionary to manage its entries.')}
-          </div>
+          <EmptyState
+            icon={<Book className="h-8 w-8" aria-hidden="true" />}
+            title={t('dictionaries.config.entries.placeholder', 'Select a dictionary to manage its entries.')}
+            className="h-full"
+          />
         )}
       </div>
 
@@ -351,7 +439,7 @@ export function DictionariesManager() {
                 }}
                 placeholder={t('dictionaries.config.dialog.keyPlaceholder', 'slug_name')}
                 disabled={dialog?.mode === 'edit'}
-                className={`w-full rounded border px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:bg-muted ${errors.key ? 'border-destructive focus-visible:ring-destructive' : ''}`}
+                className={`w-full rounded border px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:bg-muted ${errors.key ? 'border-destructive focus-visible:ring-destructive' : ''}`}
                 aria-invalid={errors.key ? 'true' : 'false'}
                 aria-describedby="dictionary-key-hint"
               />
@@ -372,7 +460,7 @@ export function DictionariesManager() {
                   if (errors.name) setErrors((prev) => ({ ...prev, name: undefined }))
                 }}
                 placeholder={t('dictionaries.config.dialog.namePlaceholder', 'Display name')}
-                className={`w-full rounded border px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary ${errors.name ? 'border-destructive focus-visible:ring-destructive' : ''}`}
+                className={`w-full rounded border px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${errors.name ? 'border-destructive focus-visible:ring-destructive' : ''}`}
                 aria-invalid={errors.name ? 'true' : 'false'}
               />
               {errors.name ? (
@@ -384,9 +472,35 @@ export function DictionariesManager() {
               <textarea
                 value={form.description}
                 onChange={(event) => setForm((prev) => ({ ...prev, description: event.target.value }))}
-                className="min-h-[120px] w-full rounded border px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+                className="min-h-[120px] w-full rounded border px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 placeholder={t('dictionaries.config.dialog.descriptionPlaceholder', 'Explain how this dictionary is used (optional).')}
               />
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm font-medium">{t('dictionaries.config.dialog.entrySortModeLabel', 'Entry sort order')}</label>
+              <Select
+                value={form.entrySortMode}
+                onValueChange={(next) => setForm((prev) => ({
+                  ...prev,
+                  entrySortMode: dictionaryEntrySortModes.includes(next as DictionaryEntrySortMode)
+                    ? (next as DictionaryEntrySortMode)
+                    : DEFAULT_DICTIONARY_ENTRY_SORT_MODE,
+                }))}
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {entrySortOptions.map((option) => (
+                    <SelectItem key={option.value} value={option.value}>
+                      {option.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                {t('dictionaries.config.dialog.entrySortModeHelp', 'Controls the order returned by dictionary entry APIs and dropdowns.')}
+              </p>
             </div>
           </div>
           <DialogFooter>

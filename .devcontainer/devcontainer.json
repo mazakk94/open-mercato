@@ -9,9 +9,10 @@
   "postCreateCommand": "bash .devcontainer/scripts/post-create.sh",
   "postStartCommand": "bash .devcontainer/scripts/post-start.sh",
 
-  "forwardPorts": [3000, "postgres:5432", "redis:6379", "meilisearch:7700"],
+  "forwardPorts": [3000, 4000, "postgres:5432", "redis:6379", "meilisearch:7700"],
   "portsAttributes": {
     "3000": { "label": "App", "onAutoForward": "notify" },
+    "4000": { "label": "Dev Splash", "onAutoForward": "notify" },
     "5432": { "label": "PostgreSQL", "onAutoForward": "silent" },
     "6379": { "label": "Redis", "onAutoForward": "silent" },
     "7700": { "label": "Meilisearch", "onAutoForward": "silent" }
@@ -19,8 +20,13 @@
 
   "remoteEnv": {
     "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0",
+    "OM_AI_PROVIDER": "${localEnv:OM_AI_PROVIDER}",
+    "OM_AI_MODEL": "${localEnv:OM_AI_MODEL}",
+    "OPENCODE_PROVIDER": "${localEnv:OPENCODE_PROVIDER}",
+    "OPENCODE_MODEL": "${localEnv:OPENCODE_MODEL}",
     "ANTHROPIC_API_KEY": "${localEnv:ANTHROPIC_API_KEY}",
-    "OPENAI_API_KEY": "${localEnv:OPENAI_API_KEY}"
+    "OPENAI_API_KEY": "${localEnv:OPENAI_API_KEY}",
+    "GOOGLE_GENERATIVE_AI_API_KEY": "${localEnv:GOOGLE_GENERATIVE_AI_API_KEY}"
   },
 
   "customizations": {

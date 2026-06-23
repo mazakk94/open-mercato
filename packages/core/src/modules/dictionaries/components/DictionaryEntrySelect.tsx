@@ -5,6 +5,7 @@ import Link from 'next/link'
 import { usePathname, useSearchParams } from 'next/navigation'
 import { Plus, Settings, Save } from 'lucide-react'
 import { Button } from '@open-mercato/ui/primitives/button'
+import { Input } from '@open-mercato/ui/primitives/input'
 import {
   Dialog,
   DialogContent,
@@ -14,6 +15,13 @@ import {
   DialogTitle,
   DialogTrigger,
 } from '@open-mercato/ui/primitives/dialog'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@open-mercato/ui/primitives/select'
 import { Spinner } from '@open-mercato/ui/primitives/spinner'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
 import { buildHrefWithReturnTo } from '@open-mercato/shared/lib/navigation/returnTo'
@@ -62,6 +70,7 @@ export type DictionarySelectLabels = {
 }
 
 export type DictionaryEntrySelectProps = {
+  id?: string
   value?: string
   onChange: (value: string | undefined) => void
   fetchOptions: () => Promise<DictionaryOption[]>
@@ -69,15 +78,25 @@ export type DictionaryEntrySelectProps = {
   labels: DictionarySelectLabels
   manageHref?: string
   selectClassName?: string
+  seedOptions?: DictionaryOption[]
   allowInlineCreate?: boolean
   allowAppearance?: boolean
   appearanceLabels?: AppearanceSelectorLabels
   disabled?: boolean
   showLabelInput?: boolean
   showManage?: boolean
+  sortOptions?: 'label_asc' | 'none'
+  /**
+   * When false, hides the read-only appearance preview (color swatch + icon + hex)
+   * rendered below the trigger for the currently-selected entry. Defaults to true to
+   * preserve existing behavior; set false where the host only wants a plain select
+   * (e.g. a create form that shouldn't surface dictionary styling).
+   */
+  showActiveAppearance?: boolean
 }
 
 export function DictionaryEntrySelect({
+  id,
   value,
   onChange,
   fetchOptions,
@@ -85,12 +104,15 @@ export function DictionaryEntrySelect({
   labels,
   manageHref,
   selectClassName,
+  seedOptions,
   allowInlineCreate = true,
   allowAppearance = false,
   appearanceLabels,
   disabled: disabledProp = false,
   showLabelInput = true,
   showManage = true,
+  sortOptions = 'label_asc',
+  showActiveAppearance = true,
 }: DictionaryEntrySelectProps) {
   const pathname = usePathname()
   const searchParams = useSearchParams()
@@ -107,7 +129,7 @@ export function DictionaryEntrySelect({
     setLoading(true)
     try {
       const items = await fetchOptions()
-      setOptions(items.sort((a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: 'base' })))
+      setOptions(sortOptions === 'none' ? items : items.slice().sort((a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: 'base' })))
     } catch (err) {
       console.error('DictionaryEntrySelect.fetchOptions failed', err)
       flash(labels.errorLoad, 'error')
@@ -115,7 +137,7 @@ export function DictionaryEntrySelect({
     } finally {
       setLoading(false)
     }
-  }, [fetchOptions, labels.errorLoad])
+  }, [fetchOptions, labels.errorLoad, sortOptions])
 
   React.useEffect(() => {
     loadOptions().catch(() => {})
@@ -134,10 +156,39 @@ export function DictionaryEntrySelect({
     if (!dialogOpen) resetDialogState()
   }, [dialogOpen, resetDialogState])
 
+  const mergedOptions = React.useMemo(() => {
+    if (!Array.isArray(seedOptions) || !seedOptions.length) return options
+    const merged: DictionaryOption[] = []
+    const seen = new Set<string>()
+    for (const option of seedOptions) {
+      if (!option.value || seen.has(option.value)) continue
+      seen.add(option.value)
+      merged.push(option)
+    }
+    for (const option of options) {
+      if (seen.has(option.value)) continue
+      seen.add(option.value)
+      merged.push(option)
+    }
+    return merged
+  }, [options, seedOptions])
+
   const activeOption = React.useMemo(
-    () => options.find((option) => option.value === value) ?? null,
-    [options, value],
+    () => mergedOptions.find((option) => option.value === value) ?? null,
+    [mergedOptions, value],
   )
+  const displayOptions = React.useMemo(() => {
+    if (!value || activeOption) return mergedOptions
+    return [
+      {
+        value,
+        label: value,
+        color: null,
+        icon: null,
+      },
+      ...mergedOptions,
+    ]
+  }, [activeOption, mergedOptions, value])
 
   const handleCreate = React.useCallback(async () => {
     if (!createOption) return
@@ -163,7 +214,10 @@ export function DictionaryEntrySelect({
           color: payload.color ?? null,
           icon: payload.icon ?? null,
         })
-        return Array.from(map.values()).sort((a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: 'base' }))
+        const nextOptions = Array.from(map.values())
+        return sortOptions === 'none'
+          ? nextOptions
+          : nextOptions.sort((a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: 'base' }))
       })
       await loadOptions()
       onChange(payload.value)
@@ -189,6 +243,7 @@ export function DictionaryEntrySelect({
     newLabel,
     newValue,
     onChange,
+    sortOptions,
   ])
 
   const handleDialogKeyDown = React.useCallback(
@@ -229,29 +284,40 @@ export function DictionaryEntrySelect({
     () => buildHrefWithReturnTo(manageLink, returnTo),
     [manageLink, returnTo],
   )
+  const optionsKey = React.useMemo(
+    () => displayOptions.map((option) => `${option.value}:${option.label}`).join('\0'),
+    [displayOptions],
+  )
 
   return (
     <div className="space-y-2">
       <div className="flex items-center gap-2">
-        <select
-          className={[
-            'h-9 w-full rounded border pl-3 pr-8 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-70',
-            selectClassName,
-          ]
-            .filter(Boolean)
-            .join(' ')}
+        <Select
+          key={`dictionary-entry:${value ?? ''}:${optionsKey}`}
           value={value ?? ''}
-          onChange={(event) => onChange(event.target.value ? event.target.value : undefined)}
+          onValueChange={(next) => {
+            if (!next) return
+            onChange(next)
+          }}
           disabled={disabled}
-          title={activeOption?.label ?? undefined}
         >
-          <option value="">{labels.placeholder}</option>
-          {options.map((option) => (
-            <option key={option.value} value={option.value} title={option.label}>
-              {option.label}
-            </option>
-          ))}
-        </select>
+          <SelectTrigger
+            id={id}
+            className={selectClassName}
+            title={activeOption?.label ?? undefined}
+          >
+            <SelectValue placeholder={labels.placeholder}>
+              {activeOption?.label}
+            </SelectValue>
+          </SelectTrigger>
+          <SelectContent>
+            {displayOptions.map((option) => (
+              <SelectItem key={option.value} value={option.value}>
+                {option.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
         <div className="flex items-center gap-1">
           {allowInlineCreate && createOption ? (
             <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
@@ -275,9 +341,8 @@ export function DictionaryEntrySelect({
                 <div className="space-y-4">
                   <div className="space-y-2">
                     <label className="text-sm font-medium">{labels.valueLabel}</label>
-                    <input
+                    <Input
                       type="text"
-                      className="w-full rounded border px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
                       value={newValue}
                       onChange={(event) => {
                         setNewValue(event.target.value)
@@ -291,9 +356,8 @@ export function DictionaryEntrySelect({
                   {showLabelInput ? (
                     <div className="space-y-2">
                       <label className="text-sm font-medium">{labels.labelLabel}</label>
-                      <input
+                      <Input
                         type="text"
-                        className="w-full rounded border px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
                         value={newLabel}
                         onChange={(event) => setNewLabel(event.target.value)}
                         placeholder={labels.labelPlaceholder}
@@ -339,7 +403,7 @@ export function DictionaryEntrySelect({
           ) : null}
         </div>
       </div>
-      {activeOption && (activeOption.icon || activeOption.color) ? (
+      {showActiveAppearance && activeOption && (activeOption.icon || activeOption.color) ? (
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
           <span className="inline-flex items-center gap-2 rounded border border-dashed px-2 py-1">
             {activeOption.icon ? renderDictionaryIcon(activeOption.icon, 'h-4 w-4') : null}

@@ -11,11 +11,14 @@ test.describe('TC-AUTH-009: User Creation Validation Errors', () => {
     await page.goto('/backend/users/create');
     await expect(page.getByText('Create User')).toBeVisible();
 
-    const emailInput = page.getByRole('textbox').first();
-    const passwordInput = page.getByRole('textbox').nth(1);
+    const emailInput = page.locator('[data-crud-field-id="email"] input').first();
+    const nameInput = page.locator('[data-crud-field-id="name"] input').first();
+    const passwordInput = page.locator('[data-crud-field-id="password"] input').first();
     await expect(emailInput).toBeVisible();
+    await expect(nameInput).toBeVisible();
     await expect(passwordInput).toBeVisible();
     await emailInput.fill(`qa-auth-009-${Date.now()}@acme.com`);
+    await nameInput.fill('QA Auth User');
     await passwordInput.fill('Valid1!Pass');
     const rolesInput = page.getByRole('textbox', { name: /add tag and press enter/i });
     await rolesInput.fill('employee');
@@ -26,8 +29,24 @@ test.describe('TC-AUTH-009: User Creation Validation Errors', () => {
 
     await page.getByRole('button', { name: 'Create' }).first().click();
 
+    // Submitting without an organization is blocked by validation: the form
+    // stays on the create page and the required Organization <select> is flagged
+    // invalid and focused. Assert on the native validity state + focus rather
+    // than role="alert": the page can carry unrelated alert-role nodes (the
+    // Next.js route announcer and reactive notification banners), which makes a
+    // bare getByRole('alert') ambiguous and flaky across runs. The custom inline
+    // error text does not render deterministically because native constraint
+    // validation short-circuits the submit before the JS error state is shown.
     await expect(page).toHaveURL(/\/backend\/users\/create/);
-    await expect(page.getByRole('alert')).toBeVisible();
-    await expect(page.locator('#organizationId')).toBeFocused();
+    const organizationSelect = page.locator('#organizationId');
+    await expect(organizationSelect).toBeFocused();
+    const validity = await organizationSelect.evaluate(
+      (element: HTMLSelectElement) => ({
+        valid: element.validity.valid,
+        valueMissing: element.validity.valueMissing,
+        value: element.value,
+      }),
+    );
+    expect(validity).toEqual({ valid: false, valueMissing: true, value: '' });
   });
 });

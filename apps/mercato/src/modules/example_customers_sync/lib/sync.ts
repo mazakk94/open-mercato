@@ -1,5 +1,8 @@
+import { setTimeout as sleep } from 'node:timers/promises'
 import type { EntityManager } from '@mikro-orm/postgresql'
+import { type Kysely } from 'kysely'
 import type { CommandBus } from '@open-mercato/shared/lib/commands'
+import '@open-mercato/core/modules/customers/commands/index'
 import { loadCustomFieldSnapshot } from '@open-mercato/shared/lib/commands/customFieldSnapshots'
 import { CrudHttpError } from '@open-mercato/shared/lib/crud/errors'
 import { findOneWithDecryption } from '@open-mercato/shared/lib/encryption/find'
@@ -13,7 +16,7 @@ import {
   type InteractionRecord,
 } from '@open-mercato/core/modules/customers/lib/interactionCompatibility'
 import { hydrateCanonicalInteractions } from '@open-mercato/core/modules/customers/lib/interactionReadModel'
-import { E } from '../../../../.mercato/generated/entities.ids.generated'
+const EXAMPLE_TODO_ENTITY_ID = 'example:todo' as const
 import { Todo } from '../../example/data/entities'
 import { ExampleCustomerInteractionMapping } from '../data/entities'
 import { emitExampleCustomersSyncEvent } from '../events'
@@ -27,6 +30,7 @@ import {
 } from './mappings'
 import {
   buildExampleCustomersSyncCommandContext,
+  createScopedSyncContainer,
   EXAMPLE_CUSTOMERS_SYNC_INBOUND_ORIGIN,
   EXAMPLE_CUSTOMERS_SYNC_OUTBOUND_ORIGIN,
   type ExampleCustomersSyncScope,
@@ -65,7 +69,7 @@ type LegacyExampleTodoLinkRow = {
   entityId: string
   todoId: string
   createdByUserId: string | null
-  createdAt: Date
+  createdAt: Date | string
 }
 
 export type ExampleCustomersSyncReconcileItem = {
@@ -91,6 +95,8 @@ type CursorPayload = {
 }
 
 const DEFAULT_TASK_TITLE = 'Untitled task'
+const LEGACY_INBOUND_BOOTSTRAP_ATTEMPTS = 10
+const LEGACY_INBOUND_BOOTSTRAP_DELAY_MS = 100
 
 function isSyncOriginFromBridge(syncOrigin: unknown): boolean {
   return typeof syncOrigin === 'string' && syncOrigin.startsWith('example_customers_sync:')
@@ -107,6 +113,10 @@ function parseDateOrNull(value: string | Date | null | undefined): Date | null {
   }
   const parsed = new Date(value)
   return Number.isNaN(parsed.getTime()) ? null : parsed
+}
+
+function toIsoString(value: Date | string | null | undefined): string | null {
+  return parseDateOrNull(value)?.toISOString() ?? null
 }
 
 function trimErrorMessage(value: unknown): string {
@@ -312,7 +322,7 @@ async function loadExampleTodoSnapshot(
   )
   if (!todo) return null
   const customValues = await loadCustomFieldSnapshot(em, {
-    entityId: E.example.todo,
+    entityId: EXAMPLE_TODO_ENTITY_ID,
     recordId: todo.id,
     tenantId: todo.tenantId ?? null,
     organizationId: todo.organizationId ?? null,
@@ -393,6 +403,38 @@ async function loadLegacyExampleTodoLinkRow(
   }
 }
 
+async function waitForLegacyExampleTodoLinkRow(
+  em: EntityManager,
+  scope: ExampleCustomersSyncScope,
+  todoId: string,
+): Promise<LegacyExampleTodoLinkRow | null> {
+  for (let attempt = 0; attempt < LEGACY_INBOUND_BOOTSTRAP_ATTEMPTS; attempt += 1) {
+    const link = await loadLegacyExampleTodoLinkRow(em, scope, todoId)
+    if (link) return link
+    if (attempt < LEGACY_INBOUND_BOOTSTRAP_ATTEMPTS - 1) {
+      await sleep(LEGACY_INBOUND_BOOTSTRAP_DELAY_MS)
+      em.clear()
+    }
+  }
+  return null
+}
+
+async function waitForExampleTodoSnapshot(
+  em: EntityManager,
+  scope: ExampleCustomersSyncScope,
+  todoId: string,
+): Promise<ExampleTodoSnapshot | null> {
+  for (let attempt = 0; attempt < LEGACY_INBOUND_BOOTSTRAP_ATTEMPTS; attempt += 1) {
+    const todo = await loadExampleTodoSnapshot(em, scope, todoId)
+    if (todo) return todo
+    if (attempt < LEGACY_INBOUND_BOOTSTRAP_ATTEMPTS - 1) {
+      await sleep(LEGACY_INBOUND_BOOTSTRAP_DELAY_MS)
+      em.clear()
+    }
+  }
+  return null
+}
+
 async function ensureLegacyExampleMapping(
   em: EntityManager,
   scope: ExampleCustomersSyncScope,
@@ -415,19 +457,29 @@ async function ensureLegacyExampleMapping(
     ...scope,
     interactionId,
     todoId: legacyLink.todoId,
-    sourceUpdatedAt: legacyLink.createdAt ?? null,
+    sourceUpdatedAt: parseDateOrNull(legacyLink.createdAt),
   })
 }
 
 export async function syncCustomerInteractionToExampleTodo(
-  container: ContainerLike,
+  rawContainer: ContainerLike,
   payload: ExampleCustomersSyncOutboundJobPayload,
 ): Promise<void> {
   const scope = { tenantId: payload.tenantId, organizationId: payload.organizationId }
-  const flags = await resolveExampleCustomersSyncFlags(container, scope.tenantId)
+  const flags = await resolveExampleCustomersSyncFlags(rawContainer, scope.tenantId)
   if (!flags.enabled) return
 
-  const em = (container.resolve('em') as EntityManager).fork()
+  // Worker's own fork — used for reads (findMappingByInteractionId,
+  // loadExampleTodoSnapshot, ensureLegacyExampleMapping) and for the
+  // error-path mapping write (markMappingError). This preserves the
+  // pre-fix behavior of the local em so the catch path keeps working.
+  const em = (rawContainer.resolve('em') as EntityManager).fork()
+  // Separate scoped container — used ONLY for command-bus calls so each
+  // sync invocation gets its own DataEngine.em. This isolates the
+  // identity-map pollution that surfaced as a todos_pkey duplicate inside
+  // setRecordCustomFields when multiple jobs touched the same interaction.id
+  // through the shared request-container DataEngine.
+  const container = createScopedSyncContainer(rawContainer)
   let mapping = await findMappingByInteractionId(em, scope, payload.interactionId)
 
   try {
@@ -559,6 +611,10 @@ export async function syncExampleTodoToCanonicalInteraction(
   const flags = await resolveExampleCustomersSyncFlags(container, scope.tenantId)
   if (!flags.enabled || !flags.bidirectional) return
 
+  // Inbound sync never hit the outbound duplicate-key bug (it creates/updates
+  // canonical interactions, not same-id Todos), so it keeps the original
+  // shared-container behavior — scoping it was speculative and regressed the
+  // inbound field-clear propagation in TC-CRM-028.
   const em = (container.resolve('em') as EntityManager).fork()
   let mapping = await findMappingByTodoId(em, scope, payload.todoId)
   let todo: ExampleTodoSnapshot | null = null
@@ -708,7 +764,6 @@ function decodeCursor(token: string | undefined): CursorPayload | null {
     if (typeof parsed.id !== 'string' || typeof parsed.createdAt !== 'string') return null
     return parsed
   } catch {
-    /* malformed cursor token — treat as no cursor */
     return null
   }
 }
@@ -720,39 +775,41 @@ async function loadLegacyExampleTodoLinks(
   cursor?: string,
 ): Promise<{ rows: LegacyExampleTodoLinkRow[]; nextCursor?: string }> {
   const em = (container.resolve('em') as EntityManager).fork()
-  const knex = em.getKnex()
+  const db = (em as any).getKysely() as Kysely<any>
   const parsedCursor = decodeCursor(cursor)
-  const query = knex('customer_todo_links')
-    .select<LegacyExampleTodoLinkRow[]>([
+  let query = db
+    .selectFrom('customer_todo_links')
+    .select([
       'id',
       'entity_id as entityId',
       'todo_id as todoId',
       'created_by_user_id as createdByUserId',
       'created_at as createdAt',
     ])
-    .where({
-      tenant_id: scope.tenantId,
-      organization_id: scope.organizationId,
-      todo_source: 'example:todo',
-    })
+    .where('tenant_id', '=', scope.tenantId)
+    .where('organization_id', '=', scope.organizationId)
+    .where('todo_source', '=', 'example:todo')
     .orderBy('created_at', 'asc')
     .orderBy('id', 'asc')
     .limit(limit + 1)
 
   if (parsedCursor) {
-    query.andWhere(function applyCursor() {
-      this.where('created_at', '>', new Date(parsedCursor.createdAt)).orWhere(function applyTieBreaker() {
-        this.where('created_at', new Date(parsedCursor.createdAt)).andWhere('id', '>', parsedCursor.id)
-      })
-    })
+    const cursorDate = new Date(parsedCursor.createdAt)
+    query = query.where(eb => eb.or([
+      eb('created_at', '>', cursorDate),
+      eb.and([
+        eb('created_at', '=', cursorDate),
+        eb('id', '>', parsedCursor.id),
+      ]),
+    ]))
   }
 
-  const rows = await query
+  const rows = (await query.execute()) as LegacyExampleTodoLinkRow[]
   const pageRows = rows.slice(0, limit)
   const next = rows.length > limit ? pageRows[pageRows.length - 1] : null
   return {
     rows: pageRows,
-    ...(next ? { nextCursor: encodeCursor({ createdAt: next.createdAt.toISOString(), id: next.id }) } : {}),
+    ...(next ? { nextCursor: encodeCursor({ createdAt: toIsoString(next.createdAt) ?? new Date(0).toISOString(), id: next.id }) } : {}),
   }
 }
 
@@ -778,14 +835,14 @@ async function ensureCanonicalInteractionForLegacyLink(
     return { interactionId: existing.id, created: false }
   }
 
-  const todo = await loadExampleTodoSnapshot(em, scope, link.todoId)
+  const todo = await waitForExampleTodoSnapshot(em, scope, link.todoId)
   if (!todo) return null
 
   const patch = buildInteractionUpdateFromExampleTodo({
     title: todo.title,
     isDone: todo.isDone,
     customValues: todo.customValues,
-    occurredAt: todo.isDone ? (todo.updatedAt ?? link.createdAt) : null,
+    occurredAt: todo.isDone ? parseDateOrNull(todo.updatedAt ?? link.createdAt) : null,
   })
 
   const commandBus = container.resolve('commandBus') as CommandBus
@@ -798,6 +855,8 @@ async function ensureCanonicalInteractionForLegacyLink(
     const result = await commandBus.execute<Record<string, unknown>, { interactionId: string }>('customers.interactions.create', {
       input: {
         id: link.todoId,
+        tenantId: scope.tenantId,
+        organizationId: scope.organizationId,
         entityId: link.entityId,
         interactionType: CUSTOMER_INTERACTION_TASK_TYPE,
         title: patch.title,
@@ -837,16 +896,16 @@ async function ensureMappingForLegacyExampleTodo(
   todoId: string,
 ): Promise<ExampleCustomerInteractionMapping | null> {
   const em = (container.resolve('em') as EntityManager).fork()
-  const legacyLink = await loadLegacyExampleTodoLinkRow(em, scope, todoId)
+  const legacyLink = await waitForLegacyExampleTodoLinkRow(em, scope, todoId)
   if (!legacyLink) return null
   const canonical = await ensureCanonicalInteractionForLegacyLink(container, scope, legacyLink)
   if (!canonical) return null
-  const todo = await loadExampleTodoSnapshot(em, scope, todoId)
+  const todo = await waitForExampleTodoSnapshot(em, scope, todoId)
   return await updateMappingAfterSync(em, {
     ...scope,
     interactionId: canonical.interactionId,
     todoId,
-    sourceUpdatedAt: todo?.updatedAt ?? legacyLink.createdAt,
+    sourceUpdatedAt: parseDateOrNull(todo?.updatedAt ?? legacyLink.createdAt),
   })
 }
 
@@ -856,8 +915,8 @@ export async function reconcileLegacyExampleTodoLinks(
 ): Promise<ExampleCustomersSyncReconcileResult> {
   const scope = { tenantId: input.tenantId, organizationId: input.organizationId }
   const limit = Math.min(Math.max(input.limit ?? 100, 1), 500)
-  const { rows, nextCursor } = await loadLegacyExampleTodoLinks(container, scope, limit, input.cursor)
   const em = (container.resolve('em') as EntityManager).fork()
+  const { rows, nextCursor } = await loadLegacyExampleTodoLinks(container, scope, limit, input.cursor)
   const items: ExampleCustomersSyncReconcileItem[] = []
   let mapped = 0
   let createdInteractions = 0
@@ -885,7 +944,7 @@ export async function reconcileLegacyExampleTodoLinks(
         ...scope,
         interactionId: canonical.interactionId,
         todoId: row.todoId,
-        sourceUpdatedAt: todo?.updatedAt ?? row.createdAt,
+        sourceUpdatedAt: parseDateOrNull(todo?.updatedAt ?? row.createdAt),
       })
       items.push({
         linkId: row.id,

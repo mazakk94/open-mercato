@@ -1,8 +1,9 @@
-import type { EntityManager } from '@mikro-orm/core'
+import type { EntityManager } from '@mikro-orm/postgresql'
 import { ProgressJob } from '../data/entities'
 import type { ProgressService } from './progressService'
 import { calculateEta, calculateProgressPercent, STALE_JOB_TIMEOUT_SECONDS } from './progressService'
 import { PROGRESS_EVENTS } from './events'
+import { findOneWithDecryption } from '@open-mercato/shared/lib/encryption/find'
 
 function buildJobPayload(job: ProgressJob): Record<string, unknown> {
   return {
@@ -41,7 +42,7 @@ export function createProgressService(em: EntityManager, eventBus: { emit: (even
         status: 'pending',
       })
 
-      await em.persistAndFlush(job)
+      await em.persist(job).flush()
 
       await eventBus.emit(PROGRESS_EVENTS.JOB_CREATED, {
         ...buildJobPayload(job),
@@ -74,7 +75,11 @@ export function createProgressService(em: EntityManager, eventBus: { emit: (even
     },
 
     async updateProgress(jobId, input, ctx) {
-      const job = await em.findOneOrFail(ProgressJob, { id: jobId, tenantId: ctx.tenantId })
+      const job = await em.findOneOrFail(ProgressJob, {
+        id: jobId,
+        tenantId: ctx.tenantId,
+        ...(ctx.organizationId ? { organizationId: ctx.organizationId } : {}),
+      })
       if (job.status === 'completed' || job.status === 'failed' || job.status === 'cancelled') {
         return job
       }
@@ -196,6 +201,7 @@ export function createProgressService(em: EntityManager, eventBus: { emit: (even
       const job = await em.findOneOrFail(ProgressJob, {
         id: jobId,
         tenantId: ctx.tenantId,
+        ...(ctx.organizationId ? { organizationId: ctx.organizationId } : {}),
         cancellable: true,
         status: { $in: ['pending', 'running'] },
       })
@@ -243,8 +249,8 @@ export function createProgressService(em: EntityManager, eventBus: { emit: (even
       return job
     },
 
-    async isCancellationRequested(jobId) {
-      const job = await em.findOne(ProgressJob, { id: jobId })
+    async isCancellationRequested(jobId, tenantId) {
+      const job = await findOneWithDecryption(em, ProgressJob, { id: jobId, tenantId })
       return job?.cancelRequestedAt != null
     },
 
@@ -278,6 +284,7 @@ export function createProgressService(em: EntityManager, eventBus: { emit: (even
       return em.findOne(ProgressJob, {
         id: jobId,
         tenantId: ctx.tenantId,
+        ...(ctx.organizationId ? { organizationId: ctx.organizationId } : {}),
       })
     },
 

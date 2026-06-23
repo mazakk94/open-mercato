@@ -5,9 +5,9 @@ import { CustomerLead } from '../../data/entities'
 import { leadCreateSchema, leadUpdateSchema } from '../../data/validators'
 import { E } from '#generated/entities.ids.generated'
 import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
+import { consumeAdvancedFilterState } from '@open-mercato/shared/lib/crud/advanced-filter-integration'
 import {
   applyEntityIdRestriction,
-  consumeAdvancedFilterState,
   findMatchingEntityIdsWithQueryEngine,
   findMatchingEntityIdsBySearchTokensAcrossSources,
   parseScopedCommandInput,

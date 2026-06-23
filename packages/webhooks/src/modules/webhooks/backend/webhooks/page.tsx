@@ -8,12 +8,15 @@ import type { ColumnDef } from '@tanstack/react-table'
 import { Button } from '@open-mercato/ui/primitives/button'
 import { RowActions } from '@open-mercato/ui/backend/RowActions'
 import { apiCall } from '@open-mercato/ui/backend/utils/apiCall'
+import { buildOptimisticLockHeader } from '@open-mercato/ui/backend/utils/optimisticLock'
+import { surfaceRecordConflict } from '@open-mercato/ui/backend/conflicts'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
 import { useOrganizationScopeVersion } from '@open-mercato/shared/lib/frontend/useOrganizationScope'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
 import { useConfirmDialog } from '@open-mercato/ui/backend/confirm-dialog'
 import type { FilterDef, FilterValues } from '@open-mercato/ui/backend/FilterBar'
-import { Notice } from '@open-mercato/ui/primitives/Notice'
+import { Alert, AlertDescription, AlertTitle } from '@open-mercato/ui/primitives/alert'
+import { ListEmptyState } from '@open-mercato/ui/backend/filters/ListEmptyState'
 import { useWebhookFeatureAccess } from './useWebhookFeatureAccess'
 
 type Row = {
@@ -107,10 +110,11 @@ export default function WebhooksListPage() {
     try {
       const call = await apiCall<{ error?: string }>(
         `/api/webhooks/${encodeURIComponent(row.id)}`,
-        { method: 'DELETE' },
+        { method: 'DELETE', headers: buildOptimisticLockHeader(row.updatedAt) },
         { fallback: null },
       )
       if (!call.ok) {
+        if (surfaceRecordConflict({ status: call.status, body: call.result }, t)) return
         const errorPayload = call.result as { error?: string } | undefined
         const message = typeof errorPayload?.error === 'string' ? errorPayload.error : t('webhooks.list.deleteError')
         flash(message, 'error')
@@ -190,7 +194,7 @@ export default function WebhooksListPage() {
       accessorKey: 'isActive',
       header: t('webhooks.list.columns.status'),
       cell: ({ row }) => (
-        <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${row.original.isActive ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200' : 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400'}`}>
+        <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${row.original.isActive ? 'bg-status-success-bg text-status-success-text' : 'bg-status-neutral-bg text-status-neutral-text'}`}>
           {row.original.isActive ? t('webhooks.list.status.active') : t('webhooks.list.status.inactive')}
         </span>
       ),
@@ -227,7 +231,10 @@ export default function WebhooksListPage() {
   return (
     <Page>
       <PageBody className="space-y-4">
-        <Notice title={t('webhooks.list.description')} message={t('webhooks.list.operatorTip')} />
+        <Alert variant="info">
+          <AlertTitle>{t('webhooks.list.description')}</AlertTitle>
+          <AlertDescription>{t('webhooks.list.operatorTip')}</AlertDescription>
+        </Alert>
         <DataTable
           title={t('webhooks.list.title')}
           actions={access.canManage ? (
@@ -273,6 +280,13 @@ export default function WebhooksListPage() {
 
             return <RowActions items={items} />
           }}
+          emptyState={(
+            <ListEmptyState
+              entityName={t('webhooks.list.title')}
+              createHref={access.canManage ? '/backend/webhooks/create' : undefined}
+              createLabel={access.canManage ? t('webhooks.nav.create') : undefined}
+            />
+          )}
           pagination={{ page, pageSize: 20, total, totalPages, onPageChange: setPage }}
           isLoading={isLoading}
         />

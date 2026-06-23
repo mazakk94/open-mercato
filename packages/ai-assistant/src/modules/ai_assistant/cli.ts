@@ -1,14 +1,9 @@
 import type { ModuleCli } from '@open-mercato/shared/modules/registry'
 import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
-import { fileURLToPath } from 'node:url'
-import { dirname, resolve } from 'node:path'
-import { pathToFileURL } from 'node:url'
-
 /**
  * Ensure app bootstrap is called before creating DI container.
- * Uses import.meta.url for runtime path resolution since @/ alias
- * doesn't work with dynamic imports (TypeScript path aliases are
- * compile-time only, not available to Node.js at runtime).
+ * Uses the shared generated-bootstrap loader so the command works both from
+ * the monorepo app and from standalone apps installed through npm packages.
  */
 async function ensureBootstrap(): Promise<void> {
   // First check if DI is already available
@@ -20,23 +15,9 @@ async function ensureBootstrap(): Promise<void> {
     // DI not available, need to bootstrap
   }
 
-  // Construct absolute path to bootstrap using import.meta.url
   try {
-    const __filename = fileURLToPath(import.meta.url)
-    const __dirname = dirname(__filename)
-    // From packages/ai-assistant/src/modules/ai_assistant/cli.ts
-    // to apps/mercato/src/bootstrap.ts:
-    // ai_assistant → modules → src → ai-assistant → packages → root (6 levels)
-    // then into apps/mercato/src/bootstrap.ts
-    const bootstrapPath = resolve(__dirname, '../../../../../../apps/mercato/src/bootstrap.ts')
-
-    // Dynamic import using file URL
-    const bootstrapUrl = pathToFileURL(bootstrapPath).href
-    const { bootstrap, isBootstrapped } = await import(bootstrapUrl)
-
-    if (!isBootstrapped()) {
-      bootstrap()
-    }
+    const { bootstrapFromAppRoot } = await import('@open-mercato/shared/lib/bootstrap/dynamicLoader')
+    await bootstrapFromAppRoot()
   } catch (error) {
     console.error('[MCP] Bootstrap failed:', error instanceof Error ? error.message : error)
     // Continue - some contexts may not have bootstrap available
@@ -66,30 +47,42 @@ const mcpServe: ModuleCli = {
   command: 'mcp:serve',
   async run(rest) {
     const args = parseArgs(rest)
-    const apiKey = String(args['api-key'] ?? args.apiKey ?? '') || null
+    // Prefer the OPEN_MERCATO_API_KEY env var so the secret never has to be
+    // placed on the command line (argv is world-readable via ps / /proc).
+    // The --api-key flag stays supported for backward compatibility.
+    const apiKey = String(args['api-key'] ?? args.apiKey ?? '') || process.env.OPEN_MERCATO_API_KEY || null
     const tenantId = String(args.tenant ?? args.tenantId ?? '') || null
     const organizationId = String(args.org ?? args.organizationId ?? '') || null
     const userId = String(args.user ?? args.userId ?? '') || null
     const debug = args.debug === true || args.debug === 'true'
+    const allowUnauthenticatedSuperadmin =
+      args['allow-unauthenticated-superadmin'] === true ||
+      args['allow-unauthenticated-superadmin'] === 'true'
 
     // Either API key or tenant is required
     if (!apiKey && !tenantId) {
       console.error('Usage: mercato ai_assistant mcp:serve [options]')
       console.error('')
       console.error('Authentication (choose one):')
-      console.error('  --api-key <secret>   API key secret for authentication (recommended)')
-      console.error('  --tenant <id>        Tenant ID (for manual context)')
+      console.error('  OPEN_MERCATO_API_KEY env   API key secret (recommended — keeps the secret off argv)')
+      console.error('  --api-key <secret>         API key secret for authentication (visible in process listings)')
+      console.error('  --tenant <id>              Tenant ID (for manual context)')
       console.error('')
       console.error('Options (with --tenant):')
       console.error('  --org <id>           Organization ID (optional)')
-      console.error('  --user <id>          User ID for ACL (optional, uses superadmin if not set)')
+      console.error('  --user <id>          User ID for ACL (required unless --allow-unauthenticated-superadmin is set)')
       console.error('')
       console.error('Common options:')
       console.error('  --debug              Enable debug logging')
+      console.error('  --allow-unauthenticated-superadmin')
+      console.error('                       DEV/TEST ONLY: run as superadmin with no per-user ACL when')
+      console.error('                       no --user (and no --api-key) is supplied. Never use in production.')
       console.error('')
       console.error('Examples:')
+      console.error('  OPEN_MERCATO_API_KEY=omk_xxxx.yyyy... mercato ai_assistant mcp:serve')
       console.error('  mercato ai_assistant mcp:serve --api-key omk_xxxx.yyyy...')
-      console.error('  mercato ai_assistant mcp:serve --tenant 123e4567-e89b-12d3-a456-426614174000')
+      console.error('  mercato ai_assistant mcp:serve --tenant 123e4567-e89b-12d3-a456-426614174000 --user <user-id>')
+      console.error('  mercato ai_assistant mcp:serve --tenant 123e4567-e89b-12d3-a456-426614174000 --allow-unauthenticated-superadmin')
       return
     }
 
@@ -121,6 +114,7 @@ const mcpServe: ModuleCli = {
           organizationId,
           userId,
         },
+        allowUnauthenticatedSuperadmin,
       })
     }
   },
@@ -271,4 +265,116 @@ const entityGraph: ModuleCli = {
   },
 }
 
-export default [mcpServe, mcpServeHttp, mcpDev, listTools, entityGraph]
+const runPendingActionCleanup: ModuleCli = {
+  command: 'run-pending-action-cleanup',
+  async run() {
+    await ensureBootstrap()
+    const container = await createRequestContainer()
+
+    const { runPendingActionCleanup: runCleanup } = await import(
+      './workers/ai-pending-action-cleanup'
+    )
+
+    const em = container.resolve<import('@mikro-orm/postgresql').EntityManager>('em')
+    const summary = await runCleanup({ em })
+
+    console.log('[ai-pending-action-cleanup] Sweep complete:', summary)
+  },
+}
+
+const testTools: ModuleCli = {
+  command: 'test-tools',
+  async run(rest) {
+    const args = parseArgs(rest)
+    const json = args.json === true || args.json === 'true'
+    const moduleFilter =
+      typeof args.module === 'string' && args.module.length > 0 ? args.module : null
+    const includeMutations = args['no-mutations'] !== true && args['no-mutations'] !== 'true'
+    const tenantId =
+      typeof args.tenant === 'string' && args.tenant.length > 0 ? args.tenant : null
+    const organizationId =
+      typeof args.org === 'string' && args.org.length > 0 ? args.org : null
+
+    await ensureBootstrap()
+    const { runToolTests } = await import('./lib/tool-test-runner')
+    const report = await runToolTests({
+      tenantId,
+      organizationId,
+      moduleFilter,
+      includeMutations,
+    })
+
+    if (json) {
+      // Wrap in markers so a Playwright spec (or any caller) can extract the
+      // JSON payload without being thrown off by bootstrap log lines emitted
+      // to stdout by other modules during DI container creation.
+      console.log('---TOOL_TEST_REPORT_BEGIN---')
+      console.log(JSON.stringify(report))
+      console.log('---TOOL_TEST_REPORT_END---')
+    } else {
+      console.log('')
+      console.log(
+        `AI tool test report — tenant=${report.tenantId ?? '<none>'} org=${
+          report.organizationId ?? '<none>'
+        }`,
+      )
+      console.log(
+        `total=${report.total} pass=${report.passed} fail=${report.failed} skip=${report.skipped}`,
+      )
+      const byModule = new Map<string, typeof report.records>()
+      for (const record of report.records) {
+        const list = byModule.get(record.module) ?? []
+        list.push(record)
+        byModule.set(record.module, list)
+      }
+      const sortedModules = Array.from(byModule.keys()).sort()
+      for (const moduleId of sortedModules) {
+        const list = byModule.get(moduleId)!
+        console.log('')
+        console.log(`${moduleId} (${list.length}):`)
+        for (const record of list) {
+          const marker =
+            record.status === 'pass' ? '✓' : record.status === 'fail' ? '✗' : '·'
+          const reason = record.reason ? ` — ${record.reason}` : ''
+          const mutation = record.isMutation ? ' [mutation]' : ''
+          console.log(
+            `  ${marker} ${record.tool}${mutation} (${record.durationMs}ms)${reason}`,
+          )
+        }
+      }
+      console.log('')
+    }
+
+    if (report.failed > 0) {
+      process.exitCode = 1
+    }
+  },
+}
+
+const runTokenUsagePrune: ModuleCli = {
+  command: 'run-token-usage-prune',
+  async run() {
+    await ensureBootstrap()
+    const container = await createRequestContainer()
+
+    const { runTokenUsagePrune: runPrune } = await import(
+      './workers/ai-token-usage-prune'
+    )
+
+    const em = container.resolve<import('@mikro-orm/postgresql').EntityManager>('em')
+    const summary = await runPrune({ em })
+
+    console.log('[ai-token-usage-prune] Prune complete:', summary)
+  },
+}
+
+export default [
+  mcpServe,
+  mcpServeHttp,
+  mcpDev,
+  listTools,
+  entityGraph,
+  runPendingActionCleanup,
+  runTokenUsagePrune,
+  testTools,
+]

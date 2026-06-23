@@ -1,17 +1,19 @@
 import { cookies, headers } from 'next/headers'
 import { backendRoutes } from '@/.mercato/generated/backend-routes.generated'
-import { findRouteManifestMatch } from '@open-mercato/shared/modules/registry'
+import { findRouteManifestMatch, registerBackendRouteManifests } from '@open-mercato/shared/modules/registry'
 import { getAuthFromCookies } from '@open-mercato/shared/lib/auth/server'
 import { AppShell } from '@open-mercato/ui/backend/AppShell'
 import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
 import { I18nProvider } from '@open-mercato/shared/lib/i18n/context'
+import { hasAllFeatures } from '@open-mercato/shared/lib/auth/featureMatch'
 import { profilePathPrefixes } from '@open-mercato/core/modules/auth/lib/profile-sections'
 import { APP_VERSION } from '@open-mercato/shared/lib/version'
 import { parseBooleanWithDefault } from '@open-mercato/shared/lib/boolean'
 import { PageInjectionBoundary } from '@open-mercato/ui/backend/injection/PageInjectionBoundary'
 import { DemoFeedbackWidget } from '@/components/DemoFeedbackWidget'
-import OrganizationSwitcher from '@/components/OrganizationSwitcher'
 import { BackendHeaderChrome } from '@/components/BackendHeaderChrome'
+
+registerBackendRouteManifests(backendRoutes)
 
 function collectStaticSettingsPathPrefixes(): string[] {
   const prefixes = new Set<string>()
@@ -81,6 +83,11 @@ export default async function BackendLayout({
   const initialCollapsed = collapsedCookie === '1'
   const demoModeEnabled = parseBooleanWithDefault(process.env.DEMO_MODE, true)
   const deployEnv = process.env.DEPLOY_ENV
+  const grantedFeatures = Array.isArray(auth?.features)
+    ? auth.features.filter((feature): feature is string => typeof feature === 'string')
+    : []
+  const canManageUpgradeActions =
+    auth?.isSuperAdmin === true || hasAllFeatures(['configs.manage'], grantedFeatures)
   const baseProductName = translate('appShell.productName', 'Open Mercato')
   const productName = deployEnv && deployEnv !== 'local'
     ? `${baseProductName} (${deployEnv.charAt(0).toUpperCase() + deployEnv.slice(1)})`
@@ -96,9 +103,9 @@ export default async function BackendLayout({
   return (
     <I18nProvider locale={locale} dict={dict}>
       <AppShell
-        key={path}
         productName={productName}
         email={auth?.email}
+        canManageUpgradeActions={canManageUpgradeActions}
         groups={[]}
         currentTitle={currentTitle}
         breadcrumb={breadcrumb}
@@ -106,13 +113,13 @@ export default async function BackendLayout({
         rightHeaderSlot={(
           <BackendHeaderChrome
             email={auth?.email}
+            userId={auth?.sub ?? null}
             embeddingConfigured={embeddingConfigured}
             missingConfigMessage={missingConfigMessage}
             tenantId={auth?.tenantId ?? null}
             organizationId={auth?.orgId ?? null}
           />
         )}
-        mobileSidebarSlot={<OrganizationSwitcher compact />}
         adminNavApi="/api/auth/admin/nav"
         version={APP_VERSION}
         settingsPathPrefixes={collectStaticSettingsPathPrefixes()}

@@ -1,19 +1,63 @@
+jest.mock('@open-mercato/cache', () => ({
+  runWithCacheTenant: async (_tenantId: string | null, fn: () => Promise<unknown>) => fn(),
+}), { virtual: true })
+
 import { makeCrudRoute } from '@open-mercato/shared/lib/crud/factory'
 import { registerApiInterceptors } from '@open-mercato/shared/lib/crud/interceptor-registry'
+import {
+  clearOptimisticLockReadersForTests,
+  getAllOptimisticLockReaders,
+  registerOptimisticLockReaders,
+} from '@open-mercato/shared/lib/crud/optimistic-lock-store'
+import { loadCustomFieldDefinitionIndex } from '@open-mercato/shared/lib/crud/custom-fields'
 import { z } from 'zod'
+
+// Keep the real custom-field helpers but spy on the definition loader so we can
+// assert the factory skips the second DB round-trip when the query engine has
+// already resolved definitions (issue #2133).
+jest.mock('@open-mercato/shared/lib/crud/custom-fields', () => {
+  const actual = jest.requireActual('@open-mercato/shared/lib/crud/custom-fields')
+  return { ...actual, loadCustomFieldDefinitionIndex: jest.fn(async () => new Map()) }
+})
 
 // ---- Mocks ----
 const mockEventBus = { emitEvent: jest.fn() }
+const defaultOrganizationId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+const defaultTenantId = '123e4567-e89b-12d3-a456-426614174000'
+type MockOrganizationScope = {
+  selectedId: string | null
+  filterIds: string[] | null
+  allowedIds: string[] | null
+  tenantId: string | null
+}
 
 type Rec = { id: string; organizationId: string; tenantId: string; title?: string; isDone?: boolean; deletedAt?: Date | null }
 let db: Record<string, Rec>
 let idSeq = 1
 let commandBus: { execute: jest.Mock }
 let crudMutationGuardService: { validateMutation: jest.Mock; afterMutationSuccess: jest.Mock } | null
+let mockOrganizationScopeOverride: MockOrganizationScope | null
 
 const em = {
+  transactional: async (cb: () => any) => {
+    const snapshot = Object.fromEntries(Object.entries(db).map(([key, value]) => [key, { ...value }]))
+    try {
+      return await cb()
+    } catch (error) {
+      for (const key of Object.keys(db)) delete db[key]
+      Object.assign(db, snapshot)
+      throw error
+    }
+  },
   create: (_cls: any, data: any) => ({ ...data, id: `id-${idSeq++}` }),
-  persistAndFlush: async (entity: Rec) => { db[entity.id] = { ...(db[entity.id] || {} as any), ...entity } },
+  persist(entity: Rec) {
+    db[entity.id] = { ...(db[entity.id] || {} as any), ...entity }
+    return { flush: async () => undefined }
+  },
+  remove(entity: Rec) {
+    delete db[entity.id]
+    return { flush: async () => undefined }
+  },
   findOne: async (_entity: any, where: any) => (em.getRepository(_entity).findOne(where) as any),
   getRepository: (_cls: any) => ({
     find: async (where: any) => Object.values(db).filter((r) => {
@@ -47,7 +91,10 @@ const em = {
           : r.organizationId === orgClause
       return matchesOrg && r.tenantId === where.tenantId
     }) || null,
-    removeAndFlush: async (entity: Rec) => { delete db[entity.id] },
+    remove(entity: Rec) {
+      delete db[entity.id]
+      return { flush: async () => undefined }
+    },
   }),
 }
 
@@ -59,22 +106,22 @@ const mockDataEngine = {
   __pendingSideEffects: [] as any[],
   createOrmEntity: jest.fn(async ({ entity, data }: any) => {
     const created = em.create(entity, data)
-    await em.persistAndFlush(created as any)
+    await em.persist(created as any).flush()
     return created
   }),
   updateOrmEntity: jest.fn(async ({ entity, where, apply }: any) => {
     const current = await (em.getRepository(entity).findOne(where) as any)
     if (!current) return null
     await apply(current)
-    await em.persistAndFlush(current)
+    await em.persist(current).flush()
     return current
   }),
   deleteOrmEntity: jest.fn(async ({ entity, where, soft, softDeleteField }: any) => {
     const repo = em.getRepository(entity)
     const current = await (repo.findOne(where) as any)
     if (!current) return null
-    if (soft !== false) { (current as any)[softDeleteField || 'deletedAt'] = new Date(); await em.persistAndFlush(current) }
-    else await repo.removeAndFlush(current)
+    if (soft !== false) { (current as any)[softDeleteField || 'deletedAt'] = new Date(); await em.persist(current).flush() }
+    else await repo.remove(current).flush()
     return current
   }),
   setCustomFields: jest.fn(async (args: any) => {
@@ -112,12 +159,26 @@ jest.mock('@open-mercato/shared/lib/di/container', () => ({
 }))
 
 jest.mock('@open-mercato/shared/lib/auth/server', () => {
-  const auth = { sub: 'u1', orgId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', tenantId: '123e4567-e89b-12d3-a456-426614174000', roles: ['admin'] }
+  const auth = {
+    sub: 'u1',
+    orgId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    tenantId: '123e4567-e89b-12d3-a456-426614174000',
+    roles: ['admin'],
+  }
   return {
     getAuthFromCookies: async () => auth,
     getAuthFromRequest: async () => auth,
   }
 })
+
+jest.mock('@open-mercato/core/modules/directory/utils/organizationScope', () => ({
+  resolveOrganizationScopeForRequest: jest.fn(async () => mockOrganizationScopeOverride ?? ({
+    selectedId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    filterIds: ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'],
+    allowedIds: ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'],
+    tenantId: '123e4567-e89b-12d3-a456-426614174000',
+  })),
+}))
 
 const setRecordCustomFields = jest.fn(async () => {})
 jest.mock('@open-mercato/core/modules/entities/lib/helpers', () => ({
@@ -134,6 +195,7 @@ describe('CRUD Factory', () => {
     jest.clearAllMocks()
     accessLogService.log.mockClear()
     mockDataEngine.__pendingSideEffects = []
+    mockOrganizationScopeOverride = null
     commandBus = {
       execute: jest.fn(async () => ({ result: {}, logEntry: { id: 'log-1' } })),
     }
@@ -203,6 +265,64 @@ describe('CRUD Factory', () => {
     }))
   })
 
+  const makeDecoratedRoute = () => makeCrudRoute({
+    metadata: { GET: { requireAuth: true } },
+    orm: { entity: Todo, idField: 'id', orgField: 'organizationId', tenantField: 'tenantId', softDeleteField: 'deletedAt' },
+    indexer: { entityType: 'example.todo' },
+    list: {
+      schema: querySchema,
+      entityId: 'example.todo',
+      fields: ['id', 'title'],
+      buildFilters: () => ({} as any),
+      decorateCustomFields: { entityIds: 'example.todo' },
+    },
+  })
+
+  const colorDefinitionIndex = () => new Map([
+    ['color', [{ key: 'color', label: 'Color', kind: 'text', multi: false, dictionaryId: null, organizationId: null, tenantId: null, priority: 0, updatedAt: 0 }]],
+  ])
+
+  it('reuses query engine custom-field definitions and skips the second DB load (#2133)', async () => {
+    const loadIndexMock = loadCustomFieldDefinitionIndex as unknown as jest.Mock
+    const cfRoute = makeDecoratedRoute()
+    queryEngine.query.mockResolvedValueOnce({
+      items: [{ id: 'id-1', title: 'A', cf_color: 'blue', organization_id: defaultOrganizationId, tenant_id: defaultTenantId }],
+      total: 1,
+      customFieldDefinitions: {
+        index: colorDefinitionIndex(),
+        entityIds: ['example.todo'],
+        tenantId: defaultTenantId,
+        organizationIds: [defaultOrganizationId],
+      },
+    })
+
+    const res = await cfRoute.GET(new Request('http://x/api/example/todos?page=1&pageSize=10&sortField=id&sortDir=asc'))
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(loadIndexMock).not.toHaveBeenCalled()
+    expect(body.items[0].customValues).toEqual({ color: 'blue' })
+  })
+
+  it('falls back to loading definitions when the engine index does not cover the scope', async () => {
+    const loadIndexMock = loadCustomFieldDefinitionIndex as unknown as jest.Mock
+    loadIndexMock.mockResolvedValueOnce(colorDefinitionIndex())
+    const cfRoute = makeDecoratedRoute()
+    queryEngine.query.mockResolvedValueOnce({
+      items: [{ id: 'id-1', title: 'A', cf_color: 'blue', organization_id: defaultOrganizationId, tenant_id: defaultTenantId }],
+      total: 1,
+      customFieldDefinitions: {
+        index: new Map(),
+        entityIds: ['example.todo'],
+        tenantId: defaultTenantId,
+        organizationIds: ['some-other-org'],
+      },
+    })
+
+    const res = await cfRoute.GET(new Request('http://x/api/example/todos?page=1&pageSize=10&sortField=id&sortDir=asc'))
+    expect(res.status).toBe(200)
+    expect(loadIndexMock).toHaveBeenCalledTimes(1)
+  })
+
   it('GET applies ids query filter in query engine path', async () => {
     const idA = '550e8400-e29b-41d4-a716-446655440001'
     const idB = '550e8400-e29b-41d4-a716-446655440002'
@@ -215,10 +335,21 @@ describe('CRUD Factory', () => {
     })
   })
 
+  it('GET normalizes custom field sort selectors for the query engine path', async () => {
+    await route.GET(new Request('http://x/api/example/todos?page=1&pageSize=10&sortField=cf_priority&sortDir=desc'))
+
+    expect(queryEngine.query).toHaveBeenCalled()
+    const queryArgs = queryEngine.query.mock.calls.at(-1)?.[1]
+    expect(queryArgs?.sort).toEqual([
+      { field: 'cf:priority', dir: 'desc' },
+    ])
+  })
+
   it('GET intersects ids with existing buildFilters id constraint', async () => {
     const routeWithIdFilter = makeCrudRoute({
       metadata: { GET: { requireAuth: true } },
       orm: { entity: Todo, idField: 'id', orgField: 'organizationId', tenantField: 'tenantId', softDeleteField: 'deletedAt' },
+      indexer: { entityType: 'example.todo' },
       list: {
         schema: querySchema.extend({ id: z.string().optional() }),
         entityId: 'example.todo',
@@ -254,16 +385,74 @@ describe('CRUD Factory', () => {
 
     const first = em.create(Todo, { title: 'One', organizationId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', tenantId: '123e4567-e89b-12d3-a456-426614174000' }) as Rec
     first.id = '550e8400-e29b-41d4-a716-446655440010'
-    await em.persistAndFlush(first)
+    await em.persist(first).flush()
     const second = em.create(Todo, { title: 'Two', organizationId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', tenantId: '123e4567-e89b-12d3-a456-426614174000' }) as Rec
     second.id = '550e8400-e29b-41d4-a716-446655440011'
-    await em.persistAndFlush(second)
+    await em.persist(second).flush()
 
     const res = await fallbackRoute.GET(new Request(`http://x/api/example/todos?ids=${first.id}`))
     expect(res.status).toBe(200)
     const body = await res.json()
     expect(body.items).toHaveLength(1)
     expect(body.items[0]?.id).toBe(first.id)
+  })
+
+  it('GET ORM fallback keeps automatic tenant/org scoping by default', async () => {
+    const fallbackRoute = makeCrudRoute({
+      metadata: { GET: { requireAuth: true } },
+      orm: { entity: Todo, idField: 'id', orgField: 'organizationId', tenantField: 'tenantId', softDeleteField: 'deletedAt' },
+      list: {
+        schema: querySchema,
+        buildFilters: () => ({} as any),
+      },
+    })
+
+    const mine = em.create(Todo, { title: 'Mine', organizationId: defaultOrganizationId, tenantId: defaultTenantId }) as Rec
+    mine.id = '550e8400-e29b-41d4-a716-446655440020'
+    await em.persist(mine).flush()
+    const other = em.create(Todo, { title: 'Other', organizationId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', tenantId: defaultTenantId }) as Rec
+    other.id = '550e8400-e29b-41d4-a716-446655440021'
+    await em.persist(other).flush()
+
+    const res = await fallbackRoute.GET(new Request('http://x/api/example/todos'))
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    const ids = body.items.map((i: any) => i.id)
+    expect(ids).toContain(mine.id)
+    expect(ids).not.toContain(other.id)
+  })
+
+  it('GET ORM fallback skips automatic scoping when omitAutomaticTenantOrgScope is set', async () => {
+    const fallbackRoute = makeCrudRoute({
+      metadata: { GET: { requireAuth: true } },
+      orm: { entity: Todo, idField: 'id', orgField: 'organizationId', tenantField: 'tenantId', softDeleteField: 'deletedAt' },
+      list: {
+        schema: querySchema,
+        buildFilters: () => ({} as any),
+        omitAutomaticTenantOrgScope: true,
+      },
+    })
+
+    const mine = em.create(Todo, { title: 'Mine', organizationId: defaultOrganizationId, tenantId: defaultTenantId }) as Rec
+    mine.id = '550e8400-e29b-41d4-a716-446655440030'
+    await em.persist(mine).flush()
+    const otherOrg = em.create(Todo, { title: 'OtherOrg', organizationId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', tenantId: defaultTenantId }) as Rec
+    otherOrg.id = '550e8400-e29b-41d4-a716-446655440031'
+    await em.persist(otherOrg).flush()
+    const otherTenant = em.create(Todo, { title: 'OtherTenant', organizationId: defaultOrganizationId, tenantId: 'ffffffff-ffff-4fff-8fff-ffffffffffff' }) as Rec
+    otherTenant.id = '550e8400-e29b-41d4-a716-446655440032'
+    await em.persist(otherTenant).flush()
+
+    const res = await fallbackRoute.GET(new Request('http://x/api/example/todos'))
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    const ids = body.items.map((i: any) => i.id)
+    // With the flag, buildFilters returns {} and auto-scope is suppressed —
+    // so rows from other orgs/tenants are reachable. Callers are expected to
+    // encode full visibility in buildFilters themselves.
+    expect(ids).toContain(mine.id)
+    expect(ids).toContain(otherOrg.id)
+    expect(ids).toContain(otherTenant.id)
   })
 
   it('GET returns CSV when format=csv', async () => {
@@ -348,10 +537,10 @@ describe('CRUD Factory', () => {
 
   it('PUT updates entity, saves custom fields, emits updated event', async () => {
     // Seed
-    const created = em.create(Todo, { title: 'X', organizationId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', tenantId: '123e4567-e89b-12d3-a456-426614174000' }) as Rec
+    const created = em.create(Todo, { title: 'X', organizationId: defaultOrganizationId, tenantId: defaultTenantId }) as Rec
     // Force UUID id to satisfy validation
     created.id = '123e4567-e89b-12d3-a456-426614174001'
-    await em.persistAndFlush(created)
+    await em.persist(created).flush()
     const res = await route.PUT(new Request('http://x/api/example/todos', { method: 'PUT', body: JSON.stringify({ id: created.id, title: 'X2', cf_priority: 5 }), headers: { 'content-type': 'application/json' } }))
     expect(res.status).toBe(200)
     expect(setRecordCustomFields).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ values: { priority: 5 } }))
@@ -365,10 +554,32 @@ describe('CRUD Factory', () => {
     expect(db[created.id].title).toBe('X2')
   })
 
+  it('POST rolls back the created entity when the custom field write fails', async () => {
+    setRecordCustomFields.mockImplementationOnce(async () => { throw new Error('cf write failed') })
+    const res = await route.POST(new Request('http://x/api/example/todos', { method: 'POST', body: JSON.stringify({ title: 'Atomic', is_done: true, cf_priority: 3 }), headers: { 'content-type': 'application/json' } }))
+    expect(res.status).toBe(500)
+    // Entity write was rolled back together with the failed custom field write
+    expect(Object.values(db)).toHaveLength(0)
+    // No created event/index is emitted for a rolled-back create
+    expect(mockDataEngine.emitOrmEntityEvent).not.toHaveBeenCalled()
+  })
+
+  it('PUT rolls back the entity update when the custom field write fails', async () => {
+    const created = em.create(Todo, { title: 'Before', organizationId: defaultOrganizationId, tenantId: defaultTenantId }) as Rec
+    created.id = '123e4567-e89b-12d3-a456-426614174003'
+    await em.persist(created).flush()
+    setRecordCustomFields.mockImplementationOnce(async () => { throw new Error('cf write failed') })
+    const res = await route.PUT(new Request('http://x/api/example/todos', { method: 'PUT', body: JSON.stringify({ id: created.id, title: 'After', cf_priority: 5 }), headers: { 'content-type': 'application/json' } }))
+    expect(res.status).toBe(500)
+    // The scalar update was rolled back together with the failed custom field write
+    expect(db[created.id].title).toBe('Before')
+    expect(mockDataEngine.emitOrmEntityEvent).not.toHaveBeenCalled()
+  })
+
   it('DELETE soft-deletes entity and emits deleted event', async () => {
-    const created = em.create(Todo, { title: 'Y', organizationId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', tenantId: '123e4567-e89b-12d3-a456-426614174000' }) as Rec
+    const created = em.create(Todo, { title: 'Y', organizationId: defaultOrganizationId, tenantId: defaultTenantId }) as Rec
     created.id = '123e4567-e89b-12d3-a456-426614174002'
-    await em.persistAndFlush(created)
+    await em.persist(created).flush()
     const res = await route.DELETE(new Request(`http://x/api/example/todos?id=${created.id}`, { method: 'DELETE' }))
     expect(res.status).toBe(200)
     expect(mockDataEngine.emitOrmEntityEvent).toHaveBeenCalledTimes(1)
@@ -379,6 +590,46 @@ describe('CRUD Factory', () => {
     expect(deletedArgs.identifiers.id).toBe(created.id)
     expect(deletedArgs.indexer?.entityType).toBe('example.todo')
     expect(db[created.id].deletedAt).toBeInstanceOf(Date)
+  })
+
+  it('trims padded selected organization ids when scope resolution falls back from empty filter ids', async () => {
+    const created = em.create(Todo, { title: 'Scoped', organizationId: defaultOrganizationId, tenantId: defaultTenantId }) as Rec
+    created.id = '123e4567-e89b-12d3-a456-426614174052'
+    await em.persist(created).flush()
+    mockOrganizationScopeOverride = {
+      selectedId: ` ${defaultOrganizationId} `,
+      filterIds: [],
+      allowedIds: null,
+      tenantId: defaultTenantId,
+    }
+
+    const updateResponse = await route.PUT(new Request('http://x/api/example/todos', {
+      method: 'PUT',
+      body: JSON.stringify({ id: created.id, title: 'Scoped Updated' }),
+      headers: { 'content-type': 'application/json' },
+    }))
+
+    expect(updateResponse.status).toBe(200)
+    expect(mockDataEngine.updateOrmEntity).toHaveBeenLastCalledWith(expect.objectContaining({
+      where: {
+        id: created.id,
+        organizationId: defaultOrganizationId,
+        tenantId: defaultTenantId,
+        deletedAt: null,
+      },
+    }))
+
+    const deleteResponse = await route.DELETE(new Request(`http://x/api/example/todos?id=${created.id}`, { method: 'DELETE' }))
+
+    expect(deleteResponse.status).toBe(200)
+    expect(mockDataEngine.deleteOrmEntity).toHaveBeenLastCalledWith(expect.objectContaining({
+      where: {
+        id: created.id,
+        organizationId: defaultOrganizationId,
+        tenantId: defaultTenantId,
+        deletedAt: null,
+      },
+    }))
   })
 
   it('PUT mutation guard uses route resource identity instead of spoofed lock headers', async () => {
@@ -396,7 +647,7 @@ describe('CRUD Factory', () => {
       tenantId: '123e4567-e89b-12d3-a456-426614174000',
     }) as Rec
     created.id = '123e4567-e89b-12d3-a456-426614174051'
-    await em.persistAndFlush(created)
+    await em.persist(created).flush()
 
     const res = await route.PUT(new Request('http://x/api/example/todos', {
       method: 'PUT',
@@ -506,5 +757,106 @@ describe('CRUD Factory', () => {
     expect(res.status).toBe(200)
     const body = await res.json()
     expect(body._interceptor).toEqual({ ok: true, count: 1 })
+  })
+})
+
+describe('CRUD Factory — optimistic-lock auto-registration', () => {
+  beforeEach(() => {
+    clearOptimisticLockReadersForTests()
+  })
+
+  afterAll(() => {
+    clearOptimisticLockReadersForTests()
+  })
+
+  function makeMinimalRoute(opts: { eventsResource: string; entity: any }) {
+    return makeCrudRoute({
+      metadata: { GET: { requireAuth: true } },
+      orm: { entity: opts.entity, idField: 'id', orgField: 'organizationId', tenantField: 'tenantId' },
+      events: { module: opts.eventsResource.split('.')[0], entity: opts.eventsResource.split('.')[1], persistent: false } as any,
+      list: { schema: z.object({}).passthrough() as any },
+      create: {
+        commandId: `${opts.eventsResource}.create`,
+        schema: z.object({}).passthrough() as any,
+      },
+      update: {
+        commandId: `${opts.eventsResource}.update`,
+        schema: z.object({ id: z.string() }).passthrough() as any,
+      },
+      del: {
+        commandId: `${opts.eventsResource}.delete`,
+        schema: z.object({ id: z.string() }).passthrough() as any,
+      },
+    })
+  }
+
+  it('auto-registers a reader for the route resourceKind at factory call time', () => {
+    expect(getAllOptimisticLockReaders()).toEqual({})
+    makeMinimalRoute({ eventsResource: 'example.todo', entity: Todo })
+    const all = getAllOptimisticLockReaders()
+    expect(Object.keys(all)).toContain('example.todo')
+    expect(typeof all['example.todo']).toBe('function')
+  })
+
+  it('does NOT override an existing hand-wired reader (IfAbsent semantics)', () => {
+    const handWired = async () => 'hand-wired'
+    registerOptimisticLockReaders({ 'example.todo': handWired })
+    makeMinimalRoute({ eventsResource: 'example.todo', entity: Todo })
+    expect(getAllOptimisticLockReaders()['example.todo']).toBe(handWired)
+  })
+
+  it('skips registration when the entity has no resolvable resourceKind', () => {
+    expect(getAllOptimisticLockReaders()).toEqual({})
+    // Route with no events.module + no command IDs → resourceKind falls back to 'resource'
+    makeCrudRoute({
+      metadata: { GET: { requireAuth: true } },
+      orm: { entity: Todo },
+      list: { schema: z.object({}).passthrough() as any },
+    } as any)
+    // 'resource' is filtered out by the auto-registration guard
+    expect(getAllOptimisticLockReaders()['resource']).toBeUndefined()
+  })
+
+  it('the registered reader projects only updatedAt and fails open on schema mismatch', async () => {
+    makeMinimalRoute({ eventsResource: 'example.todo', entity: Todo })
+    const reader = getAllOptimisticLockReaders()['example.todo']
+    expect(reader).toBeDefined()
+    let captured: { entity: unknown; filter: Record<string, unknown>; options?: Record<string, unknown> } | null = null
+    const fakeEm = {
+      async findOne(entity: unknown, filter: Record<string, unknown>, options?: Record<string, unknown>) {
+        captured = { entity, filter, options }
+        return { updatedAt: new Date('2026-05-26T07:30:00.000Z') }
+      },
+    } as never
+    const out = await reader!(fakeEm, {
+      resourceKind: 'example.todo',
+      resourceId: 'todo-1',
+      tenantId: 'tenant-1',
+      organizationId: 'org-1',
+    })
+    expect(out).toBe('2026-05-26T07:30:00.000Z')
+    expect(captured).not.toBeNull()
+    expect(captured!.entity).toBe(Todo)
+    expect(captured!.filter).toEqual({
+      id: 'todo-1',
+      tenantId: 'tenant-1',
+      organizationId: 'org-1',
+      deletedAt: null,
+    })
+    expect(captured!.options).toEqual({ fields: ['updatedAt'] })
+
+    // Fail-open contract: throwing findOne yields null, not a re-thrown error.
+    const throwingEm = {
+      async findOne() {
+        throw new Error('schema mismatch')
+      },
+    } as never
+    const safe = await reader!(throwingEm, {
+      resourceKind: 'example.todo',
+      resourceId: 'todo-1',
+      tenantId: 'tenant-1',
+      organizationId: 'org-1',
+    })
+    expect(safe).toBeNull()
   })
 })

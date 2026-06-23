@@ -5,6 +5,43 @@ import {
 } from '@open-mercato/core/modules/dictionaries/data/validators'
 import { getPaymentProvider, getShippingProvider } from '../lib/providers'
 import { REFERENCE_UNIT_CODES } from '@open-mercato/shared/lib/units/unitCodes'
+import { isValidPhoneNumber } from '@open-mercato/shared/lib/phone'
+
+export const SALES_PHONE_INVALID_MESSAGE_KEY = 'customers.people.form.primaryPhone.invalid'
+
+const optionalPhoneField = (max = 50) =>
+  z
+    .string()
+    .trim()
+    .max(max)
+    .refine((val) => isValidPhoneNumber(val), { message: SALES_PHONE_INVALID_MESSAGE_KEY })
+    .optional()
+
+const optionalNullablePhoneField = (max = 50) =>
+  z
+    .union([
+      z
+        .string()
+        .trim()
+        .max(max)
+        .refine((val) => isValidPhoneNumber(val), { message: SALES_PHONE_INVALID_MESSAGE_KEY }),
+      z.literal(''),
+      z.null(),
+    ])
+    .optional()
+
+export const customerSnapshotSchema = z
+  .object({
+    customer: z
+      .object({
+        primaryPhone: optionalNullablePhoneField(),
+      })
+      .passthrough()
+      .nullable()
+      .optional(),
+    contact: z.unknown().optional(),
+  })
+  .passthrough()
 
 const uuid = () => z.string().uuid()
 
@@ -75,7 +112,7 @@ export const channelCreateSchema = scoped.extend({
   statusEntryId: uuid().optional(),
   websiteUrl: z.string().trim().url().max(300).optional(),
   contactEmail: z.string().trim().email().max(320).optional(),
-  contactPhone: z.string().trim().max(50).optional(),
+  contactPhone: optionalPhoneField(),
   addressLine1: z.string().trim().max(255).optional(),
   addressLine2: z.string().trim().max(255).optional(),
   city: z.string().trim().max(120).optional(),
@@ -382,6 +419,148 @@ export const quoteLineUpdateSchema = z
   })
   .merge(quoteLineCreateSchema.partial())
 
+// Each adjustment kind has an intrinsic sign convention so the grand total
+// stays semantically correct regardless of operator input. The calculation
+// engine normalizes signs defensively, but the API edge rejects values that
+// would invert the kind's meaning so bad data never reaches storage.
+//
+// - `return`: non-positive — returns reduce the total (see #1705).
+// - `discount`: non-negative — discounts reduce the total.
+// - `surcharge`/`shipping`/`tax`: non-negative — they add to the total.
+// - `custom` and unknown kinds: unconstrained (operator-controlled).
+//
+// See #1905.
+export const RETURN_ADJUSTMENT_POSITIVE_NET_MESSAGE =
+  'Return adjustments must use a non-positive amountNet (returns reduce the total).'
+export const RETURN_ADJUSTMENT_POSITIVE_GROSS_MESSAGE =
+  'Return adjustments must use a non-positive amountGross (returns reduce the total).'
+export const DISCOUNT_ADJUSTMENT_NEGATIVE_NET_MESSAGE =
+  'Discount adjustments must use a non-negative amountNet (discounts reduce the total).'
+export const DISCOUNT_ADJUSTMENT_NEGATIVE_GROSS_MESSAGE =
+  'Discount adjustments must use a non-negative amountGross (discounts reduce the total).'
+export const SURCHARGE_ADJUSTMENT_NEGATIVE_NET_MESSAGE =
+  'Surcharge adjustments must use a non-negative amountNet (surcharges add to the total).'
+export const SURCHARGE_ADJUSTMENT_NEGATIVE_GROSS_MESSAGE =
+  'Surcharge adjustments must use a non-negative amountGross (surcharges add to the total).'
+export const SHIPPING_ADJUSTMENT_NEGATIVE_NET_MESSAGE =
+  'Shipping adjustments must use a non-negative amountNet (shipping adds to the total).'
+export const SHIPPING_ADJUSTMENT_NEGATIVE_GROSS_MESSAGE =
+  'Shipping adjustments must use a non-negative amountGross (shipping adds to the total).'
+export const TAX_ADJUSTMENT_NEGATIVE_NET_MESSAGE =
+  'Tax adjustments must use a non-negative amountNet (taxes add to the total).'
+export const TAX_ADJUSTMENT_NEGATIVE_GROSS_MESSAGE =
+  'Tax adjustments must use a non-negative amountGross (taxes add to the total).'
+
+type AdjustmentSignInput = {
+  kind?: string
+  amountNet?: number
+  amountGross?: number
+}
+
+const NON_NEGATIVE_SIGN_MESSAGES: Record<string, { net: string; gross: string }> = {
+  discount: {
+    net: DISCOUNT_ADJUSTMENT_NEGATIVE_NET_MESSAGE,
+    gross: DISCOUNT_ADJUSTMENT_NEGATIVE_GROSS_MESSAGE,
+  },
+  surcharge: {
+    net: SURCHARGE_ADJUSTMENT_NEGATIVE_NET_MESSAGE,
+    gross: SURCHARGE_ADJUSTMENT_NEGATIVE_GROSS_MESSAGE,
+  },
+  shipping: {
+    net: SHIPPING_ADJUSTMENT_NEGATIVE_NET_MESSAGE,
+    gross: SHIPPING_ADJUSTMENT_NEGATIVE_GROSS_MESSAGE,
+  },
+  tax: {
+    net: TAX_ADJUSTMENT_NEGATIVE_NET_MESSAGE,
+    gross: TAX_ADJUSTMENT_NEGATIVE_GROSS_MESSAGE,
+  },
+}
+
+export const enforceAdjustmentSign = (
+  value: AdjustmentSignInput,
+  ctx: z.RefinementCtx
+) => {
+  if (!value.kind) return
+  if (value.kind === 'return') {
+    if (typeof value.amountNet === 'number' && value.amountNet > 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: RETURN_ADJUSTMENT_POSITIVE_NET_MESSAGE,
+        path: ['amountNet'],
+      })
+    }
+    if (typeof value.amountGross === 'number' && value.amountGross > 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: RETURN_ADJUSTMENT_POSITIVE_GROSS_MESSAGE,
+        path: ['amountGross'],
+      })
+    }
+    return
+  }
+  const messages = NON_NEGATIVE_SIGN_MESSAGES[value.kind]
+  if (!messages) return
+  if (typeof value.amountNet === 'number' && value.amountNet < 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: messages.net,
+      path: ['amountNet'],
+    })
+  }
+  if (typeof value.amountGross === 'number' && value.amountGross < 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: messages.gross,
+      path: ['amountGross'],
+    })
+  }
+}
+
+/**
+ * @deprecated Use `enforceAdjustmentSign` — it enforces the sign convention
+ * for every adjustment kind, not just `return`. Kept for backward compatibility
+ * with third-party code that imported the original helper.
+ */
+export const enforceReturnAdjustmentSign = enforceAdjustmentSign
+
+export const RETURN_ADJUSTMENT_EXCEEDS_REMAINING_NET_MESSAGE =
+  'Return adjustment amountNet exceeds the remaining grand total. Reduce the amount or remove existing returns first.'
+export const RETURN_ADJUSTMENT_EXCEEDS_REMAINING_GROSS_MESSAGE =
+  'Return adjustment amountGross exceeds the remaining grand total. Reduce the amount or remove existing returns first.'
+
+export type ReturnAdjustmentRemainingCheck = {
+  kind?: string | null
+  amountNet?: number | null
+  amountGross?: number | null
+  remainingNet: number
+  remainingGross: number
+}
+
+export type ReturnAdjustmentRemainingIssue = {
+  path: 'amountNet' | 'amountGross'
+  message: string
+}
+
+// Inclusive: abs(amount) === remaining is allowed. Tiny epsilon absorbs
+// floating-point rounding from upstream tax/rate adjustments.
+const RETURN_REMAINING_EPSILON = 0.005
+
+export const validateReturnAdjustmentWithinRemaining = (
+  value: ReturnAdjustmentRemainingCheck
+): ReturnAdjustmentRemainingIssue[] => {
+  if (value.kind !== 'return') return []
+  const absNet = typeof value.amountNet === 'number' ? Math.abs(value.amountNet) : 0
+  const absGross = typeof value.amountGross === 'number' ? Math.abs(value.amountGross) : 0
+  const issues: ReturnAdjustmentRemainingIssue[] = []
+  if (absGross > value.remainingGross + RETURN_REMAINING_EPSILON) {
+    issues.push({ path: 'amountGross', message: RETURN_ADJUSTMENT_EXCEEDS_REMAINING_GROSS_MESSAGE })
+  }
+  if (absNet > value.remainingNet + RETURN_REMAINING_EPSILON) {
+    issues.push({ path: 'amountNet', message: RETURN_ADJUSTMENT_EXCEEDS_REMAINING_NET_MESSAGE })
+  }
+  return issues
+}
+
 export const orderAdjustmentCreateSchema = scoped.extend({
   orderId: uuid(),
   orderLineId: uuid().optional(),
@@ -462,7 +641,7 @@ export const orderCreateSchema = scoped.extend({
   customerReference: z.string().trim().max(191).optional(),
   customerEntityId: uuid().optional(),
   customerContactId: uuid().optional(),
-  customerSnapshot: jsonRecord.optional(),
+  customerSnapshot: customerSnapshotSchema.optional(),
   billingAddressId: uuid().optional(),
   shippingAddressId: uuid().optional(),
   billingAddressSnapshot: jsonRecord.optional(),
@@ -510,7 +689,7 @@ export const quoteCreateSchema = scoped.extend({
   customerEntityId: uuid().optional(),
   customerContactId: uuid().optional(),
   channelId: uuid().optional(),
-  customerSnapshot: jsonRecord.optional(),
+  customerSnapshot: customerSnapshotSchema.optional(),
   billingAddressId: uuid().optional(),
   shippingAddressId: uuid().optional(),
   billingAddressSnapshot: jsonRecord.optional(),
@@ -605,7 +784,7 @@ export const shipmentCreateSchema = scoped.extend({
     .array(
       z.object({
         orderLineId: uuid(),
-        quantity: decimal({ min: 0, max: MAX_QUANTITY, message: 'Quantity is too large.' }),
+        quantity: decimal({ min: 0, max: MAX_QUANTITY, message: 'Quantity is too large.' }).int('Quantity must be a whole number.'),
         metadata,
       })
     )
@@ -618,24 +797,55 @@ export const shipmentUpdateSchema = z
   })
   .merge(shipmentCreateSchema.partial())
 
+const returnLineQuantitySchema = z.coerce
+  .number()
+  .int('Return quantity must be a whole number.')
+  .min(1, 'Return quantity must be at least 1.')
+  .max(MAX_QUANTITY, 'Quantity is too large.')
+
+export const RETURN_DATE_IN_FUTURE_MESSAGE = 'Return date cannot be in the future.'
+
+// A return records when goods physically came back to the seller, so a future
+// date is not yet a fact. Evaluate "now" at parse time (not module-load time)
+// so a long-running server never rejects legitimate same-day returns.
+const returnedAtSchema = z.coerce
+  .date()
+  .refine((value) => value.getTime() <= Date.now(), {
+    message: RETURN_DATE_IN_FUTURE_MESSAGE,
+  })
+  .optional()
+
 export const returnCreateSchema = scoped.extend({
   orderId: uuid(),
   reason: z.string().trim().max(4000).optional(),
   notes: z.string().trim().max(4000).optional(),
-  returnedAt: z.coerce.date().optional(),
+  returnedAt: returnedAtSchema,
   lines: z
     .array(
       z.object({
         orderLineId: uuid(),
-        quantity: decimal({ min: 0 }),
+        quantity: returnLineQuantitySchema,
       })
     )
     .min(1),
 })
 
+export const returnUpdateSchema = scoped.extend({
+  id: uuid(),
+  orderId: uuid(),
+  reason: z.string().trim().max(4000).optional(),
+  notes: z.string().trim().max(4000).optional(),
+  returnedAt: returnedAtSchema,
+})
+
+export const returnDeleteSchema = scoped.extend({
+  id: uuid(),
+  orderId: uuid(),
+})
+
 export const invoiceCreateSchema = scoped.extend({
   orderId: uuid().optional(),
-  invoiceNumber: z.string().trim().min(1).max(191),
+  invoiceNumber: z.string().trim().min(1).max(191).optional(),
   statusEntryId: uuid().optional(),
   issueDate: z.coerce.date().optional(),
   dueDate: z.coerce.date().optional(),
@@ -648,6 +858,8 @@ export const invoiceCreateSchema = scoped.extend({
         orderLineId: uuid().optional(),
         lineNumber: z.coerce.number().int().min(0).optional(),
         kind: lineKindSchema.optional(),
+        name: z.string().trim().max(500).optional(),
+        sku: z.string().trim().max(191).optional(),
         description: z.string().trim().max(4000).optional(),
         quantity: decimal({ min: 0, max: MAX_QUANTITY, message: 'Quantity is too large.' }),
         quantityUnit: z.string().trim().max(25).optional(),
@@ -686,9 +898,10 @@ export const invoiceUpdateSchema = z
 export const creditMemoCreateSchema = scoped.extend({
   orderId: uuid().optional(),
   invoiceId: uuid().optional(),
-  creditMemoNumber: z.string().trim().min(1).max(191),
+  creditMemoNumber: z.string().trim().min(1).max(191).optional(),
   statusEntryId: uuid().optional(),
   issueDate: z.coerce.date().optional(),
+  reason: z.string().trim().max(4000).optional(),
   currencyCode,
   metadata,
   customFieldSetId: uuid().optional(),
@@ -697,6 +910,8 @@ export const creditMemoCreateSchema = scoped.extend({
       z.object({
         orderLineId: uuid().optional(),
         lineNumber: z.coerce.number().int().min(0).optional(),
+        name: z.string().trim().max(500).optional(),
+        sku: z.string().trim().max(191).optional(),
         description: z.string().trim().max(4000).optional(),
         quantity: decimal({ min: 0, max: MAX_QUANTITY, message: 'Quantity is too large.' }),
         quantityUnit: z.string().trim().max(25).optional(),
@@ -800,7 +1015,7 @@ export const noteUpdateSchema = z
   )
 
 export const documentNumberRequestSchema = scoped.extend({
-  kind: z.enum(['order', 'quote']),
+  kind: z.enum(['order', 'quote', 'invoice', 'credit_memo']),
   format: numberFormatSchema.optional(),
 })
 
@@ -831,6 +1046,8 @@ export type QuoteAdjustmentUpdateInput = z.infer<typeof quoteAdjustmentUpdateSch
 export type ShipmentCreateInput = z.infer<typeof shipmentCreateSchema>
 export type ShipmentUpdateInput = z.infer<typeof shipmentUpdateSchema>
 export type ReturnCreateInput = z.infer<typeof returnCreateSchema>
+export type ReturnUpdateInput = z.infer<typeof returnUpdateSchema>
+export type ReturnDeleteInput = z.infer<typeof returnDeleteSchema>
 export type InvoiceCreateInput = z.infer<typeof invoiceCreateSchema>
 export type InvoiceUpdateInput = z.infer<typeof invoiceUpdateSchema>
 export type CreditMemoCreateInput = z.infer<typeof creditMemoCreateSchema>

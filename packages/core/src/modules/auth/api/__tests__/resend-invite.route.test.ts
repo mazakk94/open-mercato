@@ -5,18 +5,21 @@ const mockLoadAcl = jest.fn()
 const mockSendEmail = jest.fn()
 const mockFindOne = jest.fn()
 const mockCreate = jest.fn()
-const mockPersistAndFlush = jest.fn()
+const mockPersist = jest.fn()
+const mockFlush = jest.fn()
 const mockNativeUpdate = jest.fn()
 const mockValidateCrudMutationGuard = jest.fn()
 const mockRunCrudMutationGuardAfterSuccess = jest.fn()
 const mockCheckAuthRateLimit = jest.fn()
 
-const mockEm = {
+const mockEm: any = {
   findOne: mockFindOne,
   create: mockCreate,
-  persistAndFlush: mockPersistAndFlush,
+  persist: mockPersist,
+  flush: mockFlush,
   nativeUpdate: mockNativeUpdate,
 }
+mockPersist.mockImplementation(function persist(this: any) { return mockEm })
 
 const mockContainer = {
   resolve: jest.fn((token: string) => {
@@ -72,17 +75,28 @@ jest.mock('@open-mercato/shared/lib/crud/mutation-guard', () => ({
   runCrudMutationGuardAfterSuccess: jest.fn((...args: unknown[]) => mockRunCrudMutationGuardAfterSuccess(...args)),
 }))
 
+const mockFindOneWithDecryption = jest.fn()
+jest.mock('@open-mercato/shared/lib/encryption/find', () => ({
+  findOneWithDecryption: jest.fn((...args: unknown[]) => mockFindOneWithDecryption(...args)),
+  findWithDecryption: jest.fn(async () => []),
+}))
+
 const tenantA = 'a0a0a0a0-a0a0-4a0a-8a0a-a0a0a0a0a0a0'
 const tenantB = 'b0b0b0b0-b0b0-4b0b-8b0b-b0b0b0b0b0b0'
 const userId = 'c0c0c0c0-c0c0-4c0c-8c0c-c0c0c0c0c0c0'
 const actorId = 'd0d0d0d0-d0d0-4d0d-8d0d-d0d0d0d0d0d0'
 const orgId = 'e0e0e0e0-e0e0-4e0e-8e0e-e0e0e0e0e0e0'
+const originalEnv = process.env
 
-function makeRequest(body: Record<string, unknown>) {
+function makeRequest(
+  body: Record<string, unknown>,
+  url = 'http://localhost/api/auth/users/resend-invite',
+  headers: Record<string, string> = {},
+) {
   __readJsonBody.current = body
-  return new Request('http://localhost/api/auth/users/resend-invite', {
+  return new Request(url, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...headers },
     body: JSON.stringify(body),
   })
 }
@@ -101,6 +115,12 @@ function makeUser(overrides: Record<string, unknown> = {}) {
 describe('POST /api/auth/users/resend-invite', () => {
   beforeEach(() => {
     jest.clearAllMocks()
+    process.env = {
+      ...originalEnv,
+      APP_URL: undefined,
+      NEXT_PUBLIC_APP_URL: undefined,
+      APP_ALLOWED_ORIGINS: undefined,
+    }
     mockGetAuthFromRequest.mockResolvedValue({
       sub: actorId,
       tenantId: tenantA,
@@ -110,10 +130,16 @@ describe('POST /api/auth/users/resend-invite', () => {
     mockCheckAuthRateLimit.mockResolvedValue({ error: null })
     mockValidateCrudMutationGuard.mockResolvedValue(null)
     mockFindOne.mockResolvedValue(makeUser())
+    mockFindOneWithDecryption.mockResolvedValue(makeUser())
     mockCreate.mockReturnValue({ id: 'new-token-row' })
-    mockPersistAndFlush.mockResolvedValue(undefined)
+    mockPersist.mockImplementation(function persist(this: any) { return mockEm })
+    mockFlush.mockResolvedValue(undefined)
     mockNativeUpdate.mockResolvedValue(undefined)
     mockSendEmail.mockResolvedValue(undefined)
+  })
+
+  afterAll(() => {
+    process.env = originalEnv
   })
 
   test('returns 401 when unauthenticated', async () => {
@@ -134,10 +160,25 @@ describe('POST /api/auth/users/resend-invite', () => {
       orgId,
     })
     mockLoadAcl.mockResolvedValueOnce({ isSuperAdmin: false })
-    mockFindOne.mockResolvedValueOnce(null)
+    mockFindOneWithDecryption.mockResolvedValueOnce(makeUser({ tenantId: tenantB }))
 
     const res = await POST(makeRequest({ id: userId }))
     expect(res.status).toBe(404)
+    expect(mockFindOne).not.toHaveBeenCalled()
+  })
+
+  test('still scopes the route load to the actor tenant for non-superadmins', async () => {
+    mockGetAuthFromRequest.mockResolvedValueOnce({
+      sub: actorId,
+      tenantId: tenantA,
+      orgId,
+    })
+    mockLoadAcl.mockResolvedValueOnce({ isSuperAdmin: false })
+    mockFindOneWithDecryption.mockResolvedValueOnce(makeUser())
+    mockFindOne.mockResolvedValueOnce(makeUser())
+
+    const res = await POST(makeRequest({ id: userId }))
+    expect(res.status).toBe(200)
 
     const whereArg = mockFindOne.mock.calls[0]?.[1] as Record<string, unknown>
     expect(whereArg.tenantId).toBe(tenantA)
@@ -171,7 +212,7 @@ describe('POST /api/auth/users/resend-invite', () => {
     const [, where] = mockNativeUpdate.mock.calls[0]
     expect(where).toMatchObject({ user: userId, usedAt: null })
 
-    expect(mockPersistAndFlush).toHaveBeenCalledTimes(1)
+    expect(mockFlush).toHaveBeenCalledTimes(1)
   })
 
   test('creates token and sends email on success', async () => {
@@ -207,6 +248,61 @@ describe('POST /api/auth/users/resend-invite', () => {
     expect(res.status).toBe(423)
     const body = await res.json()
     expect(body.error).toBe('Record locked')
-    expect(mockPersistAndFlush).not.toHaveBeenCalled()
+    expect(mockFlush).not.toHaveBeenCalled()
+  })
+
+  test('rejects a poisoned host before rotating invite tokens', async () => {
+    process.env = {
+      ...process.env,
+      APP_URL: 'https://app.example.com',
+    }
+
+    const res = await POST(makeRequest({ id: userId }, 'https://evil.example/api/auth/users/resend-invite'))
+    const body = await res.json()
+
+    expect(res.status).toBe(400)
+    expect(body.error).toBe('Invalid request origin')
+    expect(mockNativeUpdate).not.toHaveBeenCalled()
+    expect(mockFlush).not.toHaveBeenCalled()
+    expect(mockSendEmail).not.toHaveBeenCalled()
+  })
+
+  test('allows loopback origin mismatches outside production', async () => {
+    process.env = {
+      ...process.env,
+      APP_URL: 'http://localhost:3000',
+      NODE_ENV: 'test',
+    }
+
+    const res = await POST(makeRequest({ id: userId }, 'http://127.0.0.1:5001/api/auth/users/resend-invite'))
+
+    expect(res.status).toBe(200)
+    expect(mockNativeUpdate).toHaveBeenCalledTimes(1)
+    expect(mockFlush).toHaveBeenCalledTimes(1)
+    expect(mockSendEmail).toHaveBeenCalledTimes(1)
+  })
+
+  test('allows equivalent loopback proxy origins in production', async () => {
+    process.env = {
+      ...process.env,
+      APP_URL: 'http://127.0.0.1:3000',
+      NODE_ENV: 'production',
+      JWT_SECRET: 'test-jwt-secret',
+    }
+
+    const res = await POST(makeRequest(
+      { id: userId },
+      'http://127.0.0.1:3000/api/auth/users/resend-invite',
+      {
+        host: '127.0.0.1:3000',
+        'x-forwarded-host': 'localhost:3000',
+        'x-forwarded-proto': 'https',
+      },
+    ))
+
+    expect(res.status).toBe(200)
+    expect(mockNativeUpdate).toHaveBeenCalledTimes(1)
+    expect(mockFlush).toHaveBeenCalledTimes(1)
+    expect(mockSendEmail).toHaveBeenCalledTimes(1)
   })
 })

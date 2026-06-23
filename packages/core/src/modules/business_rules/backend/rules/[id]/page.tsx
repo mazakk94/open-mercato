@@ -8,7 +8,10 @@ import { Page, PageBody } from '@open-mercato/ui/backend/Page'
 import { CrudForm } from '@open-mercato/ui/backend/CrudForm'
 import { Spinner } from '@open-mercato/ui/primitives/spinner'
 import { Button } from '@open-mercato/ui/primitives/button'
-import { apiFetch } from '@open-mercato/ui/backend/utils/api'
+import { apiFetch, withScopedApiHeaders } from '@open-mercato/ui/backend/utils/api'
+import { buildOptimisticLockHeader } from '@open-mercato/ui/backend/utils/optimisticLock'
+import { readJsonSafe } from '@open-mercato/ui/backend/utils/serverErrors'
+import { CrudHttpError } from '@open-mercato/shared/lib/crud/errors'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
 import { useOrganizationScopeDetail } from '@open-mercato/shared/lib/frontend/useOrganizationScope'
 import {
@@ -51,10 +54,7 @@ export default function EditBusinessRulePage() {
 
   const initialValues = React.useMemo(() => {
     if (rule) {
-      const parsed = parseRuleToFormValues(rule)
-      console.log('Rule data:', rule)
-      console.log('Parsed initial values:', parsed)
-      return parsed
+      return parseRuleToFormValues(rule)
     }
     return null
   }, [rule])
@@ -70,7 +70,7 @@ export default function EditBusinessRulePage() {
 
     const payload = buildRulePayload(values, effectiveTenantId, effectiveOrgId, undefined)
 
-    const response = await apiFetch('/api/business_rules/rules', {
+    const updateRule = () => apiFetch('/api/business_rules/rules', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -78,10 +78,18 @@ export default function EditBusinessRulePage() {
         id: ruleId,
       }),
     })
+    const headers = buildOptimisticLockHeader(rule?.updatedAt ?? rule?.updated_at ?? null)
+    const response = Object.keys(headers).length
+      ? await withScopedApiHeaders(headers, updateRule)
+      : await updateRule()
 
     if (!response.ok) {
-      const error = await response.json()
-      throw new Error(error.message || t('business_rules.errors.updateFailed'))
+      const body = (await readJsonSafe<Record<string, unknown>>(response)) ?? {}
+      const message =
+        (typeof body.error === 'string' && body.error) ||
+        (typeof body.message === 'string' && body.message) ||
+        t('business_rules.errors.updateFailed')
+      throw new CrudHttpError(response.status, { ...body, error: message })
     }
 
     router.push('/backend/rules')
@@ -137,6 +145,7 @@ export default function EditBusinessRulePage() {
           schema={businessRuleFormSchema}
           fields={fields}
           initialValues={initialValues}
+          optimisticLockUpdatedAt={rule?.updatedAt ?? rule?.updated_at ?? null}
           onSubmit={handleSubmit}
           cancelHref="/backend/rules"
           groups={formGroups}

@@ -1,6 +1,6 @@
 import type { QueuedJob, JobContext, WorkerMeta } from '@open-mercato/queue'
 import { createQueue } from '@open-mercato/queue'
-import { getRedisUrl } from '@open-mercato/shared/lib/redis/connection'
+import { getRedisUrlOrThrow } from '@open-mercato/shared/lib/redis/connection'
 import type { EntityManager } from '@mikro-orm/core'
 import { ScheduledJob } from '../data/entities.js'
 import { CommandBus } from '@open-mercato/shared/lib/commands'
@@ -24,6 +24,13 @@ export type ExecuteSchedulePayload = {
 }
 
 type HandlerContext = { resolve: <T = unknown>(name: string) => T }
+type RbacServiceLike = {
+  tenantHasFeature(
+    tenantId: string | null | undefined,
+    feature: string,
+    opts?: { organizationId?: string | null },
+  ): Promise<boolean>
+}
 
 /**
  * Worker that executes scheduled jobs.
@@ -67,7 +74,7 @@ export default async function executeScheduleWorker(
   const { scheduleId } = payload
 
   const em = ctx.resolve<EntityManager>('em')
-  const rbacService = ctx.resolve<{ tenantHasFeature(tenantId: string | null | undefined, feature: string): Promise<boolean> }>('rbacService')
+  const rbacService = ctx.resolve<RbacServiceLike>('rbacService')
 
   // Load fresh schedule from database
   const schedule = await em.findOne(ScheduledJob, { 
@@ -129,9 +136,10 @@ export default async function executeScheduleWorker(
 
   // Check feature flag if required
   if (schedule.requireFeature) {
-      const hasFeature = await rbacService.tenantHasFeature(
+    const hasFeature = await rbacService.tenantHasFeature(
       schedule.tenantId,
-      schedule.requireFeature
+      schedule.requireFeature,
+      { organizationId: schedule.organizationId },
     )
     
     if (!hasFeature) {
@@ -152,7 +160,7 @@ export default async function executeScheduleWorker(
     // Determine queue strategy from environment
     const queueStrategy = (process.env.QUEUE_STRATEGY || 'local') as 'local' | 'async'
     const targetQueue = createQueue(schedule.targetQueue, queueStrategy, {
-      connection: { url: getRedisUrl('QUEUE') },
+      connection: { url: getRedisUrlOrThrow('QUEUE') },
     })
     
     let targetJobId: string | undefined

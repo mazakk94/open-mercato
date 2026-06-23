@@ -4,7 +4,7 @@ import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
 import { getAuthFromRequest } from '@open-mercato/shared/lib/auth/server'
 import { resolveOrganizationScopeForRequest } from '@open-mercato/core/modules/directory/utils/organizationScope'
 import type { CommandRuntimeContext, CommandBus } from '@open-mercato/shared/lib/commands'
-import { leadConvertSchema, type LeadConvertInput } from '../../../../data/validators'
+import { leadConvertBodySchema, type LeadConvertInput } from '../../../../data/validators'
 import { CrudHttpError } from "@open-mercato/shared/lib/crud/errors";
 import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
 import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
@@ -17,7 +17,7 @@ const paramsSchema = z.object({
   id: z.string().uuid(),
 })
 
-const convertBodySchema = leadConvertSchema.omit({ id: true, tenantId: true, organizationId: true })
+const convertBodySchema = leadConvertBodySchema
 
 export const metadata = {
   POST: { requireAuth: true, requireFeatures: ['customers.leads.manage'] },

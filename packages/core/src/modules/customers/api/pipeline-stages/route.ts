@@ -15,8 +15,7 @@ import {
   type PipelineStageDeleteInput,
 } from '../../data/validators'
 import { withScopedPayload } from '../utils'
-import { ensureDictionaryEntry } from '../../commands/shared'
-import { CrudHttpError } from '@open-mercato/shared/lib/crud/errors'
+import { CrudHttpError, isCrudHttpError } from '@open-mercato/shared/lib/crud/errors'
 import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
 import { serializeOperationMetadata } from '@open-mercato/shared/lib/commands/operationMetadata'
 import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
@@ -76,19 +75,6 @@ export async function GET(req: Request) {
     const dictByNormalized = new Map<string, CustomerDictionaryEntry>()
     dictEntries.forEach((entry) => dictByNormalized.set(entry.normalizedValue, entry))
 
-    const missingStages = stages.filter((s) => !dictByNormalized.has(s.label.trim().toLowerCase()))
-    if (missingStages.length) {
-      for (const stage of missingStages) {
-        const created = await ensureDictionaryEntry(em, {
-          tenantId,
-          organizationId,
-          kind: 'pipeline_stage',
-          value: stage.label,
-        })
-        if (created) dictByNormalized.set(created.normalizedValue, created)
-      }
-    }
-
     const items = stages.map((stage) => {
       const dictEntry = dictByNormalized.get(stage.label.trim().toLowerCase())
       return {
@@ -106,7 +92,7 @@ export async function GET(req: Request) {
     })
     return NextResponse.json({ items, total: items.length })
   } catch (err) {
-    if (err instanceof CrudHttpError) {
+    if (isCrudHttpError(err)) {
       return NextResponse.json(err.body, { status: err.status })
     }
     console.error('customers.pipeline-stages GET failed', err)
@@ -143,7 +129,7 @@ export async function POST(req: Request) {
     }
     return response
   } catch (err) {
-    if (err instanceof CrudHttpError) {
+    if (isCrudHttpError(err)) {
       return NextResponse.json(err.body, { status: err.status })
     }
     console.error('customers.pipeline-stages POST failed', err)
@@ -180,7 +166,7 @@ export async function PUT(req: Request) {
     }
     return response
   } catch (err) {
-    if (err instanceof CrudHttpError) {
+    if (isCrudHttpError(err)) {
       return NextResponse.json(err.body, { status: err.status })
     }
     console.error('customers.pipeline-stages PUT failed', err)
@@ -202,7 +188,7 @@ export async function DELETE(req: Request) {
     )
     return NextResponse.json({ ok: true })
   } catch (err) {
-    if (err instanceof CrudHttpError) {
+    if (isCrudHttpError(err)) {
       return NextResponse.json(err.body, { status: err.status })
     }
     console.error('customers.pipeline-stages DELETE failed', err)

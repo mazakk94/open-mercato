@@ -1,6 +1,16 @@
-import { Entity, PrimaryKey, Property, ManyToOne, Unique, Index } from '@mikro-orm/core'
+import { Entity, Index, ManyToOne, PrimaryKey, Property, Unique } from '@mikro-orm/decorators/legacy'
 
 @Entity({ tableName: 'users' })
+// Email uniqueness is per-tenant, enforced by a partial unique index
+// (`users_tenant_email_hash_uniq`) on `(tenant_id, email_hash)` over live rows
+// (`WHERE deleted_at IS NULL AND email_hash IS NOT NULL`), owned by raw SQL in
+// Migration20260610120000. It keys on the deterministic `email_hash`, not `email`, because
+// `email` is encrypted at rest with a per-row IV (see encryption.ts) — its ciphertext is
+// non-deterministic, so a unique index on it would not detect duplicates. A `@Unique`
+// decorator can't express a partial, tenant-scoped index, so the entity omits it — the
+// migration is the source of truth. A global unique constraint contradicts the multi-tenant
+// login flow and leaks cross-tenant account existence (#2934). Mirrors
+// `customer_users_tenant_email_hash_uniq`.
 export class User {
   @PrimaryKey({ type: 'uuid', defaultRaw: 'gen_random_uuid()' })
   id!: string
@@ -11,7 +21,7 @@ export class User {
   @Property({ name: 'organization_id', type: 'uuid', nullable: true })
   organizationId?: string | null
 
-  @Property({ type: 'text', unique: true })
+  @Property({ type: 'text' })
   email!: string
 
   @Property({ name: 'email_hash', type: 'text', nullable: true })
@@ -19,7 +29,7 @@ export class User {
   emailHash?: string | null
 
   @Property({ type: 'text', nullable: true })
-  name?: string
+  name?: string | null
 
   @Property({ name: 'password_hash', type: 'text', nullable: true })
   passwordHash?: string | null
@@ -33,7 +43,10 @@ export class User {
   @Property({ name: 'created_at', type: Date, onCreate: () => new Date() })
   createdAt: Date = new Date()
 
-@Property({ name: 'deleted_at', type: Date, nullable: true })
+  @Property({ name: 'updated_at', type: Date, onCreate: () => new Date(), onUpdate: () => new Date(), nullable: true })
+  updatedAt?: Date | null
+
+  @Property({ name: 'deleted_at', type: Date, nullable: true })
   deletedAt?: Date | null
 }
 
@@ -46,18 +59,24 @@ export class Role {
   @Property({ type: 'text' })
   name!: string
 
-  @Property({ name: 'tenant_id', type: 'uuid', nullable: true })
-  tenantId?: string | null
+  @Property({ name: 'tenant_id', type: 'uuid' })
+  tenantId!: string
 
   @Property({ name: 'created_at', type: Date, onCreate: () => new Date() })
   createdAt: Date = new Date()
+
+  @Property({ name: 'updated_at', type: Date, onCreate: () => new Date(), onUpdate: () => new Date(), nullable: true })
+  updatedAt?: Date | null
 
   @Property({ name: 'deleted_at', type: Date, nullable: true })
   deletedAt?: Date | null
 }
 
 @Entity({ tableName: 'user_sidebar_preferences' })
-@Unique({ properties: ['user', 'tenantId', 'organizationId', 'locale'] })
+// Uniqueness is enforced by a partial unique index (`user_sidebar_preferences_active_unique_idx`)
+// scoped to live rows (`WHERE deleted_at IS NULL`) and owned by raw SQL in
+// Migration20260427143311. A `@Unique` decorator can't express a partial index,
+// so the entity intentionally omits it — the migration is the source of truth.
 export class UserSidebarPreference {
   @PrimaryKey({ type: 'uuid', defaultRaw: 'gen_random_uuid()' })
   id!: string
@@ -88,7 +107,10 @@ export class UserSidebarPreference {
 }
 
 @Entity({ tableName: 'role_sidebar_preferences' })
-@Unique({ properties: ['role', 'tenantId', 'locale'] })
+// Uniqueness is enforced by a partial unique index (`role_sidebar_preferences_active_unique_idx`)
+// scoped to live rows (`WHERE deleted_at IS NULL`) and owned by raw SQL in
+// Migration20260427143311. A `@Unique` decorator can't express a partial index,
+// so the entity intentionally omits it — the migration is the source of truth.
 export class RoleSidebarPreference {
   @PrimaryKey({ type: 'uuid', defaultRaw: 'gen_random_uuid()' })
   id!: string
@@ -115,7 +137,49 @@ export class RoleSidebarPreference {
   deletedAt?: Date | null
 }
 
+@Entity({ tableName: 'sidebar_variants' })
+// Uniqueness is enforced by a partial unique index (`sidebar_variants_active_name_unique_idx`)
+// scoped to live rows (`WHERE deleted_at IS NULL`) and owned by raw SQL in
+// Migration20260427143311. A `@Unique` decorator can't express a partial index,
+// so the entity intentionally omits it — the migration is the source of truth.
+export class SidebarVariant {
+  @PrimaryKey({ type: 'uuid', defaultRaw: 'gen_random_uuid()' })
+  id!: string
+
+  @ManyToOne(() => User)
+  user!: User
+
+  @Property({ name: 'tenant_id', type: 'uuid', nullable: true })
+  tenantId?: string | null
+
+  @Property({ name: 'organization_id', type: 'uuid', nullable: true })
+  organizationId?: string | null
+
+  @Property({ type: 'text' })
+  locale!: string
+
+  @Property({ type: 'text' })
+  name!: string
+
+  @Property({ name: 'settings_json', type: 'json', nullable: true })
+  settingsJson?: unknown
+
+  @Property({ name: 'is_active', type: 'boolean', default: false })
+  isActive: boolean = false
+
+  @Property({ name: 'created_at', type: Date, onCreate: () => new Date() })
+  createdAt: Date = new Date()
+
+  @Property({ name: 'updated_at', type: Date, onUpdate: () => new Date(), nullable: true })
+  updatedAt?: Date
+
+  @Property({ name: 'deleted_at', type: Date, nullable: true })
+  deletedAt?: Date | null
+}
+
 @Entity({ tableName: 'user_roles' })
+@Index({ name: 'user_roles_user_id_idx', properties: ['user'] })
+@Index({ name: 'user_roles_role_id_idx', properties: ['role'] })
 export class UserRole {
   @PrimaryKey({ type: 'uuid', defaultRaw: 'gen_random_uuid()' })
   id!: string

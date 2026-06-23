@@ -5,16 +5,21 @@ import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
 import { getAuthFromRequest } from '@open-mercato/shared/lib/auth/server'
 import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
 import { Attachment, AttachmentPartition } from '@open-mercato/core/modules/attachments/data/entities'
-import { resolveAttachmentAbsolutePath } from '@open-mercato/core/modules/attachments/lib/storage'
 import {
   buildThumbnailCacheKey,
   readThumbnailCache,
   writeThumbnailCache,
 } from '@open-mercato/core/modules/attachments/lib/thumbnailCache'
-import { checkAttachmentAccess } from '@open-mercato/core/modules/attachments/lib/access'
+import { canRenderInlineAttachment } from '@open-mercato/core/modules/attachments/lib/security'
+import { checkAttachmentAccess, isSuperAdminAuth } from '@open-mercato/core/modules/attachments/lib/access'
 import type { EntityManager } from '@mikro-orm/postgresql'
-import { promises as fs } from 'fs'
 import { attachmentsTag, imageQuerySchema, attachmentErrorSchema } from '../../../openapi'
+import {
+  MAX_IMAGE_SOURCE_PIXELS,
+  validateImageDimensions,
+  validateImageMagicBytes,
+} from '@open-mercato/core/modules/attachments/lib/imageSafety'
+import { StorageDriverFactory } from '../../../../lib/drivers'
 
 const querySchema = z.object({
   width: z.coerce.number().int().min(1).max(4000).optional(),
@@ -45,14 +50,19 @@ export async function GET(
 
   const { resolve } = await createRequestContainer()
   const em = resolve('em') as EntityManager
+  const storageDriverFactory =
+    (resolve('storageDriverFactory') as StorageDriverFactory | null) ?? new StorageDriverFactory(em)
 
-  const attachment = await em.findOne(Attachment, {
-    id,
-  })
+  const findFilter: Record<string, unknown> = { id }
+  if (auth && !isSuperAdminAuth(auth)) {
+    if (auth.tenantId) findFilter.tenantId = auth.tenantId
+    if (auth.orgId) findFilter.organizationId = auth.orgId
+  }
+  const attachment = await em.findOne(Attachment, findFilter)
   if (!attachment) {
     return NextResponse.json({ error: 'Not found' }, { status: 404 })
   }
-  if (typeof attachment.mimeType !== 'string' || !attachment.mimeType.startsWith('image/')) {
+  if (!canRenderInlineAttachment(attachment.mimeType)) {
     return NextResponse.json({ error: 'Unsupported media type' }, { status: 400 })
   }
   const partition = await em.findOne(AttachmentPartition, { code: attachment.partitionCode })
@@ -65,11 +75,10 @@ export async function GET(
     return NextResponse.json({ error: message }, { status: access.status })
   }
 
-  const filePath = resolveAttachmentAbsolutePath(
-    attachment.partitionCode,
-    attachment.storagePath,
-    attachment.storageDriver
-  )
+  const driver = await storageDriverFactory.resolveForPartition(attachment.partitionCode, {
+    tenantId: attachment.tenantId ?? '',
+    organizationId: attachment.organizationId ?? '',
+  })
   const cacheKey = buildThumbnailCacheKey(width, height, cropType)
   try {
     let buffer: Buffer | null = null
@@ -77,8 +86,21 @@ export async function GET(
       buffer = await readThumbnailCache(attachment.partitionCode, attachment.id, cacheKey)
     }
     if (!buffer) {
-      const input = await fs.readFile(filePath)
-      let transformer = sharp(input)
+      const { buffer: input } = await driver.read(attachment.partitionCode, attachment.storagePath)
+      const magicBytesValidation = validateImageMagicBytes(input, attachment.mimeType)
+      if (!magicBytesValidation.ok) {
+        return NextResponse.json({ error: magicBytesValidation.error }, { status: magicBytesValidation.status })
+      }
+
+      const dimensionsValidation = await validateImageDimensions(input)
+      if (!dimensionsValidation.ok) {
+        return NextResponse.json({ error: dimensionsValidation.error }, { status: dimensionsValidation.status })
+      }
+
+      let transformer = sharp(input, {
+        failOn: 'error',
+        limitInputPixels: MAX_IMAGE_SOURCE_PIXELS,
+      })
       if (width || height) {
         const resizeOptions: sharp.ResizeOptions = {
           width: width || undefined,
@@ -106,6 +128,7 @@ export async function GET(
       headers: {
         'Content-Type': attachment.mimeType || 'image/jpeg',
         'Cache-Control': partition.isPublic ? 'public, max-age=3600' : 'private, max-age=60',
+        'X-Content-Type-Options': 'nosniff',
       },
     })
   } catch (error) {

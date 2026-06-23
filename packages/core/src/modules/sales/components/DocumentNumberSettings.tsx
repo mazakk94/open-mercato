@@ -128,6 +128,7 @@ export function DocumentNumberSettings() {
         orderNextNumber: Number.parseInt(formState.orderNextNumber, 10) || undefined,
         quoteNextNumber: Number.parseInt(formState.quoteNextNumber, 10) || undefined,
       }
+      // optimistic-lock-exempt: single-row tenant numbering settings blob — no per-record version / concurrent record edit
       const call = await apiCall<SettingsResponse>('/api/sales/settings/document-numbers', {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
@@ -230,7 +231,7 @@ export function DocumentNumberSettings() {
             </p>
           </label>
         </div>
-        <div className="space-y-2 rounded-lg border bg-muted/40 p-3">
+        <div className="space-y-2 rounded-lg border bg-muted/50 p-3">
           <div className="flex items-center gap-2 text-sm font-medium">
             {translations.tokensTitle}
             <span className="text-xs font-normal text-muted-foreground">{translations.tokensHint}</span>

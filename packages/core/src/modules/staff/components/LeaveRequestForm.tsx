@@ -32,6 +32,7 @@ export type LeaveRequestFormValues = {
   unavailabilityReasonEntryId?: string | null
   unavailabilityReasonValue?: string | null
   note?: string | null
+  updatedAt?: string | null
 }
 
 export type LeaveRequestFormProps = {
@@ -51,22 +52,7 @@ export type LeaveRequestFormProps = {
 
 const DEFAULT_TIMEZONE = 'UTC'
 
-function toDateInputValue(value?: string | Date | null): string | null {
-  if (!value) return null
-  if (value instanceof Date) {
-    if (Number.isNaN(value.getTime())) return null
-    return value.toISOString().slice(0, 10)
-  }
-  if (typeof value === 'string') {
-    const trimmed = value.trim()
-    if (!trimmed) return null
-    if (/^\d{4}-\d{2}-\d{2}/.test(trimmed)) return trimmed.slice(0, 10)
-    const parsed = new Date(trimmed)
-    if (Number.isNaN(parsed.getTime())) return null
-    return parsed.toISOString().slice(0, 10)
-  }
-  return null
-}
+import { toDateInputValue } from '@open-mercato/shared/lib/date/format'
 
 export function buildLeaveRequestPayload(
   values: LeaveRequestFormValues,
@@ -298,6 +284,7 @@ export function LeaveRequestForm(props: LeaveRequestFormProps) {
             createOption={canManageReasons ? createReasonOption : undefined}
             labels={reasonLabels}
             selectClassName="w-full"
+            sortOptions="none"
             manageHref={canManageReasons ? '/backend/config/dictionaries' : undefined}
             allowInlineCreate={canManageReasons}
             showManage={canManageReasons}
@@ -331,6 +318,7 @@ export function LeaveRequestForm(props: LeaveRequestFormProps) {
       title={title}
       fields={fields}
       initialValues={normalizedInitialValues}
+      optimisticLockUpdatedAt={normalizedInitialValues.updatedAt}
       submitLabel={submitLabel}
       backHref={backHref}
       cancelHref={cancelHref}

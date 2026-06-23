@@ -10,7 +10,7 @@ import {
   scheduleDeleteSchema,
   scheduleListQuerySchema,
 } from '../../data/validators.js'
-import { escapeLikePattern } from '@open-mercato/shared/lib/db/escapeLikePattern'
+import { buildSchedulerJobsFilters } from './buildFilters.js'
 import {
   createSchedulerCrudOpenApi,
   createPagedListResponseSchema,
@@ -36,6 +36,7 @@ const crud = makeCrudRoute({
     tenantField: 'tenantId',
     softDeleteField: 'deletedAt',
   },
+  indexer: { entityType: 'scheduler:scheduled_job' },
   list: {
     entityId: 'scheduler:scheduled_job',
     schema: scheduleListQuerySchema,
@@ -68,6 +69,7 @@ const crud = makeCrudRoute({
       lastRunAt: 'last_run_at',
       createdAt: 'created_at',
     },
+    omitAutomaticTenantOrgScope: true,
     transformItem: (item: Record<string, unknown>) => {
       if (!item) return item
       return {
@@ -94,40 +96,7 @@ const crud = makeCrudRoute({
         updatedAt: item.updated_at,
       }
     },
-    buildFilters: async (query, ctx) => {
-      const filters: Record<string, unknown> = {}
-
-      filters.organization_id = { $eq: ctx.auth?.orgId }
-
-      if (query.id) {
-        filters.id = { $eq: query.id }
-      }
-
-      if (query.search) {
-        filters.$or = [
-          { name: { $ilike: `%${escapeLikePattern(query.search)}%` } },
-          { description: { $ilike: `%${escapeLikePattern(query.search)}%` } },
-        ]
-      }
-
-      if (query.scopeType) {
-        filters.scope_type = { $eq: query.scopeType }
-      }
-
-      if (query.isEnabled !== undefined) {
-        filters.is_enabled = { $eq: query.isEnabled }
-      }
-
-      if (query.sourceType) {
-        filters.source_type = { $eq: query.sourceType }
-      }
-
-      if (query.sourceModule) {
-        filters.source_module = { $eq: query.sourceModule }
-      }
-
-      return filters
-    },
+    buildFilters: buildSchedulerJobsFilters,
   },
   actions: {
     create: {
@@ -140,11 +109,10 @@ const crud = makeCrudRoute({
         let tenantId = raw.tenantId
         
         if (scopeType === 'system') {
-          // System scope requires superadmin privileges
-          const isSuperAdmin = Array.isArray(ctx.auth?.roles) && ctx.auth.roles.some(
-            (role: unknown) => typeof role === 'string' && role.trim().toLowerCase() === 'superadmin'
-          )
-          if (!isSuperAdmin) {
+          // System scope requires super-admin. Use the immutable `isSuperAdmin`
+          // flag (derived from RoleAcl/UserAcl) — never compare role names, which
+          // are tenant-mutable and spoofable.
+          if (ctx.auth?.isSuperAdmin !== true) {
             throw new CrudHttpError(403, { error: 'System-scoped schedules require superadmin privileges' })
           }
           // System scope: no org/tenant

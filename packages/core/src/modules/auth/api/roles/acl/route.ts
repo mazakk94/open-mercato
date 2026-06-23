@@ -4,11 +4,18 @@ import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
 import { getAuthFromRequest } from '@open-mercato/shared/lib/auth/server'
 import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
 import { logCrudAccess } from '@open-mercato/shared/lib/crud/factory'
-import { forbidden } from '@open-mercato/shared/lib/crud/errors'
+import { isCrudHttpError } from '@open-mercato/shared/lib/crud/errors'
+import { enforceCommandOptimisticLock } from '@open-mercato/shared/lib/crud/optimistic-lock-command'
+import { withAtomicFlush } from '@open-mercato/shared/lib/commands/flush'
 import { RoleAcl, Role } from '@open-mercato/core/modules/auth/data/entities'
 import type { EntityManager } from '@mikro-orm/postgresql'
 import { resolveIsSuperAdmin } from '@open-mercato/core/modules/auth/lib/tenantAccess'
 import { RbacService } from '@open-mercato/core/modules/auth/services/rbacService'
+import {
+  assertActorCanGrantAcl,
+  assertActorCanModifySuperAdminRoleTarget,
+  normalizeGrantFeatureList,
+} from '@open-mercato/core/modules/auth/lib/grantChecks'
 
 type TaggableCache = { deleteByTags?: (tags: string[]) => Promise<void> | void }
 
@@ -33,6 +40,7 @@ const roleAclResponseSchema = z.object({
   isSuperAdmin: z.boolean(),
   features: z.array(z.string()),
   organizations: z.array(z.string()).nullable(),
+  updatedAt: z.string().nullable(),
 })
 
 const roleAclUpdateResponseSchema = z.object({
@@ -54,14 +62,14 @@ export async function GET(req: Request) {
   const container = await createRequestContainer()
   const isSuperAdmin = await resolveIsSuperAdmin({ auth, container })
   const em = container.resolve('em') as EntityManager
-  const role = await em.findOne(Role, { id: parsed.data.roleId })
+  const authTenantId = auth.tenantId ?? null
+  const roleFilter: Record<string, unknown> = { id: parsed.data.roleId }
+  if (!isSuperAdmin && authTenantId) {
+    roleFilter.$or = [{ tenantId: authTenantId }, { tenantId: null }]
+  }
+  const role = await em.findOne(Role, roleFilter)
   if (!role) return NextResponse.json({ error: 'Not found' }, { status: 404 })
   const roleTenantId = role?.tenantId ? String(role.tenantId) : null
-  const authTenantId = auth.tenantId ?? null
-
-  if (!isSuperAdmin && roleTenantId && authTenantId && roleTenantId !== authTenantId) {
-    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
-  }
 
   let tenantScope = parsed.data.tenantId ?? roleTenantId ?? authTenantId ?? null
   if (parsed.data.tenantId && parsed.data.tenantId !== tenantScope) {
@@ -69,6 +77,23 @@ export async function GET(req: Request) {
     else return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
   if (!tenantScope && !isSuperAdmin) tenantScope = authTenantId ?? null
+
+  if (!isSuperAdmin && auth.sub) {
+    try {
+      await assertActorCanModifySuperAdminRoleTarget({
+        em,
+        rbacService: container.resolve('rbacService') as RbacService,
+        actorUserId: auth.sub,
+        tenantId: tenantScope,
+        organizationId: auth.orgId ?? null,
+        targetRoleId: parsed.data.roleId,
+        actorIsSuperAdmin: false,
+      })
+    } catch (err) {
+      if (isCrudHttpError(err)) return NextResponse.json(err.body, { status: err.status })
+      throw err
+    }
+  }
 
   const acl = tenantScope
     ? await em.findOne(RoleAcl, { role, tenantId: tenantScope })
@@ -78,8 +103,9 @@ export async function GET(req: Request) {
         isSuperAdmin: !!acl.isSuperAdmin,
         features: Array.isArray(acl.featuresJson) ? acl.featuresJson : [],
         organizations: Array.isArray(acl.organizationsJson) ? acl.organizationsJson : null,
+        updatedAt: acl.updatedAt instanceof Date ? acl.updatedAt.toISOString() : null,
       }
-    : { isSuperAdmin: false, features: [], organizations: null }
+    : { isSuperAdmin: false, features: [], organizations: null, updatedAt: null }
 
   await logCrudAccess({
     container,
@@ -107,15 +133,15 @@ export async function PUT(req: Request) {
   const em = container.resolve('em') as EntityManager
   const isSuperAdmin = await resolveIsSuperAdmin({ auth, container })
   const rbacService = container.resolve('rbacService') as RbacService
-  const role = await em.findOne(Role, { id: parsed.data.roleId })
+  const authTenantId = auth.tenantId ?? null
+  const putRoleFilter: Record<string, unknown> = { id: parsed.data.roleId }
+  if (!isSuperAdmin && authTenantId) {
+    putRoleFilter.$or = [{ tenantId: authTenantId }, { tenantId: null }]
+  }
+  const role = await em.findOne(Role, putRoleFilter)
   if (!role) return NextResponse.json({ error: 'Not found' }, { status: 404 })
 
   const roleTenantId = role?.tenantId ? String(role.tenantId) : null
-  const authTenantId = auth.tenantId ?? null
-
-  if (!isSuperAdmin && roleTenantId && authTenantId && roleTenantId !== authTenantId) {
-    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
-  }
 
   let targetTenantId = parsed.data.tenantId ?? roleTenantId ?? authTenantId ?? null
   if (parsed.data.tenantId && parsed.data.tenantId !== targetTenantId) {
@@ -132,14 +158,42 @@ export async function PUT(req: Request) {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
 
-  const actorAcl = auth.sub
-    ? await rbacService.loadAcl(auth.sub, { tenantId: auth.tenantId ?? null, organizationId: auth.orgId ?? null })
-    : null
-  const actorIsSuperAdmin = !!actorAcl?.isSuperAdmin
+  if (!isSuperAdmin && auth.sub) {
+    try {
+      await assertActorCanModifySuperAdminRoleTarget({
+        em,
+        rbacService,
+        actorUserId: auth.sub,
+        tenantId: targetTenantId,
+        organizationId: auth.orgId ?? null,
+        targetRoleId: parsed.data.roleId,
+        actorIsSuperAdmin: false,
+      })
+    } catch (err) {
+      if (isCrudHttpError(err)) return NextResponse.json(err.body, { status: err.status })
+      throw err
+    }
+  }
 
-  const requestedFeatures = normalizeFeatureList(parsed.data.features)
   let acl = await em.findOne(RoleAcl, { role, tenantId: targetTenantId })
-  if (!acl) {
+  // Optimistic lock: refuse a stale ACL overwrite so two admins editing the same
+  // role's features in parallel cannot silently clobber each other (#2055). The
+  // check is strictly additive — when the client sends no expected-version header
+  // it is a no-op. Skipped when the ACL row does not exist yet (first grant has
+  // no prior version to conflict with).
+  if (acl) {
+    try {
+      enforceCommandOptimisticLock({
+        resourceKind: 'auth.role_acl',
+        resourceId: acl.id,
+        current: acl.updatedAt ?? null,
+        request: req,
+      })
+    } catch (err) {
+      if (isCrudHttpError(err)) return NextResponse.json(err.body, { status: err.status })
+      throw err
+    }
+  } else {
     acl = em.create(RoleAcl, {
       role,
       tenantId: targetTenantId,
@@ -149,29 +203,48 @@ export async function PUT(req: Request) {
   }
 
   const existingIsSuperAdmin = !!acl.isSuperAdmin
+  const existingFeatures = normalizeGrantFeatureList(acl.featuresJson)
+  const existingOrganizations = normalizeOrganizations(acl.organizationsJson)
   const requestedIsSuperAdmin = parsed.data.isSuperAdmin ?? existingIsSuperAdmin
-  let effectiveIsSuperAdmin = requestedIsSuperAdmin
+  const requestedFeatures = parsed.data.features === undefined
+    ? existingFeatures
+    : normalizeGrantFeatureList(parsed.data.features)
+  const requestedOrganizations = parsed.data.organizations === undefined
+    ? existingOrganizations
+    : normalizeOrganizations(parsed.data.organizations)
 
-  if (!actorIsSuperAdmin) {
-    if (requestedIsSuperAdmin && !existingIsSuperAdmin) {
-      throw forbidden('Only super administrators can mark a role as super admin.')
-    }
-    if (existingIsSuperAdmin && requestedIsSuperAdmin === false) {
-      effectiveIsSuperAdmin = false
-    } else {
-      effectiveIsSuperAdmin = existingIsSuperAdmin
-    }
+  try {
+    await assertActorCanGrantAcl({
+      em,
+      rbacService,
+      actorUserId: auth.sub,
+      tenantId: targetTenantId,
+      organizationId: auth.orgId ?? null,
+      isSuperAdmin: requestedIsSuperAdmin,
+      features: requestedFeatures,
+      organizations: requestedOrganizations,
+    })
+  } catch (err) {
+    if (isCrudHttpError(err)) return NextResponse.json(err.body, { status: err.status })
+    throw err
   }
 
-  const effectiveFeatures = actorIsSuperAdmin
-    ? requestedFeatures
-    : sanitizeTenantFeatures(requestedFeatures)
+  // Persist the ACL mutation inside a transaction so the role-permission write
+  // commits atomically (proper ACL-edit transaction handling).
+  const aclToPersist = acl
+  await withAtomicFlush(
+    em,
+    [
+      () => {
+        aclToPersist.organizationsJson = requestedOrganizations
+        aclToPersist.isSuperAdmin = requestedIsSuperAdmin
+        aclToPersist.featuresJson = requestedFeatures
+        em.persist(aclToPersist)
+      },
+    ],
+    { transaction: true },
+  )
 
-  if (parsed.data.organizations !== undefined) acl.organizationsJson = parsed.data.organizations
-  acl.isSuperAdmin = effectiveIsSuperAdmin
-  acl.featuresJson = effectiveFeatures
-  await em.persistAndFlush(acl)
-  
   // Invalidate cache for all users in this tenant since role ACL changed
   if (targetTenantId) {
     await rbacService.invalidateTenantCache(targetTenantId)
@@ -184,30 +257,13 @@ export async function PUT(req: Request) {
   
   return NextResponse.json({
     ok: true,
-    sanitized: !actorIsSuperAdmin && (effectiveFeatures.length !== requestedFeatures.length || effectiveIsSuperAdmin !== requestedIsSuperAdmin),
+    sanitized: false,
   })
 }
 
-function normalizeFeatureList(features: unknown): string[] {
-  if (!Array.isArray(features)) return []
-  const dedup = new Set<string>()
-  for (const value of features) {
-    if (typeof value !== 'string') continue
-    const trimmed = value.trim()
-    if (!trimmed) continue
-    dedup.add(trimmed)
-  }
-  return Array.from(dedup)
-}
-
-function sanitizeTenantFeatures(features: string[]): string[] {
-  return features.filter((feature) => !isTenantRestrictedFeature(feature))
-}
-
-function isTenantRestrictedFeature(feature: string): boolean {
-  if (feature === '*' || feature === 'directory.*') return true
-  if (feature.startsWith('directory.tenants')) return true
-  return false
+function normalizeOrganizations(organizations: unknown): string[] | null {
+  if (!Array.isArray(organizations)) return null
+  return normalizeGrantFeatureList(organizations)
 }
 
 export const openApi: OpenApiRouteDoc = {

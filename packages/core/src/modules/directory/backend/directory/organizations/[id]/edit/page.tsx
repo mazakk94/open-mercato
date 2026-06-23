@@ -1,6 +1,7 @@
 "use client"
 import * as React from 'react'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
+import { extractCustomFieldEntries } from '@open-mercato/shared/lib/crud/custom-fields-client'
 import { E } from '#generated/entities.ids.generated'
 import { OrganizationSelect } from '@open-mercato/core/modules/directory/components/OrganizationSelect'
 import { TenantSelect } from '@open-mercato/core/modules/directory/components/TenantSelect'
@@ -15,6 +16,7 @@ import { apiCall } from '@open-mercato/ui/backend/utils/apiCall'
 import { deleteCrud, updateCrud } from '@open-mercato/ui/backend/utils/crud'
 import { collectCustomFieldValues } from '@open-mercato/ui/backend/utils/customFieldValues'
 import { createCrudFormError } from '@open-mercato/ui/backend/utils/serverErrors'
+import { ErrorMessage, RecordNotFoundState } from '@open-mercato/ui/backend/detail'
 
 type TreeResponse = {
   items: OrganizationTreeNode[]
@@ -24,6 +26,7 @@ type OrganizationResponse = {
   items: Array<{
     id: string
     name: string
+    slug?: string | null
     tenantId: string
     tenantName?: string | null
     parentId: string | null
@@ -32,6 +35,8 @@ type OrganizationResponse = {
     descendantIds: string[]
     isActive: boolean
     pathLabel: string
+    updatedAt?: string | null
+    updated_at?: string | null
   } & Record<string, unknown>>
 }
 
@@ -46,6 +51,7 @@ export default function EditOrganizationPage({ params }: { params?: { id?: strin
   const [tenantId, setTenantId] = React.useState<string | null>(null)
   const [loading, setLoading] = React.useState(true)
   const [error, setError] = React.useState<string | null>(null)
+  const [isNotFound, setIsNotFound] = React.useState(false)
   const [parentTree, setParentTree] = React.useState<OrganizationTreeNode[]>([])
   const [childSummary, setChildSummary] = React.useState<OrganizationTreeOption[]>([])
   const [originalChildIds, setOriginalChildIds] = React.useState<string[]>([])
@@ -105,13 +111,23 @@ export default function EditOrganizationPage({ params }: { params?: { id?: strin
     async function load() {
       setLoading(true)
       setError(null)
+      setIsNotFound(false)
       try {
-        const { ok, result } = await apiCall<OrganizationResponse>(
+        const { ok, status, result } = await apiCall<OrganizationResponse>(
           `/api/directory/organizations?view=manage&ids=${currentOrgId}&status=all&includeInactive=true&page=1&pageSize=1`,
         )
-        if (!ok) throw new Error(t('directory.organizations.form.errors.load', 'Failed to load organization'))
+        if (!ok) {
+          if (status === 404) {
+            if (!cancelled) setIsNotFound(true)
+            return
+          }
+          throw new Error(t('directory.organizations.form.errors.load', 'Failed to load organization'))
+        }
         const record = Array.isArray(result?.items) ? result.items?.[0] : undefined
-        if (!record) throw new Error(t('directory.organizations.form.errors.notFound', 'Organization not found'))
+        if (!record) {
+          if (!cancelled) setIsNotFound(true)
+          return
+        }
         const resolvedTenantId = record.tenantId || null
         setTenantId(resolvedTenantId)
         const baseTree = await loadParentTree(resolvedTenantId, record.descendantIds ?? [])
@@ -123,17 +139,19 @@ export default function EditOrganizationPage({ params }: { params?: { id?: strin
         setChildSummary(childrenDetails)
         setOriginalChildIds(Array.isArray(record.childIds) ? record.childIds : [])
 
-        const customValues: Record<string, unknown> = {}
-        for (const [key, value] of Object.entries(record as Record<string, unknown>)) {
-          if (key.startsWith('cf_')) customValues[key] = value
-          else if (key.startsWith('cf:')) customValues[`cf_${key.slice(3)}`] = value
-        }
+        const customValues = extractCustomFieldEntries(record as Record<string, unknown>)
         setInitialValues({
           id: record.id,
           name: record.name,
+          slug: record.slug ?? '',
           parentId: record.parentId || '',
           isActive: record.isActive,
           tenantId: resolvedTenantId,
+          updatedAt: typeof record.updatedAt === 'string'
+            ? record.updatedAt
+            : typeof record.updated_at === 'string'
+              ? record.updated_at
+              : null,
           ...customValues,
         })
         setPathLabel(record.pathLabel)
@@ -195,6 +213,12 @@ export default function EditOrganizationPage({ params }: { params?: { id?: strin
     ] : []),
     { id: 'name', label: t('directory.organizations.form.field.name', 'Name'), type: 'text', required: true },
     {
+      id: 'slug',
+      label: t('directory.organizations.form.field.slug', 'Slug'),
+      type: 'text',
+      description: t('directory.organizations.form.field.slug.description', 'URL-safe identifier used for the customer portal (lowercase letters, numbers, hyphens, underscores).'),
+    },
+    {
       id: 'parentId',
       label: t('directory.organizations.form.field.parent', 'Parent'),
       type: 'custom',
@@ -237,8 +261,8 @@ export default function EditOrganizationPage({ params }: { params?: { id?: strin
 
   const detailFields = React.useMemo(() => (
     actorIsSuperAdmin
-      ? ['tenantId', 'name', 'parentId', 'childrenInfo', 'isActive']
-      : ['name', 'parentId', 'childrenInfo', 'isActive']
+      ? ['tenantId', 'name', 'slug', 'parentId', 'childrenInfo', 'isActive']
+      : ['name', 'slug', 'parentId', 'childrenInfo', 'isActive']
   ), [actorIsSuperAdmin])
 
   const groups: CrudFormGroup[] = React.useMemo(() => ([
@@ -258,11 +282,25 @@ export default function EditOrganizationPage({ params }: { params?: { id?: strin
     )
   }
 
+  if (isNotFound) {
+    return (
+      <Page>
+        <PageBody>
+          <RecordNotFoundState
+            label={t('directory.organizations.form.errors.notFound', 'Organization not found')}
+            backHref="/backend/directory/organizations"
+            backLabel={t('directory.organizations.form.actions.backToList', 'Back to organizations')}
+          />
+        </PageBody>
+      </Page>
+    )
+  }
+
   if (error && !loading && !initialValues) {
     return (
       <Page>
         <PageBody>
-          <div className="rounded border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">{error}</div>
+          <ErrorMessage label={error} />
         </PageBody>
       </Page>
     )
@@ -278,7 +316,8 @@ export default function EditOrganizationPage({ params }: { params?: { id?: strin
           fields={fields}
           groups={groups}
           entityId={E.directory.organization}
-          initialValues={initialValues ?? { id: orgId, tenantId: tenantId ?? null, name: '', parentId: '', isActive: true, childIds: [] }}
+          initialValues={initialValues ?? { id: orgId, tenantId: tenantId ?? null, name: '', slug: '', parentId: '', isActive: true, childIds: [] }}
+          optimisticLockUpdatedAt={typeof initialValues?.updatedAt === 'string' ? initialValues.updatedAt : null}
           isLoading={loading}
           loadingMessage={t('directory.organizations.form.loading', 'Loading organization...')}
           submitLabel={t('directory.organizations.form.action.save', 'Save')}
@@ -315,6 +354,7 @@ export default function EditOrganizationPage({ params }: { params?: { id?: strin
 type UpdateOrganizationPayload = {
   id: string
   name: string
+  slug?: string | null
   isActive: boolean
   parentId: string | null
   childIds: string[]
@@ -369,6 +409,11 @@ export async function submitUpdateOrganization(options: {
         ? values.parentId
         : null,
     childIds: originalChildIds,
+  }
+
+  if (typeof values.slug === 'string') {
+    const trimmedSlug = values.slug.trim()
+    payload.slug = trimmedSlug.length ? trimmedSlug : null
   }
 
   if (submittedTenantId !== undefined && submittedTenantId !== null) {

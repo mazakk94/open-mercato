@@ -100,7 +100,7 @@ export function RowActions({ items = [] }: { items?: RowActionItem[] }) {
         variant="ghost"
         aria-haspopup="menu"
         aria-expanded={open}
-        onClick={(e) => { e.stopPropagation(); setOpen((v) => !v); requestAnimationFrame(updatePosition) }}
+        onClick={(e) => { e.stopPropagation(); setOpen(true); requestAnimationFrame(updatePosition) }}
       >
         <span aria-hidden="true">⋯</span>
         <span className="sr-only">{t('ui.rowActions.openActions', 'Open actions')}</span>
@@ -109,7 +109,7 @@ export function RowActions({ items = [] }: { items?: RowActionItem[] }) {
         <div
           ref={menuRef}
           role="menu"
-          className="fixed w-44 max-w-[calc(100vw-1rem)] rounded-md border bg-background p-1 shadow focus:outline-none z-[1000]"
+          className="fixed w-44 max-w-[calc(100vw-1rem)] rounded-md border bg-background p-1 shadow focus-visible:outline-none z-dropdown"
           style={{
             top: direction === 'down' ? anchorRect.bottom + 8 : anchorRect.top - 8,
             left: Math.min(anchorRect.right, window.innerWidth - 8),

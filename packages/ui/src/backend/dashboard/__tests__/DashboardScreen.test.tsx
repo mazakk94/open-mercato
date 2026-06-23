@@ -7,7 +7,7 @@ import { screen, waitFor } from '@testing-library/react'
 import { renderWithProviders } from '@open-mercato/shared/lib/testing/renderWithProviders'
 import { DashboardScreen } from '../DashboardScreen'
 import { apiCall } from '@open-mercato/ui/backend/utils/apiCall'
-import { loadDashboardWidgetModule } from '../widgetRegistry'
+import { getDashboardWidgets, loadDashboardWidgetModule } from '../widgetRegistry'
 
 jest.setTimeout(20000)
 
@@ -16,7 +16,14 @@ jest.mock('@open-mercato/ui/backend/utils/apiCall', () => ({
 }))
 
 jest.mock('../widgetRegistry', () => ({
+  getDashboardWidgets: jest.fn(),
   loadDashboardWidgetModule: jest.fn(),
+}))
+
+let mockOrganizationScopeVersion = 0
+
+jest.mock('@open-mercato/shared/lib/frontend/useOrganizationScope', () => ({
+  useOrganizationScopeVersion: () => mockOrganizationScopeVersion,
 }))
 
 jest.mock('next/navigation', () => ({
@@ -31,6 +38,9 @@ const createMockResponse = (status: number): Response => ({ status } as Response
 
 const dict = {
   'dashboard.loadError': 'Failed to load dashboard',
+  'dashboard.widget.loadError': 'Unable to load widget.',
+  'dashboard.empty.noWidgets.title': 'No dashboard widgets yet',
+  'dashboard.empty.noWidgets.description': 'Dashboard widgets will appear here after you add a module.',
   'dashboard.widgets.foo.title': 'Widget Foo',
   'dashboard.widgets.foo.description': 'Widget description',
 }
@@ -71,6 +81,8 @@ function MockWidget() {
 describe('DashboardScreen', () => {
   beforeEach(() => {
     jest.resetAllMocks()
+    mockOrganizationScopeVersion = 0
+    ;(getDashboardWidgets as jest.Mock).mockReturnValue([{ key: 'foo.loader', loader: jest.fn() }])
     ;(loadDashboardWidgetModule as jest.Mock).mockResolvedValue({
       Widget: MockWidget,
       hydrateSettings: (value: unknown) => value,
@@ -94,6 +106,27 @@ describe('DashboardScreen', () => {
     expect(await screen.findByText('Widget body')).toBeInTheDocument()
   })
 
+  it('reloads the dashboard when the organization scope changes', async () => {
+    ;(apiCall as jest.Mock).mockResolvedValue({
+      ok: true,
+      status: 200,
+      result: widgetResponse,
+      response: createMockResponse(200),
+    })
+
+    const { rerender } = renderWithProviders(<DashboardScreen />, { dict })
+
+    expect(await screen.findByText('Widget body')).toBeInTheDocument()
+    expect(apiCall).toHaveBeenCalledTimes(1)
+
+    mockOrganizationScopeVersion = 1
+    rerender(<DashboardScreen />)
+
+    await waitFor(() => {
+      expect(apiCall).toHaveBeenCalledTimes(2)
+    })
+  })
+
   it('shows an error when the layout request fails', async () => {
     const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {})
     ;(apiCall as jest.Mock).mockResolvedValue({
@@ -110,5 +143,40 @@ describe('DashboardScreen', () => {
     })
 
     errorSpy.mockRestore()
+  })
+
+  it('shows an informational empty state when no dashboard widgets are registered', async () => {
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {})
+    ;(getDashboardWidgets as jest.Mock).mockReturnValue([])
+    ;(apiCall as jest.Mock).mockResolvedValue({
+      ok: false,
+      status: 500,
+      result: null,
+      response: createMockResponse(500),
+    })
+
+    renderWithProviders(<DashboardScreen />, { dict })
+
+    expect(await screen.findByText('No dashboard widgets yet')).toBeInTheDocument()
+    expect(screen.getByText('Dashboard widgets will appear here after you add a module.')).toBeInTheDocument()
+    expect(screen.queryByText('Failed to load dashboard')).not.toBeInTheDocument()
+
+    errorSpy.mockRestore()
+  })
+
+  it('shows a widget load error when the registered module cannot be found', async () => {
+    ;(apiCall as jest.Mock).mockResolvedValue({
+      ok: true,
+      status: 200,
+      result: widgetResponse,
+      response: createMockResponse(200),
+    })
+    ;(loadDashboardWidgetModule as jest.Mock).mockResolvedValue(null)
+
+    renderWithProviders(<DashboardScreen />, { dict })
+
+    expect(await screen.findByText('Widget Foo')).toBeInTheDocument()
+    expect(await screen.findByText('Unable to load widget.')).toBeInTheDocument()
+    expect(screen.queryByText('Widget body')).not.toBeInTheDocument()
   })
 })

@@ -20,6 +20,7 @@ const sidebarNavItemSchema: z.ZodType<{
   enabled?: boolean
   hidden?: boolean
   pageContext?: 'main' | 'admin' | 'settings' | 'profile'
+  iconName?: string
   iconMarkup?: string
   children?: any[]
 }> = z.lazy(() =>
@@ -31,6 +32,7 @@ const sidebarNavItemSchema: z.ZodType<{
     enabled: z.boolean().optional(),
     hidden: z.boolean().optional(),
     pageContext: z.enum(['main', 'admin', 'settings', 'profile']).optional(),
+    iconName: z.string().optional(),
     iconMarkup: z.string().optional(),
     children: z.array(sidebarNavItemSchema).optional(),
   }),
@@ -42,6 +44,7 @@ const sectionItemSchema: z.ZodType<{
   labelKey?: string
   href: string
   order?: number
+  iconName?: string
   iconMarkup?: string
   children?: any[]
 }> = z.lazy(() =>
@@ -51,6 +54,7 @@ const sectionItemSchema: z.ZodType<{
     labelKey: z.string().optional(),
     href: z.string(),
     order: z.number().optional(),
+    iconName: z.string().optional(),
     iconMarkup: z.string().optional(),
     children: z.array(sectionItemSchema).optional(),
   }),
@@ -65,6 +69,13 @@ const sectionGroupSchema = z.object({
 })
 
 const adminNavResponseSchema = z.object({
+  brand: z.object({
+    name: z.string().optional(),
+    logo: z.object({
+      src: z.string(),
+      alt: z.string().optional(),
+    }).nullable().optional(),
+  }).nullable().optional(),
   groups: z.array(
     z.object({
       id: z.string().optional(),
@@ -123,9 +134,12 @@ export async function GET(req: Request) {
   } catch {
     cacheScopeOrganizationId = auth.orgId ?? null
     cacheScopeTenantId = auth.tenantId ?? null
+    selectedOrganizationId = auth.orgId ?? null
+    selectedTenantId = auth.tenantId ?? null
   }
 
-  const cacheKey = `nav:sidebar:${locale}:${auth.sub}:${cacheScopeTenantId || 'null'}:${cacheScopeOrganizationId || 'null'}`
+  const cacheVersion = 'v2'
+  const cacheKey = `nav:sidebar:${cacheVersion}:${locale}:${auth.sub}:${cacheScopeTenantId || 'null'}:${cacheScopeOrganizationId || 'null'}`
   try {
     if (cache?.get) {
       const cached = await cache.get(cacheKey)
@@ -153,6 +167,8 @@ export async function GET(req: Request) {
         `nav:entities:${cacheScopeTenantId || 'null'}`,
         `nav:locale:${locale}`,
         `nav:sidebar:user:${auth.sub}`,
+        cacheScopeTenantId ? `nav:sidebar:tenant:${cacheScopeTenantId}` : undefined,
+        cacheScopeOrganizationId ? `nav:sidebar:organization:${cacheScopeOrganizationId}` : undefined,
         `nav:sidebar:scope:${auth.sub}:${cacheScopeTenantId || 'null'}:${cacheScopeOrganizationId || 'null'}:${locale}`,
         ...((Array.isArray(auth.roles) ? auth.roles : []).map((role) => `nav:sidebar:role:${role}`)),
       ].filter(Boolean) as string[]

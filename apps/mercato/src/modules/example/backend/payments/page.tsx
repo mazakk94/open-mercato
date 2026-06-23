@@ -20,8 +20,6 @@ import {
   Ban,
   ArrowDownToLine,
   Undo2,
-  CheckCircle2,
-  AlertCircle,
   Info,
   Zap,
 } from 'lucide-react'
@@ -180,7 +178,7 @@ function StripePaymentForm({
   }, [clientSecret, elements, onError, onSuccess, stripe, t])
 
   return (
-    <div className="space-y-4 rounded-lg border bg-muted/20 p-4">
+    <div className="space-y-4 rounded-lg border bg-muted/30 p-4">
       <div className="space-y-1">
         <p className="text-sm font-semibold">{t('example.payments.stripe.form.title', 'Complete Stripe payment')}</p>
         <p className="text-sm text-muted-foreground">
@@ -433,7 +431,6 @@ export default function PaymentGatewayDemoPage() {
           {/* Error Display */}
           {error && (
             <Alert variant="destructive">
-              <AlertCircle className="size-4" />
               <AlertTitle>{t('example.payments.error.title', 'Error')}</AlertTitle>
               <AlertDescription>{error}</AlertDescription>
             </Alert>
@@ -442,7 +439,6 @@ export default function PaymentGatewayDemoPage() {
           {/* Action Result */}
           {actionResult && (
             <Alert variant="success">
-              <CheckCircle2 className="size-4" />
               <AlertTitle>{t('example.payments.success.title', 'Success')}</AlertTitle>
               <AlertDescription>{actionResult}</AlertDescription>
             </Alert>

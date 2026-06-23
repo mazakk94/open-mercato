@@ -107,9 +107,14 @@ export function ActionsDropdown({
       clearTimeout(hoverTimeoutRef.current)
     }
     setOpen(true)
+    updatePosition()
   }
 
-  const handleMouseLeave = () => {
+  const handleMouseLeave = (event: React.MouseEvent) => {
+    const nextTarget = event.relatedTarget as Node | null
+    if (nextTarget && (btnRef.current?.contains(nextTarget) || menuRef.current?.contains(nextTarget))) {
+      return
+    }
     hoverTimeoutRef.current = setTimeout(() => {
       setOpen(false)
     }, 150)
@@ -154,7 +159,7 @@ export function ActionsDropdown({
         <div
           ref={menuRef}
           role="menu"
-          className="fixed w-52 rounded-md border bg-background p-1 shadow-md focus:outline-none z-[1000]"
+          className="fixed w-52 rounded-md border bg-background p-1 shadow-md focus-visible:outline-none z-dropdown"
           onMouseEnter={handleMouseEnter}
           onMouseLeave={handleMouseLeave}
           style={{

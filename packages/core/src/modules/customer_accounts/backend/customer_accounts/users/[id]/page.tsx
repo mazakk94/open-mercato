@@ -6,13 +6,19 @@ import { useRouter } from 'next/navigation'
 import { Page, PageBody } from '@open-mercato/ui/backend/Page'
 import { FormHeader } from '@open-mercato/ui/backend/forms'
 import { Button } from '@open-mercato/ui/primitives/button'
+import { Input } from '@open-mercato/ui/primitives/input'
+import { PasswordInput } from '@open-mercato/ui/primitives/password-input'
 import { Spinner } from '@open-mercato/ui/primitives/spinner'
+import { SwitchField } from '@open-mercato/ui/primitives/switch-field'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@open-mercato/ui/primitives/dialog'
-import { apiCall, readApiResultOrThrow } from '@open-mercato/ui/backend/utils/apiCall'
+import { apiCall, readApiResultOrThrow, withScopedApiRequestHeaders } from '@open-mercato/ui/backend/utils/apiCall'
+import { buildOptimisticLockHeader } from '@open-mercato/ui/backend/utils/optimisticLock'
+import { surfaceRecordConflict } from '@open-mercato/ui/backend/conflicts'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
 import { useConfirmDialog } from '@open-mercato/ui/backend/confirm-dialog'
 import { useGuardedMutation } from '@open-mercato/ui/backend/injection/useGuardedMutation'
+import { RecordNotFoundState, ErrorMessage } from '@open-mercato/ui/backend/detail'
 
 type UserDetail = {
   id: string
@@ -110,15 +116,14 @@ function ResetPasswordDialog({
             <label className="text-sm font-medium" htmlFor="reset-password">
               {t('customer_accounts.admin.detail.resetPassword.fields.newPassword', 'New Password')}
             </label>
-            <input
+            <PasswordInput
               id="reset-password"
-              type="password"
               required
               minLength={8}
               value={newPassword}
               onChange={(event) => setNewPassword(event.target.value)}
-              className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               placeholder={t('customer_accounts.admin.detail.resetPassword.fields.placeholder', 'Min. 8 characters')}
+              autoComplete="new-password"
             />
           </div>
           <div className="flex justify-end gap-2 pt-2">
@@ -145,6 +150,7 @@ export default function CustomerUserDetailPage({ params }: { params?: { id?: str
   const [data, setData] = React.useState<UserDetail | null>(null)
   const [isLoading, setIsLoading] = React.useState(true)
   const [error, setError] = React.useState<string | null>(null)
+  const [isNotFound, setIsNotFound] = React.useState(false)
   const [isSaving, setIsSaving] = React.useState(false)
   const [editActive, setEditActive] = React.useState<boolean | null>(null)
   const [editDisplayName, setEditDisplayName] = React.useState('')
@@ -184,7 +190,7 @@ export default function CustomerUserDetailPage({ params }: { params?: { id?: str
 
   React.useEffect(() => {
     if (!id) {
-      setError(t('customer_accounts.admin.detail.error.notFound', 'User not found'))
+      setIsNotFound(true)
       setIsLoading(false)
       return
     }
@@ -192,6 +198,7 @@ export default function CustomerUserDetailPage({ params }: { params?: { id?: str
     async function load() {
       setIsLoading(true)
       setError(null)
+      setIsNotFound(false)
       try {
         const payload = await readApiResultOrThrow<UserDetail>(
           `/api/customer_accounts/admin/users/${encodeURIComponent(id!)}`,
@@ -207,8 +214,12 @@ export default function CustomerUserDetailPage({ params }: { params?: { id?: str
         setEditCustomerEntityId(payload.customerEntityId)
       } catch (err) {
         if (cancelled) return
-        const message = err instanceof Error ? err.message : t('customer_accounts.admin.detail.error.load', 'Failed to load user')
-        setError(message)
+        if ((err as { status?: number }).status === 404) {
+          setIsNotFound(true)
+        } else {
+          const message = err instanceof Error ? err.message : t('customer_accounts.admin.detail.error.load', 'Failed to load user')
+          setError(message)
+        }
       } finally {
         if (!cancelled) setIsLoading(false)
       }
@@ -240,25 +251,25 @@ export default function CustomerUserDetailPage({ params }: { params?: { id?: str
   React.useEffect(() => {
     if (!data) return
     let cancelled = false
-    async function loadCrmNames() {
-      if (data!.personEntityId) {
-        try {
-          const call = await apiCall<{ id?: string; firstName?: string; lastName?: string }>(`/api/customers/people/${encodeURIComponent(data!.personEntityId)}`)
-          if (!cancelled && call.ok && call.result) {
-            setPersonName([call.result.firstName, call.result.lastName].filter(Boolean).join(' ') || call.result.id || null)
-          }
-        } catch { /* ignore */ }
-      }
-      if (data!.customerEntityId) {
-        try {
-          const call = await apiCall<{ id?: string; name?: string }>(`/api/customers/${encodeURIComponent(data!.customerEntityId)}`)
-          if (!cancelled && call.ok && call.result) {
-            setCompanyName(call.result.name || call.result.id || null)
-          }
-        } catch { /* ignore */ }
-      }
+    async function loadPersonName() {
+      if (!data!.personEntityId) return
+      try {
+        const call = await apiCall<{ id?: string; firstName?: string; lastName?: string }>(`/api/customers/people/${encodeURIComponent(data!.personEntityId)}`)
+        if (!cancelled && call.ok && call.result) {
+          setPersonName([call.result.firstName, call.result.lastName].filter(Boolean).join(' ') || call.result.id || null)
+        }
+      } catch { /* ignore */ }
     }
-    loadCrmNames()
+    async function loadCompanyName() {
+      if (!data!.customerEntityId) return
+      try {
+        const call = await apiCall<{ id?: string; name?: string }>(`/api/customers/${encodeURIComponent(data!.customerEntityId)}`)
+        if (!cancelled && call.ok && call.result) {
+          setCompanyName(call.result.name || call.result.id || null)
+        }
+      } catch { /* ignore */ }
+    }
+    void Promise.all([loadPersonName(), loadCompanyName()])
     return () => { cancelled = true }
   }, [data])
 
@@ -323,21 +334,25 @@ export default function CustomerUserDetailPage({ params }: { params?: { id?: str
     setIsSaving(true)
     try {
       await runMutationWithContext(async () => {
-        const call = await apiCall<{ ok: boolean; error?: string }>(
-          `/api/customer_accounts/admin/users/${encodeURIComponent(id)}`,
-          {
-            method: 'PUT',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({
-              displayName: editDisplayName.trim() || undefined,
-              isActive: editActive,
-              roleIds: selectedRoleIds,
-              personEntityId: editPersonEntityId,
-              customerEntityId: editCustomerEntityId,
-            }),
-          },
+        const call = await withScopedApiRequestHeaders(
+          buildOptimisticLockHeader(data.updatedAt),
+          () => apiCall<{ ok: boolean; error?: string; updatedAt?: string | null }>(
+            `/api/customer_accounts/admin/users/${encodeURIComponent(id)}`,
+            {
+              method: 'PUT',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({
+                displayName: editDisplayName.trim() || undefined,
+                isActive: editActive,
+                roleIds: selectedRoleIds,
+                personEntityId: editPersonEntityId,
+                customerEntityId: editCustomerEntityId,
+              }),
+            },
+          ),
         )
         if (!call.ok) {
+          if (surfaceRecordConflict({ status: call.status, body: call.result }, t)) return
           flash(call.result?.error || t('customer_accounts.admin.detail.error.save', 'Failed to save user'), 'error')
           return
         }
@@ -348,6 +363,7 @@ export default function CustomerUserDetailPage({ params }: { params?: { id?: str
           displayName: editDisplayName.trim() || prev.displayName,
           personEntityId: editPersonEntityId,
           customerEntityId: editCustomerEntityId,
+          updatedAt: call.result?.updatedAt ?? prev.updatedAt,
         } : prev)
       }, { displayName: editDisplayName, isActive: editActive, roleIds: selectedRoleIds, personEntityId: editPersonEntityId, customerEntityId: editCustomerEntityId })
     } catch (err) {
@@ -369,11 +385,15 @@ export default function CustomerUserDetailPage({ params }: { params?: { id?: str
     if (!confirmed) return
     try {
       await runMutationWithContext(async () => {
-        const call = await apiCall(
-          `/api/customer_accounts/admin/users/${encodeURIComponent(id)}`,
-          { method: 'DELETE' },
+        const call = await withScopedApiRequestHeaders(
+          buildOptimisticLockHeader(data.updatedAt),
+          () => apiCall(
+            `/api/customer_accounts/admin/users/${encodeURIComponent(id)}`,
+            { method: 'DELETE' },
+          ),
         )
         if (!call.ok) {
+          if (surfaceRecordConflict({ status: call.status, body: call.result }, t)) return
           flash(t('customer_accounts.admin.error.delete', 'Failed to delete user'), 'error')
           return
         }
@@ -461,18 +481,34 @@ export default function CustomerUserDetailPage({ params }: { params?: { id?: str
     )
   }
 
+  if (isNotFound) {
+    return (
+      <Page>
+        <PageBody>
+          <RecordNotFoundState
+            label={t('customer_accounts.admin.detail.error.notFound', 'User not found')}
+            backHref="/backend/customer_accounts/users"
+            backLabel={t('customer_accounts.admin.detail.actions.backToList', 'Back to list')}
+          />
+        </PageBody>
+      </Page>
+    )
+  }
+
   if (error || !data) {
     return (
       <Page>
         <PageBody>
-          <div className="flex h-[50vh] flex-col items-center justify-center gap-2 text-muted-foreground">
-            <p>{error || t('customer_accounts.admin.detail.error.notFound', 'User not found')}</p>
-            <Button asChild variant="outline">
-              <Link href="/backend/customer_accounts/users">
-                {t('customer_accounts.admin.detail.actions.backToList', 'Back to list')}
-              </Link>
-            </Button>
-          </div>
+          <ErrorMessage
+            label={error ?? t('customer_accounts.admin.detail.error.notFound', 'User not found')}
+            action={
+              <Button asChild variant="outline" size="sm">
+                <Link href="/backend/customer_accounts/users">
+                  {t('customer_accounts.admin.detail.actions.backToList', 'Back to list')}
+                </Link>
+              </Button>
+            }
+          />
         </PageBody>
       </Page>
     )
@@ -491,16 +527,16 @@ export default function CustomerUserDetailPage({ params }: { params?: { id?: str
           deleteLabel={t('customer_accounts.admin.detail.actions.delete', 'Delete')}
         />
 
-        <div className="rounded-lg border border-blue-200 bg-blue-50/50 p-4 dark:border-blue-800 dark:bg-blue-950/50">
+        <div className="rounded-lg border border-status-info-border bg-status-info-bg p-4">
           <div className="flex items-start gap-3">
             <div className="flex-1">
-              <h3 className="text-sm font-medium text-blue-900 dark:text-blue-100">
+              <h3 className="text-sm font-medium text-status-info-text">
                 {t('customer_accounts.admin.detail.portalAccess.title', 'Customer Portal Access')}
               </h3>
-              <p className="mt-1 text-sm text-blue-700 dark:text-blue-300">
+              <p className="mt-1 text-sm text-status-info-text">
                 {t('customer_accounts.admin.detail.portalAccess.description', 'This user can access the customer portal at the URL below. The portal provides self-service access to orders, invoices, quotes, and account management.')}
               </p>
-              <p className="mt-2 text-xs text-blue-600 dark:text-blue-400">
+              <p className="mt-2 text-xs text-status-info-text">
                 {t('customer_accounts.admin.detail.portalAccess.url', 'Portal URL: {url}', {
                   url: `${typeof window !== 'undefined' ? window.location.origin : ''}/[org-slug]/portal`,
                 })}
@@ -522,8 +558,8 @@ export default function CustomerUserDetailPage({ params }: { params?: { id?: str
                 <dd className="flex items-center gap-2">
                   <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${
                     data.emailVerifiedAt
-                      ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200'
-                      : 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200'
+                      ? 'bg-status-success-bg text-status-success-text'
+                      : 'bg-status-warning-bg text-status-warning-text'
                   }`}>
                     {data.emailVerifiedAt
                       ? t('customer_accounts.admin.verified', 'Yes')
@@ -571,12 +607,11 @@ export default function CustomerUserDetailPage({ params }: { params?: { id?: str
                 ) : (
                   <div className="space-y-1">
                     <div className="relative">
-                      <input
+                      <Input
                         type="text"
                         value={personSearchQuery}
                         onChange={(event) => { void handleSearchPeople(event.target.value) }}
                         placeholder={t('customer_accounts.admin.detail.fields.searchPerson', 'Search people by name...')}
-                        className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                       />
                       {personResults.length > 0 && (
                         <div className="absolute z-10 mt-1 w-full rounded-md border bg-background shadow-lg max-h-40 overflow-y-auto">
@@ -615,12 +650,11 @@ export default function CustomerUserDetailPage({ params }: { params?: { id?: str
                 ) : (
                   <div className="space-y-1">
                     <div className="relative">
-                      <input
+                      <Input
                         type="text"
                         value={companySearchQuery}
                         onChange={(event) => { void handleSearchCompanies(event.target.value) }}
                         placeholder={t('customer_accounts.admin.detail.fields.searchCompany', 'Search companies by name...')}
-                        className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                       />
                       {companyResults.length > 0 && (
                         <div className="absolute z-10 mt-1 w-full rounded-md border bg-background shadow-lg max-h-40 overflow-y-auto">
@@ -660,34 +694,20 @@ export default function CustomerUserDetailPage({ params }: { params?: { id?: str
                 <label className="text-sm font-medium" htmlFor="user-display-name">
                   {t('customer_accounts.admin.detail.fields.displayName', 'Display Name')}
                 </label>
-                <input
+                <Input
                   id="user-display-name"
                   type="text"
                   value={editDisplayName}
                   onChange={(event) => setEditDisplayName(event.target.value)}
-                  className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                 />
               </div>
 
-              <div className="flex items-center gap-3">
-                <label className="text-sm font-medium" htmlFor="user-active-toggle">
-                  {t('customer_accounts.admin.detail.fields.isActive', 'Active')}
-                </label>
-                <button
-                  id="user-active-toggle"
-                  type="button"
-                  role="switch"
-                  aria-checked={editActive ?? data.isActive}
-                  onClick={() => setEditActive((prev) => !(prev ?? data.isActive))}
-                  className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                    (editActive ?? data.isActive) ? 'bg-primary' : 'bg-muted'
-                  }`}
-                >
-                  <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                    (editActive ?? data.isActive) ? 'translate-x-6' : 'translate-x-1'
-                  }`} />
-                </button>
-              </div>
+              <SwitchField
+                id="user-active-toggle"
+                label={t('customer_accounts.admin.detail.fields.isActive', 'Active')}
+                checked={editActive ?? data.isActive}
+                onCheckedChange={(next) => setEditActive(next)}
+              />
             </div>
 
             <div className="space-y-2">
@@ -748,12 +768,12 @@ export default function CustomerUserDetailPage({ params }: { params?: { id?: str
             </Button>
           </div>
           {resetLinkUrl && (
-            <div className="rounded-md border border-blue-200 bg-blue-50 p-3 dark:border-blue-800 dark:bg-blue-950">
-              <p className="mb-1.5 text-sm font-medium text-blue-900 dark:text-blue-100">
+            <div className="rounded-md border border-status-info-border bg-status-info-bg p-3">
+              <p className="mb-1.5 text-sm font-medium text-status-info-text">
                 {t('customer_accounts.admin.detail.sendResetLink.linkLabel', 'Password reset link (valid for 60 minutes):')}
               </p>
               <div className="flex items-center gap-2">
-                <code className="flex-1 break-all rounded bg-blue-100 px-2 py-1 text-xs text-blue-800 dark:bg-blue-900 dark:text-blue-200">
+                <code className="flex-1 break-all rounded bg-status-info-bg px-2 py-1 text-xs text-status-info-text">
                   {resetLinkUrl}
                 </code>
                 <Button
@@ -768,7 +788,7 @@ export default function CustomerUserDetailPage({ params }: { params?: { id?: str
                   {t('customer_accounts.admin.detail.sendResetLink.actions.copy', 'Copy')}
                 </Button>
               </div>
-              <p className="mt-1.5 text-xs text-blue-700 dark:text-blue-300">
+              <p className="mt-1.5 text-xs text-status-info-text">
                 {t('customer_accounts.admin.detail.sendResetLink.hint', 'Share this link with the customer to let them set a new password.')}
               </p>
             </div>

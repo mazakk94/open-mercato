@@ -1,6 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import { spawn } from 'node:child_process'
+import spawn from 'cross-spawn'
 import { copyDirRecursive, rewriteCrossModuleImports } from './eject'
 import {
   parsePackageNameFromSpec,
@@ -10,6 +10,7 @@ import {
 } from './module-package'
 import { ensureModuleRegistration } from './modules-config'
 import type { PackageResolver } from './resolver'
+import { resolveSpawnCommand } from './spawn'
 
 type ModuleCommandResult = {
   moduleId: string
@@ -22,6 +23,11 @@ type InstallTarget = {
   cwd: string
   args: string[]
 }
+
+const OFFICIAL_PACKAGE_SCOPE = '@open-mercato/'
+const SAFE_PACKAGE_SPEC_PATTERN = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*(?:@.+)?$/i
+const SAFE_PACKAGE_TAG_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
+const SAFE_PACKAGE_FILE_LOCATOR_PATTERN = /^file:[A-Za-z0-9_./: \\-]+$/
 
 function resolveYarnBinary(): string {
   return process.platform === 'win32' ? 'yarn.cmd' : 'yarn'
@@ -61,10 +67,12 @@ function runCommand(
   cwd: string,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
+    const resolvedSpawn = resolveSpawnCommand(command, args)
+    const child = spawn(resolvedSpawn.command, resolvedSpawn.args, {
       cwd,
       env: process.env,
       stdio: 'inherit',
+      ...resolvedSpawn.spawnOptions,
     })
 
     child.on('error', reject)
@@ -126,10 +134,47 @@ async function runGeneratorsWithRegistrationNotice(
   }
 }
 
+function isOfficialPackage(packageName: string): boolean {
+  return packageName.startsWith(OFFICIAL_PACKAGE_SCOPE)
+}
+
 function assertPackageName(packageName: string | null): asserts packageName is string {
-  if (!packageName || !packageName.startsWith('@open-mercato/')) {
-    throw new Error('Only @open-mercato/* package specs are supported by "mercato module add".')
+  if (!packageName) {
+    throw new Error('Could not determine a package name from the provided spec.')
   }
+}
+
+function assertThirdPartyAllowed(packageName: string, allowThirdParty: boolean): void {
+  if (isOfficialPackage(packageName) || allowThirdParty) {
+    return
+  }
+
+  throw new Error(
+    `Package "${packageName}" is outside the ${OFFICIAL_PACKAGE_SCOPE}* scope. Re-run with --allow-third-party to install third-party module packages.`,
+  )
+}
+
+function assertSupportedPackageSpec(packageSpec: string, allowThirdParty: boolean): string {
+  const trimmed = packageSpec.trim()
+
+  if (!SAFE_PACKAGE_SPEC_PATTERN.test(trimmed)) {
+    throw new Error('Unsupported package spec. Provide a valid npm package name with an optional tag/version or file: locator.')
+  }
+
+  const packageName = parsePackageNameFromSpec(trimmed)
+  assertPackageName(packageName)
+  assertThirdPartyAllowed(packageName, allowThirdParty)
+
+  if (trimmed === packageName) {
+    return trimmed
+  }
+
+  const suffix = trimmed.slice(packageName.length + 1)
+  if (SAFE_PACKAGE_TAG_PATTERN.test(suffix) || SAFE_PACKAGE_FILE_LOCATOR_PATTERN.test(suffix)) {
+    return trimmed
+  }
+
+  throw new Error('Unsupported package spec suffix. Use a tag/version token or a file: locator.')
 }
 
 function validateBeforeRegistration(
@@ -211,11 +256,13 @@ export async function addOfficialModule(
   packageSpec: string,
   eject: boolean,
   moduleId?: string,
+  allowThirdParty = false,
 ): Promise<ModuleCommandResult> {
-  const packageName = parsePackageNameFromSpec(packageSpec)
+  const safePackageSpec = assertSupportedPackageSpec(packageSpec, allowThirdParty)
+  const packageName = parsePackageNameFromSpec(safePackageSpec)
   assertPackageName(packageName)
 
-  await installPackageSpec(resolver, packageSpec)
+  await installPackageSpec(resolver, safePackageSpec)
 
   const modulePackage = resolveInstalledOfficialModulePackage(resolver, packageName, moduleId)
   return registerResolvedOfficialModule(resolver, modulePackage, packageName, eject)
@@ -226,10 +273,9 @@ export async function enableOfficialModule(
   packageName: string,
   moduleId?: string,
   eject = false,
+  allowThirdParty = false,
 ): Promise<ModuleCommandResult> {
-  if (!packageName.startsWith('@open-mercato/')) {
-    throw new Error('Only @open-mercato/* packages can be enabled with "mercato module enable".')
-  }
+  assertThirdPartyAllowed(packageName, allowThirdParty)
 
   const modulePackage = resolveInstalledOfficialModulePackage(resolver, packageName, moduleId)
   return registerResolvedOfficialModule(resolver, modulePackage, packageName, eject)

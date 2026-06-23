@@ -6,6 +6,8 @@ import { Role } from '@open-mercato/core/modules/auth/data/entities'
 import { ApiKey } from '../data/entities'
 import { createKmsService } from '@open-mercato/shared/lib/encryption/kms'
 import { encryptWithAesGcm, decryptWithAesGcm } from '@open-mercato/shared/lib/encryption/aes'
+import { getSharedApiKeyAuthCache } from '@open-mercato/shared/lib/auth/apiKeyAuthCache'
+import { findOneWithDecryption } from '@open-mercato/shared/lib/encryption/find'
 
 const BCRYPT_COST = 10
 
@@ -108,7 +110,7 @@ export async function createApiKey(
     expiresAt: input.expiresAt ?? null,
     createdAt: new Date(),
   })
-  await em.persistAndFlush(record)
+  await em.persist(record).flush()
   if (opts.rbac) {
     await opts.rbac.invalidateUserCache(`api_key:${record.id}`)
   }
@@ -123,7 +125,8 @@ export async function deleteApiKey(
   const record = await em.findOne(ApiKey, { id })
   if (!record) return
   record.deletedAt = new Date()
-  await em.persistAndFlush(record)
+  await em.persist(record).flush()
+  getSharedApiKeyAuthCache().invalidateByKeyId(record.id)
   if (opts.rbac) {
     await opts.rbac.invalidateUserCache(`api_key:${record.id}`)
   }
@@ -198,7 +201,7 @@ export async function createSessionApiKey(
     createdAt: new Date(),
   })
 
-  await em.persistAndFlush(record)
+  await em.persist(record).flush()
 
   return {
     keyId: record.id,
@@ -221,6 +224,68 @@ export async function findApiKeyBySessionToken(
     sessionToken,
     deletedAt: null,
   })
+
+  if (!record) return null
+  if (record.expiresAt && record.expiresAt.getTime() < Date.now()) return null
+
+  return record
+}
+
+/**
+ * Bind an OpenCode session id to the api_key row that owns this chat session.
+ *
+ * Called by the chat dispatcher the first time we see the `done` event for a
+ * freshly minted session token. From that point on,
+ * `findApiKeyByOpencodeSessionId(em, opencodeSessionId)` returns the same row,
+ * which the ai-assistant runtime uses to assert ownership on every resume.
+ *
+ * Throws when the session token has been deleted/expired, and when the api_key
+ * row is already bound to a DIFFERENT OpenCode session (defensive: this should
+ * never happen in practice because each chat mints a new session token, but we
+ * fail closed instead of silently overwriting).
+ *
+ * Idempotent when the row is already bound to the same OpenCode session id.
+ */
+export async function bindOpencodeSessionToApiKey(
+  em: EntityManager,
+  sessionToken: string,
+  opencodeSessionId: string
+): Promise<void> {
+  if (!sessionToken) throw new Error('Session token not found or expired')
+  if (!opencodeSessionId) throw new Error('OpenCode session id is required')
+
+  const row = await findApiKeyBySessionToken(em, sessionToken)
+  if (!row) throw new Error('Session token not found or expired')
+
+  if (row.opencodeSessionId === opencodeSessionId) return
+  if (row.opencodeSessionId && row.opencodeSessionId !== opencodeSessionId) {
+    throw new Error('Session token already bound to a different OpenCode session')
+  }
+
+  row.opencodeSessionId = opencodeSessionId
+  await em.persist(row).flush()
+}
+
+/**
+ * Find an api_key row by its bound OpenCode session id.
+ *
+ * Returns null if no active row matches, or if the matched row is expired
+ * (same contract as `findApiKeyBySessionToken`). Uses
+ * `findOneWithDecryption` so encrypted-at-rest fields on the row are decrypted
+ * before the ai-assistant runtime inspects `sessionUserId` / `tenantId` /
+ * `organizationId` for the ownership check.
+ */
+export async function findApiKeyByOpencodeSessionId(
+  em: EntityManager,
+  opencodeSessionId: string
+): Promise<ApiKey | null> {
+  if (!opencodeSessionId) return null
+
+  const record = await findOneWithDecryption(
+    em,
+    ApiKey,
+    { opencodeSessionId, deletedAt: null } as any,
+  )
 
   if (!record) return null
   if (record.expiresAt && record.expiresAt.getTime() < Date.now()) return null
@@ -268,7 +333,8 @@ export async function deleteSessionApiKey(
   if (!record) return
 
   record.deletedAt = new Date()
-  await em.persistAndFlush(record)
+  await em.persist(record).flush()
+  getSharedApiKeyAuthCache().invalidateByKeyId(record.id)
 }
 
 /**
@@ -283,28 +349,35 @@ export async function deleteSessionApiKey(
  * @param fn - Function to execute with the API key secret
  * @returns Result of the function
  */
+const ONETIME_KEY_MAX_TTL_MS = 5 * 60 * 1000
+
 export async function withOnetimeApiKey<T>(
   em: EntityManager,
   input: CreateApiKeyInput,
   fn: (secret: string) => Promise<T>
 ): Promise<T> {
+  const maxExpiresAt = new Date(Date.now() + ONETIME_KEY_MAX_TTL_MS)
+  const safeExpiresAt = input.expiresAt && input.expiresAt < maxExpiresAt
+    ? input.expiresAt
+    : maxExpiresAt
+
   const { record, secret } = await createApiKey(em, {
     ...input,
     name: input.name || '__onetime__',
     description: input.description || 'One-time API key',
+    expiresAt: safeExpiresAt,
   })
 
   try {
-    // Execute the function with the API key
     const result = await fn(secret)
     return result
   } finally {
-    // Always delete the API key, even if the function throws
     try {
-      await em.removeAndFlush(record)
+      record.deletedAt = new Date()
+      await em.persist(record).flush()
+      getSharedApiKeyAuthCache().invalidateByKeyId(record.id)
     } catch (error) {
-      // Log but don't throw - we don't want cleanup errors to mask the original error
-      console.error('[withOnetimeApiKey] Failed to delete one-time API key:', error)
+      console.error('[withOnetimeApiKey] Failed to soft-delete one-time API key:', error)
     }
   }
 }

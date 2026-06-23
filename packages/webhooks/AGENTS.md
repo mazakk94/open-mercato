@@ -2,7 +2,7 @@
 
 Use `@open-mercato/webhooks` for Standard Webhooks delivery, inbound verification, and webhook marketplace/admin flows.
 
-## MUST Rules
+## Always
 
 1. **MUST use the shared webhook primitives** — import signing, verification, and secret helpers from `@open-mercato/shared/lib/webhooks`
 2. **MUST enqueue outbound deliveries** — never send webhook HTTP requests directly from subscribers or API routes unless the endpoint is the explicit synchronous test route
@@ -12,6 +12,27 @@ Use `@open-mercato/webhooks` for Standard Webhooks delivery, inbound verificatio
 6. **MUST update both canonical and aliased API surfaces carefully** — `/api/webhooks/...` is the contract surface; compatibility aliases must keep working when present
 7. **MUST wire backend UI writes through shared CRUD helpers or guarded mutations** — do not add ad hoc fetch logic for create, update, retry, rotate, or test actions
 8. **MUST treat inbound adapters as provider-owned** — register `WebhookEndpointAdapter` in the provider module; do not hardcode provider behavior in the webhooks package
+
+## Ask First
+
+- Ask before changing webhook signing, verification, canonical route contracts, or compatibility aliases.
+- Ask before moving provider-specific inbound behavior into the shared webhooks package.
+- Ask before changing retry, deduplication, or delivery lifecycle event semantics.
+
+## Never
+
+- Never send webhook HTTP requests directly from subscribers or API routes unless the endpoint is the explicit synchronous test route.
+- Never read encrypted webhook secrets with raw ORM helpers.
+- Never add ad hoc backend `fetch` logic for create, update, retry, rotate, or test actions.
+- Never hardcode provider-specific inbound behavior in this package.
+
+## Validation Commands
+
+```bash
+yarn generate
+yarn workspace @open-mercato/webhooks test
+yarn workspace @open-mercato/webhooks build
+```
 
 ## When You Need Outbound Webhooks
 
@@ -57,7 +78,7 @@ packages/webhooks/src/modules/webhooks/
 
 ## Checklist: Adding a New Delivery Capability
 
-1. Add or update the contract in `.ai/specs/SPEC-057-2026-03-04-webhooks-module.md` if behavior changes materially
+1. Add or update the contract in `.ai/specs/implemented/SPEC-057-2026-03-04-webhooks-module.md` if behavior changes materially
 2. Modify shared types or helpers in `packages/shared/src/lib/webhooks/` first when the contract changes
 3. Add or update webhook package code in `lib/`, `api/`, `subscribers/`, or `workers/`
 4. Run `yarn generate` if you add module files that rely on auto-discovery
@@ -70,4 +91,4 @@ packages/webhooks/src/modules/webhooks/
 - **Event subscribers and persistent delivery**: `packages/events/AGENTS.md`
 - **Backend forms, tables, and detail pages**: `packages/ui/AGENTS.md`
 - **Integration marketplace tabs, settings, and logs**: `packages/core/src/modules/integrations/AGENTS.md`
-- **Webhook spec and phase tracking**: `.ai/specs/SPEC-057-2026-03-04-webhooks-module.md`
+- **Webhook spec and phase tracking**: `.ai/specs/implemented/SPEC-057-2026-03-04-webhooks-module.md`

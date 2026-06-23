@@ -8,12 +8,14 @@ import { DataTable } from '@open-mercato/ui/backend/DataTable'
 import type { ColumnDef } from '@tanstack/react-table'
 import { Button } from '@open-mercato/ui/primitives/button'
 import { RowActions } from '@open-mercato/ui/backend/RowActions'
-import { apiCall } from '@open-mercato/ui/backend/utils/apiCall'
+import { apiCall, withScopedApiRequestHeaders } from '@open-mercato/ui/backend/utils/apiCall'
+import { buildOptimisticLockHeader } from '@open-mercato/ui/backend/utils/optimisticLock'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
 import type { FilterDef, FilterValues } from '@open-mercato/ui/backend/FilterBar'
 import { useConfirmDialog } from '@open-mercato/ui/backend/confirm-dialog'
+import { ListEmptyState } from '@open-mercato/ui/backend/filters/ListEmptyState'
 
 type RuleSet = {
   id: string
@@ -83,9 +85,13 @@ export default function RuleSetsListPage() {
     })
     if (!confirmed) return
 
-    const result = await apiCall(`/api/business_rules/sets?id=${id}`, {
-      method: 'DELETE',
-    })
+    const record = (data || []).find((item) => item.id === id)
+    const result = await withScopedApiRequestHeaders(
+      buildOptimisticLockHeader(record?.updatedAt),
+      () => apiCall(`/api/business_rules/sets?id=${id}`, {
+        method: 'DELETE',
+      }),
+    )
 
     if (result.ok) {
       flash(t('business_rules.sets.messages.deleted'), 'success')
@@ -96,14 +102,18 @@ export default function RuleSetsListPage() {
   }
 
   const handleToggleEnabled = async (id: string, currentEnabled: boolean) => {
-    const result = await apiCall('/api/business_rules/sets', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        id,
-        enabled: !currentEnabled,
+    const record = (data || []).find((item) => item.id === id)
+    const result = await withScopedApiRequestHeaders(
+      buildOptimisticLockHeader(record?.updatedAt),
+      () => apiCall('/api/business_rules/sets', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id,
+          enabled: !currentEnabled,
+        }),
       }),
-    })
+    )
 
     if (result.ok) {
       flash(t('business_rules.sets.messages.updated'), 'success')
@@ -154,7 +164,7 @@ export default function RuleSetsListPage() {
       cell: ({ row }) => (
         <Link
           href={`/backend/sets/${row.original.id}`}
-          className="font-mono text-sm text-blue-600 hover:text-blue-800 hover:underline"
+          className="font-mono text-sm text-primary hover:underline"
         >
           {row.original.setId}
         </Link>
@@ -184,8 +194,8 @@ export default function RuleSetsListPage() {
           onClick={() => handleToggleEnabled(row.original.id, row.original.enabled)}
           className={`inline-flex items-center px-2 py-1 rounded text-xs font-medium cursor-pointer ${
             row.original.enabled
-              ? 'bg-green-100 text-green-800 hover:bg-green-200 dark:bg-green-900 dark:text-green-300 dark:hover:bg-green-800'
-              : 'bg-muted text-muted-foreground hover:bg-muted/80'
+              ? 'bg-status-success-bg text-status-success-text hover:bg-status-success-bg/80'
+              : 'bg-muted text-muted-foreground hover:bg-muted/50'
           }`}
           title={t('business_rules.sets.actions.toggleEnabled')}
         >
@@ -241,6 +251,13 @@ export default function RuleSetsListPage() {
           onFiltersClear={handleFiltersClear}
           isLoading={isLoading}
           error={error ? t('business_rules.sets.messages.loadFailed') : undefined}
+          emptyState={(
+            <ListEmptyState
+              entityName={t('business_rules.sets.list.title')}
+              createHref="/backend/sets/create"
+              createLabel={t('business_rules.sets.actions.create')}
+            />
+          )}
           pagination={{ page, pageSize, total, totalPages, onPageChange: setPage }}
         />
       </PageBody>

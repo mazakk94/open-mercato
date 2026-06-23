@@ -1,4 +1,5 @@
-import { Entity, Index, OptionalProps, PrimaryKey, Property, Unique } from '@mikro-orm/core'
+import { OptionalProps } from '@mikro-orm/core'
+import { Entity, Index, PrimaryKey, Property, Unique } from '@mikro-orm/decorators/legacy'
 import { resolveDefaultAttachmentOcrEnabled } from '../lib/ocrConfig'
 
 @Entity({ tableName: 'attachment_partitions' })
@@ -32,6 +33,13 @@ export class AttachmentPartition {
 
   @Property({ name: 'ocr_model', type: 'text', nullable: true })
   ocrModel?: string | null
+
+  @Property({ name: 'organization_id', type: 'uuid', nullable: true })
+  organizationId?: string | null
+
+  @Property({ name: 'tenant_id', type: 'uuid', nullable: true })
+  @Index({ name: 'attachment_partitions_tenant_idx' })
+  tenantId?: string | null
 
   @Property({ name: 'created_at', type: Date, onCreate: () => new Date() })
   createdAt: Date = new Date()

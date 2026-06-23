@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { z } from 'zod'
 import type { EntityManager } from '@mikro-orm/postgresql'
 import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
+import { getSecurityEmailBaseUrl, mapSecurityEmailUrlError } from '@open-mercato/shared/lib/url'
 import { loadDictionary } from '@open-mercato/shared/lib/i18n/server'
 import { defaultLocale, locales, type Locale } from '@open-mercato/shared/lib/i18n/config'
 import { createFallbackTranslator } from '@open-mercato/shared/lib/i18n/translate'
@@ -14,11 +15,19 @@ import { User } from '@open-mercato/core/modules/auth/data/entities'
 import type { OpenApiMethodDoc, OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
 import { formatPasswordRequirements, getPasswordPolicy } from '@open-mercato/shared/lib/auth/passwordPolicy'
 import { parseBooleanToken } from '@open-mercato/shared/lib/boolean'
+import { readEndpointRateLimitConfig } from '@open-mercato/shared/lib/ratelimit/config'
+import { rateLimitErrorSchema } from '@open-mercato/shared/lib/ratelimit/helpers'
 
 export const metadata = {
   path: '/onboarding/onboarding',
   POST: {
     requireAuth: false,
+    rateLimit: readEndpointRateLimitConfig('ONBOARDING', {
+      points: 10,
+      duration: 60,
+      blockDuration: 60,
+      keyPrefix: 'onboarding',
+    }),
   },
 }
 
@@ -124,8 +133,17 @@ export async function POST(req: Request) {
       throw err
     }
 
-    const url = new URL(req.url)
-    const baseUrl = process.env.APP_URL || `${url.protocol}//${url.host}`
+    let baseUrl: string
+    try {
+      baseUrl = getSecurityEmailBaseUrl(req)
+    } catch (error) {
+      const mapped = mapSecurityEmailUrlError(error, {
+        scope: 'onboarding.start',
+        configMessage: 'Self-service onboarding is not configured.',
+      })
+      if (mapped) return NextResponse.json({ ok: false, error: mapped.body.error }, { status: mapped.status })
+      throw error
+    }
     const verifyUrl = `${baseUrl}/api/onboarding/onboarding/verify?token=${token}`
 
     const firstName = request.firstName || parsed.data.firstName
@@ -232,6 +250,7 @@ const onboardingPostDoc: OpenApiMethodDoc = {
     { status: 400, description: 'Validation failed', schema: onboardingErrorSchema },
     { status: 404, description: 'Self-service onboarding disabled', schema: onboardingErrorSchema },
     { status: 409, description: 'Existing account or pending request', schema: onboardingErrorSchema },
+    { status: 429, description: 'Too many onboarding submissions from this IP', schema: rateLimitErrorSchema },
     { status: 500, description: 'Unexpected server error', schema: onboardingErrorSchema },
   ],
 }

@@ -8,13 +8,20 @@ import { Badge } from '@open-mercato/ui/primitives/badge'
 import { Button } from '@open-mercato/ui/primitives/button'
 import { Switch } from '@open-mercato/ui/primitives/switch'
 import { Input } from '@open-mercato/ui/primitives/input'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@open-mercato/ui/primitives/select'
 import { Spinner } from '@open-mercato/ui/primitives/spinner'
-import { apiCall } from '@open-mercato/ui/backend/utils/apiCall'
+import { apiCall, withScopedApiRequestHeaders } from '@open-mercato/ui/backend/utils/apiCall'
+import { buildOptimisticLockHeader } from '@open-mercato/ui/backend/utils/optimisticLock'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
 import type { CredentialFieldType, IntegrationCredentialField } from '@open-mercato/shared/modules/integrations/types'
-import { LoadingMessage } from '@open-mercato/ui/backend/detail'
-import { ErrorMessage } from '@open-mercato/ui/backend/detail'
+import { LoadingMessage, ErrorMessage, RecordNotFoundState } from '@open-mercato/ui/backend/detail'
 
 type CredentialField = IntegrationCredentialField
 
@@ -76,6 +83,7 @@ export default function BundleConfigPage({ params }: BundleConfigPageProps) {
   const [detail, setDetail] = React.useState<BundleDetail | null>(null)
   const [isLoading, setIsLoading] = React.useState(true)
   const [error, setError] = React.useState<string | null>(null)
+  const [isNotFound, setIsNotFound] = React.useState(false)
   const [credValues, setCredValues] = React.useState<Record<string, unknown>>({})
   const [isSavingCreds, setIsSavingCreds] = React.useState(false)
   const [togglingIds, setTogglingIds] = React.useState<Set<string>>(new Set())
@@ -97,13 +105,18 @@ export default function BundleConfigPage({ params }: BundleConfigPageProps) {
     }
     setIsLoading(true)
     setError(null)
+    setIsNotFound(false)
     const call = await apiCall<BundleDetail>(
       `/api/integrations/${encodeURIComponent(currentBundleId)}`,
       undefined,
       { fallback: null },
     )
     if (!call.ok || !call.result) {
-      setError(t('integrations.detail.loadError'))
+      if (call.status === 404) {
+        setIsNotFound(true)
+      } else {
+        setError(t('integrations.detail.loadError'))
+      }
       setIsLoading(false)
       return
     }
@@ -115,7 +128,15 @@ export default function BundleConfigPage({ params }: BundleConfigPageProps) {
       { fallback: null },
     )
     if (credCall.ok && credCall.result?.credentials) {
-      setCredValues(credCall.result.credentials)
+      const next = { ...credCall.result.credentials }
+      if (currentBundleId === 'storage_s3') {
+        const authMode = next.authMode
+        if (authMode !== 'access_keys' && authMode !== 'ambient') {
+          const hasKeys = Boolean(next.accessKeyId || next.secretAccessKey)
+          next.authMode = hasKeys ? 'access_keys' : 'ambient'
+        }
+      }
+      setCredValues(next)
     }
     setIsLoading(false)
   }, [resolveCurrentBundleId, t])
@@ -126,11 +147,15 @@ export default function BundleConfigPage({ params }: BundleConfigPageProps) {
     const currentBundleId = resolveCurrentBundleId()
     if (!currentBundleId) return
     setIsSavingCreds(true)
-    const call = await apiCall(`/api/integrations/${encodeURIComponent(currentBundleId)}/credentials`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ credentials: credValues }),
-    }, { fallback: null })
+    // TODO(#2373-B): thread updatedAt — integration detail/state response does not expose a record version yet
+    const call = await withScopedApiRequestHeaders(
+      buildOptimisticLockHeader(undefined),
+      () => apiCall(`/api/integrations/${encodeURIComponent(currentBundleId)}/credentials`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ credentials: credValues }),
+      }, { fallback: null }),
+    )
     if (call.ok) {
       flash(t('integrations.detail.credentials.saved'), 'success')
     } else {
@@ -141,11 +166,15 @@ export default function BundleConfigPage({ params }: BundleConfigPageProps) {
 
   const handleToggle = React.useCallback(async (integrationId: string, enabled: boolean) => {
     setTogglingIds((prev) => new Set(prev).add(integrationId))
-    const call = await apiCall(`/api/integrations/${encodeURIComponent(integrationId)}/state`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ isEnabled: enabled }),
-    }, { fallback: null })
+    // TODO(#2373-B): thread updatedAt — integration detail/state response does not expose a record version yet
+    const call = await withScopedApiRequestHeaders(
+      buildOptimisticLockHeader(undefined),
+      () => apiCall(`/api/integrations/${encodeURIComponent(integrationId)}/state`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ isEnabled: enabled }),
+      }, { fallback: null }),
+    )
     if (call.ok) {
       setDetail((prev) => {
         if (!prev) return prev
@@ -169,9 +198,27 @@ export default function BundleConfigPage({ params }: BundleConfigPageProps) {
   }, [detail, handleToggle])
 
   if (isLoading) return <Page><PageBody><LoadingMessage label={t('integrations.bundle.title')} /></PageBody></Page>
+  if (isNotFound) {
+    return (
+      <Page>
+        <PageBody>
+          <RecordNotFoundState
+            label={t('integrations.detail.notFound', 'Integration not found.')}
+            backHref="/backend/integrations"
+            backLabel={t('integrations.detail.backToList', 'Back to integrations')}
+          />
+        </PageBody>
+      </Page>
+    )
+  }
   if (error || !detail?.bundle) return <Page><PageBody><ErrorMessage label={error ?? t('integrations.detail.loadError')} /></PageBody></Page>
 
   const credFields = (detail.bundle.credentials?.fields ?? []).filter(isEditableCredentialField)
+
+  function isFieldVisible(field: CredentialField): boolean {
+    if (!field.visibleWhen) return true
+    return credValues[field.visibleWhen.field] === field.visibleWhen.equals
+  }
 
   return (
     <Page>
@@ -195,22 +242,25 @@ export default function BundleConfigPage({ params }: BundleConfigPageProps) {
               <CardTitle>{t('integrations.bundle.sharedCredentials')}</CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
-              {credFields.map((field) => (
+              {credFields.filter(isFieldVisible).map((field) => (
                 <div key={field.key} className="space-y-1.5">
                   <label className="text-sm font-medium">
                     {field.label}{field.required && <span className="text-red-500 ml-0.5">*</span>}
                   </label>
                   {field.type === 'select' && field.options ? (
-                    <select
-                      className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm"
-                      value={(credValues[field.key] as string) ?? ''}
-                      onChange={(e) => setCredValues((prev) => ({ ...prev, [field.key]: e.target.value }))}
+                    <Select
+                      value={(credValues[field.key] as string) || undefined}
+                      onValueChange={(value) => setCredValues((prev) => ({ ...prev, [field.key]: value ?? '' }))}
                     >
-                      <option value="">—</option>
-                      {field.options.map((opt) => (
-                        <option key={opt.value} value={opt.value}>{opt.label}</option>
-                      ))}
-                    </select>
+                      <SelectTrigger>
+                        <SelectValue placeholder="—" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {field.options.map((opt) => (
+                          <SelectItem key={opt.value} value={opt.value}>{opt.label}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
                   ) : field.type === 'boolean' ? (
                     <Switch
                       checked={Boolean(credValues[field.key])}

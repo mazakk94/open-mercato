@@ -20,6 +20,8 @@ const events = [
   { id: 'customers.deal.created', label: 'Deal Created', entity: 'deal', category: 'crud' },
   { id: 'customers.deal.updated', label: 'Deal Updated', entity: 'deal', category: 'crud' },
   { id: 'customers.deal.deleted', label: 'Deal Deleted', entity: 'deal', category: 'crud' },
+  { id: 'customers.deal.won', label: 'Deal Won', entity: 'deal', category: 'lifecycle' },
+  { id: 'customers.deal.lost', label: 'Deal Lost', entity: 'deal', category: 'lifecycle' },
 
   // Comments
   { id: 'customers.comment.created', label: 'Comment Created', entity: 'comment', category: 'crud' },
@@ -63,6 +65,30 @@ const events = [
   { id: 'customers.lead.status_changed', label: 'Lead Status Changed', entity: 'lead', category: 'lifecycle' },
   { id: 'customers.lead.converted', label: 'Lead Converted', entity: 'lead', category: 'lifecycle' },
   { id: 'customers.lead.deleted', label: 'Lead Deleted', entity: 'lead', category: 'crud' },
+
+  // Entity Roles
+  { id: 'customers.entity_role.created', label: 'Entity Role Created', entity: 'entity_role', category: 'crud' },
+  { id: 'customers.entity_role.updated', label: 'Entity Role Updated', entity: 'entity_role', category: 'crud' },
+  { id: 'customers.entity_role.deleted', label: 'Entity Role Deleted', entity: 'entity_role', category: 'crud' },
+
+  // Labels
+  { id: 'customers.label.created', label: 'Label Created', entity: 'label', category: 'crud' },
+  { id: 'customers.label.updated', label: 'Label Updated', entity: 'label', category: 'crud' },
+  { id: 'customers.label.deleted', label: 'Label Deleted', entity: 'label', category: 'crud' },
+
+  // Label Assignments
+  { id: 'customers.label_assignment.created', label: 'Label Assigned', entity: 'label_assignment', category: 'crud' },
+  { id: 'customers.label_assignment.updated', label: 'Label Assignment Updated', entity: 'label_assignment', category: 'crud' },
+  { id: 'customers.label_assignment.deleted', label: 'Label Unassigned', entity: 'label_assignment', category: 'crud' },
+
+  // Person-Company Links
+  { id: 'customers.person_company_link.created', label: 'Person Linked To Company', entity: 'person_company_link', category: 'crud', clientBroadcast: true },
+  { id: 'customers.person_company_link.updated', label: 'Person-Company Link Updated', entity: 'person_company_link', category: 'crud', clientBroadcast: true },
+  { id: 'customers.person_company_link.deleted', label: 'Person Unlinked From Company', entity: 'person_company_link', category: 'crud', clientBroadcast: true },
+
+  // ── Email integration (2026-05-27) ────────────────────────────────────────
+  { id: 'customers.email.linked', label: 'Email Linked To Person', entity: 'email_link', category: 'lifecycle', clientBroadcast: true },
+  { id: 'customers.email.visibility_changed', label: 'Email Visibility Changed', entity: 'email_link', category: 'lifecycle', clientBroadcast: true },
 ] as const
 
 export const eventsConfig = createModuleEvents({

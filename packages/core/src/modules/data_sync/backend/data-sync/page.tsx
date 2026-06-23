@@ -12,11 +12,19 @@ import { Card, CardContent, CardHeader, CardTitle } from '@open-mercato/ui/primi
 import { Button } from '@open-mercato/ui/primitives/button'
 import { Input } from '@open-mercato/ui/primitives/input'
 import { Label } from '@open-mercato/ui/primitives/label'
-import { Notice } from '@open-mercato/ui/primitives/Notice'
+import { Alert, AlertDescription } from '@open-mercato/ui/primitives/alert'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@open-mercato/ui/primitives/select'
 import { Separator } from '@open-mercato/ui/primitives/separator'
 import { Switch } from '@open-mercato/ui/primitives/switch'
 import { RowActions } from '@open-mercato/ui/backend/RowActions'
-import { apiCall } from '@open-mercato/ui/backend/utils/apiCall'
+import { apiCall, withScopedApiRequestHeaders } from '@open-mercato/ui/backend/utils/apiCall'
+import { buildOptimisticLockHeader } from '@open-mercato/ui/backend/utils/optimisticLock'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
 import { useOrganizationScopeVersion } from '@open-mercato/shared/lib/frontend/useOrganizationScope'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
@@ -24,7 +32,6 @@ import {
   ArrowRightLeft,
   Boxes,
   CalendarClock,
-  CircleAlert,
   Clock3,
   Gauge,
   Play,
@@ -59,6 +66,8 @@ type SyncOption = {
   description?: string | null
   providerKey?: string | null
   direction: 'import' | 'export' | 'bidirectional'
+  runMode?: 'generic' | 'provider'
+  canStartRun?: boolean
   supportedEntities: string[]
   hasCredentials: boolean
   isEnabled: boolean
@@ -80,6 +89,7 @@ type SyncScheduleRecord = {
   fullSync: boolean
   isEnabled: boolean
   lastRunAt: string | null
+  updatedAt?: string | null
 }
 
 type SyncSchedulesResponse = {
@@ -94,6 +104,7 @@ type SyncScheduleEditorState = {
   fullSync: boolean
   isEnabled: boolean
   lastRunAt: string | null
+  updatedAt?: string | null
 }
 
 const STATUS_STYLES: Record<string, string> = {
@@ -143,7 +154,7 @@ function getSummaryBadgeStyle(kind: 'enabled' | 'disabled' | 'ready' | 'missing'
 
   return {
     variant: 'outline',
-    className: 'border-muted-foreground/20 bg-muted/40 text-muted-foreground',
+    className: 'border-muted-foreground/20 bg-muted/50 text-muted-foreground',
   }
 }
 
@@ -163,6 +174,7 @@ function buildDefaultScheduleState(entityType: string): SyncScheduleEditorState 
     fullSync: normalized !== 'products',
     isEnabled: true,
     lastRunAt: null,
+    updatedAt: null,
   }
 }
 
@@ -320,6 +332,7 @@ export default function SyncRunsDashboardPage() {
         fullSync: record.fullSync,
         isEnabled: record.isEnabled,
         lastRunAt: record.lastRunAt,
+        updatedAt: record.updatedAt ?? null,
       })
       setIsLoadingSchedule(false)
     }
@@ -333,6 +346,7 @@ export default function SyncRunsDashboardPage() {
   }, [])
 
   const handleCancel = React.useCallback(async (row: SyncRunRow) => {
+    // optimistic-lock-exempt: run lifecycle action endpoint (cancel), not a concurrent record edit
     const call = await apiCall(`/api/data_sync/runs/${encodeURIComponent(row.id)}/cancel`, {
       method: 'POST',
     }, { fallback: null })
@@ -345,6 +359,7 @@ export default function SyncRunsDashboardPage() {
   }, [t])
 
   const handleRetry = React.useCallback(async (row: SyncRunRow) => {
+    // optimistic-lock-exempt: run lifecycle action endpoint (retry), not a concurrent record edit
     const call = await apiCall(`/api/data_sync/runs/${encodeURIComponent(row.id)}/retry`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -383,6 +398,7 @@ export default function SyncRunsDashboardPage() {
 
     try {
       const call = await runMutation({
+        // optimistic-lock-exempt: starts a new sync run (create), not a concurrent record edit
         operation: () => apiCall<{ id: string }>('/api/data_sync/run', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -432,6 +448,7 @@ export default function SyncRunsDashboardPage() {
     setIsSavingSchedule(true)
     try {
       const call = await runMutation({
+        // optimistic-lock-exempt: keyed upsert (POST, no record id/version in body) — guard targets id-addressed PUT/PATCH/DELETE
         operation: () => apiCall<SyncScheduleRecord>('/api/data_sync/schedules', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -476,6 +493,7 @@ export default function SyncRunsDashboardPage() {
         fullSync: call.result.fullSync,
         isEnabled: call.result.isEnabled,
         lastRunAt: call.result.lastRunAt,
+        updatedAt: call.result.updatedAt ?? null,
       })
       flash(t('data_sync.dashboard.schedule.success', 'Recurring schedule saved'), 'success')
     } catch (error) {
@@ -492,9 +510,12 @@ export default function SyncRunsDashboardPage() {
     setIsDeletingSchedule(true)
     try {
       const call = await runMutation({
-        operation: () => apiCall(`/api/data_sync/schedules/${encodeURIComponent(scheduleEditor.id as string)}`, {
-          method: 'DELETE',
-        }, { fallback: null }),
+        operation: () => withScopedApiRequestHeaders(
+          buildOptimisticLockHeader(scheduleEditor.updatedAt),
+          () => apiCall(`/api/data_sync/schedules/${encodeURIComponent(scheduleEditor.id as string)}`, {
+            method: 'DELETE',
+          }, { fallback: null }),
+        ),
         mutationPayload: {
           scheduleId: scheduleEditor.id,
         },
@@ -517,7 +538,7 @@ export default function SyncRunsDashboardPage() {
     } finally {
       setIsDeletingSchedule(false)
     }
-  }, [runMutation, scheduleEditor.id, selectedEntityType, t])
+  }, [runMutation, scheduleEditor.id, scheduleEditor.updatedAt, selectedEntityType, t])
 
   const filters: FilterDef[] = [
     {
@@ -596,6 +617,7 @@ export default function SyncRunsDashboardPage() {
     selectedIntegration
     && selectedEntityType
     && selectedIntegration.isEnabled
+    && selectedIntegration.canStartRun !== false
     && selectedIntegration.hasCredentials,
   )
   const hasSavedSchedule = Boolean(scheduleEditor.id)
@@ -615,7 +637,7 @@ export default function SyncRunsDashboardPage() {
           <CardHeader className="space-y-4">
             <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
               <div className="space-y-2">
-                <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-[0.14em] text-muted-foreground">
+                <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-widest text-muted-foreground">
                   <Repeat className="size-4" />
                   <span>{t('data_sync.dashboard.start.eyebrow', 'Run once or keep it recurring')}</span>
                 </div>
@@ -676,56 +698,71 @@ export default function SyncRunsDashboardPage() {
                   <PlugZap className="size-4 text-muted-foreground" />
                   <span>{t('data_sync.dashboard.columns.integration')}</span>
                 </Label>
-                <select
-                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                  value={selectedIntegrationId}
-                  onChange={(event) => setSelectedIntegrationId(event.target.value)}
+                <Select
+                  value={selectedIntegrationId || undefined}
+                  onValueChange={(value) => setSelectedIntegrationId(value ?? '')}
                   disabled={isLoadingOptions || options.length === 0}
                 >
-                  {options.length === 0 ? (
-                    <option value="">{t('integrations.marketplace.noResults', 'No integrations found')}</option>
-                  ) : null}
-                  {options.map((item) => (
-                    <option key={item.integrationId} value={item.integrationId}>
-                      {item.title}
-                    </option>
-                  ))}
-                </select>
+                  <SelectTrigger size="lg">
+                    <SelectValue
+                      placeholder={
+                        options.length === 0
+                          ? t('integrations.marketplace.noResults', 'No integrations found')
+                          : undefined
+                      }
+                    />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {options.map((item) => (
+                      <SelectItem key={item.integrationId} value={item.integrationId}>
+                        {item.title}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
               </div>
               <div className="space-y-2">
                 <Label className="flex items-center gap-2 text-sm font-medium">
                   <Boxes className="size-4 text-muted-foreground" />
                   <span>{t('data_sync.dashboard.columns.entityType')}</span>
                 </Label>
-                <select
-                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                  value={selectedEntityType}
-                  onChange={(event) => setSelectedEntityType(event.target.value)}
+                <Select
+                  value={selectedEntityType || undefined}
+                  onValueChange={(value) => setSelectedEntityType(value ?? '')}
                   disabled={entityOptions.length === 0}
                 >
-                  {entityOptions.map((entityType) => (
-                    <option key={entityType} value={entityType}>
-                      {formatEntityTypeLabel(entityType)}
-                    </option>
-                  ))}
-                </select>
+                  <SelectTrigger size="lg">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {entityOptions.map((entityType) => (
+                      <SelectItem key={entityType} value={entityType}>
+                        {formatEntityTypeLabel(entityType)}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
               </div>
               <div className="space-y-2">
                 <Label className="flex items-center gap-2 text-sm font-medium">
                   <ArrowRightLeft className="size-4 text-muted-foreground" />
                   <span>{t('data_sync.dashboard.columns.direction')}</span>
                 </Label>
-                <select
-                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                <Select
                   value={selectedDirection}
-                  onChange={(event) => setSelectedDirection(event.target.value === 'export' ? 'export' : 'import')}
+                  onValueChange={(value) => setSelectedDirection(value === 'export' ? 'export' : 'import')}
                   disabled={selectedIntegration?.direction !== 'bidirectional'}
                 >
-                  <option value="import">{t('data_sync.dashboard.direction.import')}</option>
-                  {(selectedIntegration?.direction === 'bidirectional' || selectedIntegration?.direction === 'export') ? (
-                    <option value="export">{t('data_sync.dashboard.direction.export')}</option>
-                  ) : null}
-                </select>
+                  <SelectTrigger size="lg">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="import">{t('data_sync.dashboard.direction.import')}</SelectItem>
+                    {(selectedIntegration?.direction === 'bidirectional' || selectedIntegration?.direction === 'export') ? (
+                      <SelectItem value="export">{t('data_sync.dashboard.direction.export')}</SelectItem>
+                    ) : null}
+                  </SelectContent>
+                </Select>
               </div>
             </div>
 
@@ -734,7 +771,7 @@ export default function SyncRunsDashboardPage() {
             ) : null}
 
             <div className="grid gap-4 xl:grid-cols-2">
-              <div className="rounded-xl border bg-muted/20 p-4">
+              <div className="rounded-xl border bg-muted/30 p-4">
                 <div className="flex items-start justify-between gap-3">
                   <div className="space-y-1">
                     <div className="flex items-center gap-2">
@@ -790,7 +827,7 @@ export default function SyncRunsDashboardPage() {
                 </div>
               </div>
 
-              <div className="rounded-xl border bg-muted/20 p-4">
+              <div className="rounded-xl border bg-muted/30 p-4">
                 <div className="flex items-start justify-between gap-3">
                   <div className="space-y-1">
                     <div className="flex items-center gap-2">
@@ -818,17 +855,21 @@ export default function SyncRunsDashboardPage() {
                       <Clock3 className="size-4 text-muted-foreground" />
                       <span>{t('data_sync.dashboard.schedule.type', 'Schedule type')}</span>
                     </Label>
-                    <select
-                      className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                    <Select
                       value={scheduleEditor.scheduleType}
-                      onChange={(event) => updateScheduleEditor({
-                        scheduleType: event.target.value === 'cron' ? 'cron' : 'interval',
+                      onValueChange={(value) => updateScheduleEditor({
+                        scheduleType: value === 'cron' ? 'cron' : 'interval',
                       })}
                       disabled={isLoadingSchedule || isSavingSchedule || isDeletingSchedule || !selectedIntegration || !selectedEntityType}
                     >
-                      <option value="interval">{t('data_sync.dashboard.schedule.interval', 'Interval')}</option>
-                      <option value="cron">{t('data_sync.dashboard.schedule.cron', 'Cron')}</option>
-                    </select>
+                      <SelectTrigger size="lg">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="interval">{t('data_sync.dashboard.schedule.interval', 'Interval')}</SelectItem>
+                        <SelectItem value="cron">{t('data_sync.dashboard.schedule.cron', 'Cron')}</SelectItem>
+                      </SelectContent>
+                    </Select>
                   </div>
                   <div className="space-y-2">
                     <Label className="flex items-center gap-2 text-sm font-medium">
@@ -937,25 +978,31 @@ export default function SyncRunsDashboardPage() {
             </div>
 
             {selectedIntegration && !selectedIntegration.isEnabled ? (
-              <Notice compact variant="warning">
-                <span className="inline-flex items-center gap-2">
-                  <CircleAlert className="size-4" />
-                  <span>{t('integrations.detail.state.disabled', 'This integration is disabled. Enable it on the integration settings page before starting a sync.')}</span>
-                </span>
-              </Notice>
+              <Alert variant="warning">
+                <AlertDescription>
+                  {t('integrations.detail.state.disabled', 'This integration is disabled. Enable it on the integration settings page before starting a sync.')}
+                </AlertDescription>
+              </Alert>
             ) : null}
             {selectedIntegration && !selectedIntegration.hasCredentials ? (
-              <Notice compact variant="warning">
-                <span className="inline-flex items-center gap-2">
-                  <CircleAlert className="size-4" />
-                  <span>{t('integrations.detail.credentials.notConfigured', 'Credentials are not configured yet. Save the integration credentials before starting a sync.')}</span>
-                </span>
-              </Notice>
+              <Alert variant="warning">
+                <AlertDescription>
+                  {t('integrations.detail.credentials.notConfigured', 'Credentials are not configured yet. Save the integration credentials before starting a sync.')}
+                </AlertDescription>
+              </Alert>
+            ) : null}
+            {selectedIntegration && selectedIntegration.canStartRun === false ? (
+              <Alert variant="info">
+                <AlertDescription>
+                  {t('data_sync.dashboard.start.providerManaged', 'This integration starts sync runs from its own setup flow. Open the integration settings page to continue.')}
+                </AlertDescription>
+              </Alert>
             ) : null}
           </CardContent>
         </Card>
 
         <DataTable
+          stickyActionsColumn
           title={t('data_sync.dashboard.title')}
           columns={columns}
           data={rows}

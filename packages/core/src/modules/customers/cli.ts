@@ -2,6 +2,7 @@ import type { ModuleCli } from '@open-mercato/shared/modules/registry'
 import { createRequestContainer, type AppContainer } from '@open-mercato/shared/lib/di/container'
 import { randomUUID } from 'crypto'
 import type { EntityManager } from '@mikro-orm/postgresql'
+import { type Kysely, sql } from 'kysely'
 import { Dictionary, DictionaryEntry, type DictionaryManagerVisibility } from '@open-mercato/core/modules/dictionaries/data/entities'
 import { installCustomEntitiesFromModules } from '@open-mercato/core/modules/entities/lib/install-from-ce'
 import type { CacheStrategy } from '@open-mercato/cache/types'
@@ -27,6 +28,7 @@ import {
   CustomerTodoLink,
   CustomerPipeline,
   CustomerPipelineStage,
+  CustomerTag,
 } from './data/entities'
 import { ensureDictionaryEntry } from './commands/shared'
 import { recomputeNextInteraction } from './lib/interactionProjection'
@@ -51,7 +53,7 @@ type DictionaryDefault = {
 type CustomFieldValuesPayload = Parameters<DataEngine['setCustomFields']>[0]['values']
 type ProgressBarHandle = ReturnType<typeof createProgressBar>
 
-const DEAL_STATUS_DEFAULTS: DictionaryDefault[] = [
+export const DEAL_STATUS_DEFAULTS: DictionaryDefault[] = [
   { value: 'open', label: 'Open', color: '#2563eb', icon: 'lucide:circle' },
   { value: 'closed', label: 'Closed', color: '#6b7280', icon: 'lucide:check-circle' },
   { value: 'win', label: 'Win', color: '#22c55e', icon: 'lucide:trophy' },
@@ -59,7 +61,7 @@ const DEAL_STATUS_DEFAULTS: DictionaryDefault[] = [
   { value: 'in_progress', label: 'In progress', color: '#f59e0b', icon: 'lucide:activity' },
 ]
 
-const PIPELINE_STAGE_DEFAULTS: DictionaryDefault[] = [
+export const PIPELINE_STAGE_DEFAULTS: DictionaryDefault[] = [
   { value: 'opportunity', label: 'Opportunity', color: '#38bdf8', icon: 'lucide:target' },
   { value: 'marketing_qualified_lead', label: 'Marketing Qualified Lead', color: '#a855f7', icon: 'lucide:sparkles' },
   { value: 'sales_qualified_lead', label: 'Sales Qualified Lead', color: '#f97316', icon: 'lucide:users' },
@@ -70,27 +72,34 @@ const PIPELINE_STAGE_DEFAULTS: DictionaryDefault[] = [
   { value: 'stalled', label: 'Stalled', color: '#6b7280', icon: 'lucide:alert-circle' },
 ]
 
-const ENTITY_STATUS_DEFAULTS: DictionaryDefault[] = [
-  { value: 'customer', label: 'Customer', color: '#16a34a', icon: 'lucide:handshake' },
-  { value: 'active', label: 'Active', color: '#2563eb', icon: 'lucide:user-check' },
-  { value: 'prospect', label: 'Prospect', color: '#f59e0b', icon: 'lucide:target' },
-  { value: 'inactive', label: 'Inactive', color: '#6b7280', icon: 'lucide:archive' },
+export const ENTITY_STATUS_DEFAULTS: DictionaryDefault[] = [
+  { value: 'active', label: 'Active', color: '#22c55e', icon: 'lucide:user-check' },
+  { value: 'inactive', label: 'Inactive', color: '#94a3b8', icon: 'lucide:pause-circle' },
+  { value: 'pending', label: 'Pending', color: '#f59e0b', icon: 'lucide:clock' },
+  { value: 'archived', label: 'Archived', color: '#64748b', icon: 'lucide:archive' },
 ]
 
-const ENTITY_LIFECYCLE_STAGE_DEFAULTS: DictionaryDefault[] = [
-  { value: 'prospect', label: 'Prospect', color: '#f59e0b', icon: 'lucide:sparkles' },
-  { value: 'evaluation', label: 'Evaluation', color: '#a855f7', icon: 'lucide:clipboard-list' },
+export const ENTITY_LIFECYCLE_STAGE_DEFAULTS: DictionaryDefault[] = [
+  { value: 'lead', label: 'Lead', color: '#3b82f6', icon: 'lucide:sparkles' },
+  { value: 'prospect', label: 'Prospect', color: '#8b5cf6', icon: 'lucide:eye' },
   { value: 'customer', label: 'Customer', color: '#22c55e', icon: 'lucide:handshake' },
-  { value: 'expansion', label: 'Expansion', color: '#0ea5e9', icon: 'lucide:trending-up' },
-  { value: 'churned', label: 'Churned', color: '#ef4444', icon: 'lucide:alert-circle' },
+  { value: 'subscriber', label: 'Subscriber', color: '#10b981', icon: 'lucide:bell' },
+  { value: 'churned', label: 'Churned', color: '#ef4444', icon: 'lucide:user-x' },
+  { value: 'other', label: 'Other', color: '#94a3b8', icon: 'lucide:circle' },
 ]
 
-const ENTITY_SOURCE_DEFAULTS: DictionaryDefault[] = [
-  { value: 'partner_referral', label: 'Partner referral', color: '#6366f1', icon: 'lucide:handshake' },
+export const ENTITY_SOURCE_DEFAULTS: DictionaryDefault[] = [
+  { value: 'linkedin', label: 'LinkedIn', color: '#0a66c2', icon: 'lucide:linkedin' },
+  { value: 'email', label: 'Email', color: '#3b82f6', icon: 'lucide:mail' },
+  { value: 'web_form', label: 'Web form', color: '#22c55e', icon: 'lucide:globe' },
+  { value: 'referral', label: 'Referral', color: '#8b5cf6', icon: 'lucide:users' },
   { value: 'customer_referral', label: 'Customer referral', color: '#22c55e', icon: 'lucide:thumbs-up' },
-  { value: 'industry_event', label: 'Industry event', color: '#f97316', icon: 'lucide:calendar' },
-  { value: 'inbound_web', label: 'Inbound web', color: '#0ea5e9', icon: 'lucide:globe' },
-  { value: 'outbound_campaign', label: 'Outbound campaign', color: '#facc15', icon: 'lucide:megaphone' },
+  { value: 'partner_referral', label: 'Partner referral', color: '#3b82f6', icon: 'lucide:handshake' },
+  { value: 'event', label: 'Conference / Event', color: '#f59e0b', icon: 'lucide:calendar' },
+  { value: 'cold_outreach', label: 'Cold outreach', color: '#94a3b8', icon: 'lucide:phone' },
+  { value: 'facebook', label: 'Facebook', color: '#1877f2', icon: 'lucide:facebook' },
+  { value: 'typeform', label: 'Typeform', color: '#262627', icon: 'lucide:file-text' },
+  { value: 'other', label: 'Other', color: '#64748b', icon: 'lucide:circle' },
 ]
 
 const ADDRESS_TYPE_DEFAULTS: DictionaryDefault[] = [
@@ -104,6 +113,7 @@ const ADDRESS_TYPE_DEFAULTS: DictionaryDefault[] = [
 const ACTIVITY_TYPE_DEFAULTS: DictionaryDefault[] = [
   { value: 'call', label: 'Call', color: '#2563eb', icon: 'lucide:phone-call' },
   { value: 'email', label: 'Email', color: '#16a34a', icon: 'lucide:mail' },
+  { value: 'event', label: 'Event', color: '#6366f1', icon: 'lucide:calendar' },
   { value: 'meeting', label: 'Meeting', color: '#f59e0b', icon: 'lucide:users' },
   { value: 'note', label: 'Note', color: '#a855f7', icon: 'lucide:notebook' },
   { value: 'task', label: 'Task', color: '#ef4444', icon: 'lucide:check-square' },
@@ -132,6 +142,40 @@ const INDUSTRY_DEFAULTS: DictionaryDefault[] = [
   { value: 'Hospitality', label: 'Hospitality' },
   { value: 'Energy', label: 'Energy' },
   { value: 'Media', label: 'Media' },
+]
+
+const TEMPERATURE_DEFAULTS: DictionaryDefault[] = [
+  { value: 'hot', label: 'Hot', color: '#ef4444', icon: 'lucide:flame' },
+  { value: 'high', label: 'High', color: '#f59e0b', icon: 'lucide:trending-up' },
+  { value: 'medium', label: 'Medium', color: '#8b5cf6', icon: 'lucide:sparkles' },
+  { value: 'low', label: 'Low', color: '#64748b', icon: 'lucide:clock' },
+  { value: 'cold', label: 'Cold', color: '#94a3b8', icon: 'lucide:snowflake' },
+]
+
+const CUSTOM_TAG_SEED_DEFAULTS = [
+  { value: 'architecture', label: 'architecture' },
+  { value: 'hospitality', label: 'hospitality' },
+  { value: 'retail', label: 'retail' },
+  { value: 'healthcare', label: 'healthcare' },
+  { value: 'tech', label: 'tech' },
+  { value: 'manufacturing', label: 'manufacturing' },
+  { value: 'decision-maker', label: 'decision-maker' },
+  { value: 'influencer', label: 'influencer' },
+  { value: 'end-user', label: 'end-user' },
+  { value: 'blocker', label: 'blocker' },
+  { value: 'vip', label: 'vip' },
+  { value: 'strategic-account', label: 'strategic-account' },
+  { value: 'reference-customer', label: 'reference-customer' },
+  { value: 'case-study-candidate', label: 'case-study-candidate' },
+]
+
+const PERSON_COMPANY_ROLE_DEFAULTS = [
+  { value: 'decision_maker', label: 'Decision maker', color: '#f59e0b', icon: 'lucide:crown' },
+  { value: 'influencer', label: 'Influencer', color: '#8b5cf6', icon: 'lucide:sparkles' },
+  { value: 'budget_holder', label: 'Budget holder', color: '#3b82f6', icon: 'lucide:wallet' },
+  { value: 'technical_evaluator', label: 'Technical evaluator', color: '#22c55e', icon: 'lucide:wrench' },
+  { value: 'primary_contact', label: 'Primary contact', color: '#0ea5e9', icon: 'lucide:star' },
+  { value: 'end_user', label: 'End user', color: '#64748b', icon: 'lucide:user' },
 ]
 
 const PRIORITY_CURRENCIES = ['EUR', 'USD', 'GBP', 'PLN']
@@ -248,7 +292,7 @@ function isoDaysFromNow(days: number, options?: { hour?: number; minute?: number
   return base.toISOString()
 }
 
-const CUSTOMER_EXAMPLES: ExampleCompany[] = [
+export const CUSTOMER_EXAMPLES: ExampleCompany[] = [
   {
     slug: 'brightside-solar',
     displayName: 'Brightside Solar',
@@ -264,7 +308,7 @@ const CUSTOMER_EXAMPLES: ExampleCompany[] = [
     primaryPhone: '+1 415-555-0148',
     source: 'partner_referral',
     lifecycleStage: 'customer',
-    status: 'customer',
+    status: 'active',
     custom: {
       relationship_health: 'healthy',
       renewal_quarter: 'Q3',
@@ -321,7 +365,7 @@ const CUSTOMER_EXAMPLES: ExampleCompany[] = [
         phone: '+1 628-555-0199',
         timezone: 'America/Los_Angeles',
         linkedInUrl: 'https://www.linkedin.com/in/danielcho-energy/',
-        source: 'outbound_campaign',
+        source: 'cold_outreach',
         custom: {
           buying_role: 'economic_buyer',
           preferred_pronouns: 'he/him',
@@ -395,7 +439,7 @@ const CUSTOMER_EXAMPLES: ExampleCompany[] = [
         valueCurrency: 'USD',
         expectedCloseAt: isoDaysFromNow(65),
         probability: 40,
-        source: 'inbound_web',
+        source: 'web_form',
         custom: {
           competitive_risk: 'high',
           implementation_complexity: 'complex',
@@ -470,7 +514,7 @@ const CUSTOMER_EXAMPLES: ExampleCompany[] = [
       'Boston-based analytics platform helping consumer brands optimize merchandising decisions.',
     primaryEmail: 'info@harborviewanalytics.com',
     primaryPhone: '+1 617-555-0024',
-    source: 'industry_event',
+    source: 'event',
     lifecycleStage: 'prospect',
     status: 'active',
     custom: {
@@ -502,7 +546,7 @@ const CUSTOMER_EXAMPLES: ExampleCompany[] = [
         phone: '+1 617-555-0168',
         timezone: 'America/New_York',
         linkedInUrl: 'https://www.linkedin.com/in/arjunpatel-sales/',
-        source: 'industry_event',
+        source: 'event',
         custom: {
           buying_role: 'economic_buyer',
           preferred_pronouns: 'he/him',
@@ -520,7 +564,7 @@ const CUSTOMER_EXAMPLES: ExampleCompany[] = [
         phone: '+1 617-555-0179',
         timezone: 'America/New_York',
         linkedInUrl: 'https://www.linkedin.com/in/lenaortiz-retail/',
-        source: 'industry_event',
+        source: 'event',
         custom: {
           buying_role: 'champion',
           preferred_pronouns: 'she/her',
@@ -539,7 +583,7 @@ const CUSTOMER_EXAMPLES: ExampleCompany[] = [
         valueCurrency: 'USD',
         expectedCloseAt: isoDaysFromNow(-25),
         probability: 100,
-        source: 'industry_event',
+        source: 'event',
         custom: {
           competitive_risk: 'low',
           implementation_complexity: 'standard',
@@ -594,7 +638,7 @@ const CUSTOMER_EXAMPLES: ExampleCompany[] = [
         valueCurrency: 'USD',
         expectedCloseAt: isoDaysFromNow(120),
         probability: 35,
-        source: 'outbound_campaign',
+        source: 'cold_outreach',
         custom: {
           competitive_risk: 'medium',
           implementation_complexity: 'complex',
@@ -672,7 +716,7 @@ const CUSTOMER_EXAMPLES: ExampleCompany[] = [
     primaryPhone: '+1 512-555-0456',
     source: 'customer_referral',
     lifecycleStage: 'customer',
-    status: 'customer',
+    status: 'active',
     custom: {
       relationship_health: 'healthy',
       renewal_quarter: 'Q1',
@@ -1155,6 +1199,59 @@ async function seedCustomerDictionaries(em: EntityManager, { tenantId, organizat
       icon: entry.icon,
     })
   }
+  for (const entry of TEMPERATURE_DEFAULTS) {
+    await ensureDictionaryEntry(em, {
+      tenantId,
+      organizationId,
+      kind: 'temperature',
+      value: entry.value,
+      label: entry.label,
+      color: entry.color,
+      icon: entry.icon,
+    })
+  }
+  // Renewal quarters: current year + 2 future years
+  const currentYear = new Date().getFullYear()
+  for (let year = currentYear; year <= currentYear + 2; year++) {
+    for (const q of [1, 2, 3, 4]) {
+      await ensureDictionaryEntry(em, {
+        tenantId,
+        organizationId,
+        kind: 'renewal_quarter',
+        value: `${year}_q${q}`,
+        label: `Q${q} ${year}`,
+        color: '#94a3b8',
+        icon: 'lucide:calendar',
+      })
+    }
+  }
+  // Uses raw em.find/em.findOne — entities queried here have no encrypted fields as of this commit.
+  // Migrate to findOneWithDecryption / findWithDecryption when any of them gain an @Encrypted column.
+  // Custom tags (free-pool labels)
+  for (const entry of CUSTOM_TAG_SEED_DEFAULTS) {
+    const slug = entry.value
+    const existing = await em.findOne(CustomerTag, {
+      tenantId,
+      organizationId,
+      slug,
+    })
+    if (!existing) {
+      em.persist(em.create(CustomerTag, {
+        tenantId,
+        organizationId,
+        slug,
+        label: entry.label,
+      }))
+    }
+  }
+  await em.flush()
+  for (const entry of PERSON_COMPANY_ROLE_DEFAULTS) {
+    await ensureDictionaryEntry(em, {
+      tenantId, organizationId,
+      kind: 'person_company_role',
+      value: entry.value, label: entry.label, color: entry.color, icon: entry.icon,
+    })
+  }
 }
 
 function resolveCurrencyCodes(): string[] {
@@ -1550,10 +1647,21 @@ async function seedCustomerExamples(
     }
   }
 
+  // Load default pipeline and build a value→stageId lookup so deals appear in the pipeline view
+  const defaultPipeline = await em.findOne(CustomerPipeline, { tenantId, organizationId, isDefault: true })
+  const pipelineStages = defaultPipeline
+    ? await em.find(CustomerPipelineStage, { pipelineId: defaultPipeline.id }, { orderBy: { order: 'ASC' } })
+    : []
+  const stageValueToId = new Map<string, string>()
+  for (let i = 0; i < pipelineStages.length && i < PIPELINE_STAGE_DEFAULTS.length; i++) {
+    stageValueToId.set(PIPELINE_STAGE_DEFAULTS[i].value, pipelineStages[i].id)
+  }
+
   for (const company of CUSTOMER_EXAMPLES) {
     const companyEntity = companyEntities.get(company.slug)
     if (!companyEntity) continue
     for (const dealInfo of company.deals ?? []) {
+      const resolvedStageId = dealInfo.pipelineStage ? stageValueToId.get(dealInfo.pipelineStage) ?? null : null
       const deal = em.create(CustomerDeal, {
         organizationId,
         tenantId,
@@ -1561,6 +1669,8 @@ async function seedCustomerExamples(
         description: dealInfo.description ?? null,
         status: dealInfo.status,
         pipelineStage: dealInfo.pipelineStage ?? null,
+        pipelineId: resolvedStageId ? defaultPipeline!.id : null,
+        pipelineStageId: resolvedStageId,
         valueAmount: toAmount(dealInfo.valueAmount),
         valueCurrency:
           dealInfo.valueCurrency ?? (typeof dealInfo.valueAmount === 'number' ? 'USD' : null),
@@ -1747,12 +1857,18 @@ async function seedCustomerStressTest(
   const assignmentFlushThreshold = includeExtras ? 100 : 0
   const cfInsertBatchSize = 500
   const flushInterval = 100
-  const knex = em.getConnection().getKnex()
-  const entityIndexesColumns = await knex('entity_indexes')
-    .columnInfo()
-    .catch(() => ({} as Record<string, unknown>))
-  const hasColumn = (name: string) =>
-    Object.keys(entityIndexesColumns).some((col) => col.toLowerCase() === name.toLowerCase())
+  const db = em.getKysely<any>() as any
+  const entityIndexesColumnRows = await db
+    .selectFrom('information_schema.columns')
+    .select(['column_name'])
+    .where(sql<boolean>`table_schema = current_schema()`)
+    .where('table_name', '=', 'entity_indexes')
+    .execute()
+    .catch(() => [] as Array<{ column_name: string }>)
+  const entityIndexesColumnSet = new Set<string>(
+    entityIndexesColumnRows.map((row: any) => String(row.column_name).toLowerCase()),
+  )
+  const hasColumn = (name: string) => entityIndexesColumnSet.has(name.toLowerCase())
   const supportsOrgCoalesced = hasColumn('organization_id_coalesced')
 
   type PendingIndexDoc = {
@@ -1884,37 +2000,42 @@ async function seedCustomerStressTest(
       return
     }
     if (supportsOrgCoalesced) {
-      await trx('entity_indexes')
-        .insert(rows)
-        .onConflict(['entity_type', 'entity_id', 'organization_id_coalesced'])
-        .merge({
-          doc: trx.raw('excluded.doc'),
-          index_version: trx.raw('excluded.index_version'),
-          organization_id: trx.raw('excluded.organization_id'),
-          tenant_id: trx.raw('excluded.tenant_id'),
-          deleted_at: trx.raw('excluded.deleted_at'),
-          updated_at: trx.raw('excluded.updated_at'),
-        })
+      await trx
+        .insertInto('entity_indexes')
+        .values(rows.map((row) => ({ ...row, doc: sql`${JSON.stringify(row.doc)}::jsonb` })))
+        .onConflict((oc: any) => oc
+          .columns(['entity_type', 'entity_id', 'organization_id_coalesced'])
+          .doUpdateSet({
+            doc: sql`excluded.doc`,
+            index_version: sql`excluded.index_version`,
+            organization_id: sql`excluded.organization_id`,
+            tenant_id: sql`excluded.tenant_id`,
+            deleted_at: sql`excluded.deleted_at`,
+            updated_at: sql`excluded.updated_at`,
+          }))
+        .execute()
     } else {
       for (const row of rows) {
-        const updatePayload = {
-          doc: row.doc,
-          index_version: row.index_version,
-          organization_id: row.organization_id,
-          tenant_id: row.tenant_id,
-          updated_at: row.updated_at,
-          deleted_at: null as null,
-        }
-        const updated = await trx('entity_indexes')
-          .where({
-            entity_type: row.entity_type,
-            entity_id: row.entity_id,
+        const updated = await trx
+          .updateTable('entity_indexes')
+          .set({
+            doc: sql`${JSON.stringify(row.doc)}::jsonb`,
+            index_version: row.index_version,
             organization_id: row.organization_id,
-          })
-          .update(updatePayload)
-        if (updated) continue
+            tenant_id: row.tenant_id,
+            updated_at: row.updated_at,
+            deleted_at: null,
+          } as any)
+          .where('entity_type', '=', row.entity_type)
+          .where('entity_id', '=', row.entity_id)
+          .where('organization_id', row.organization_id === null ? 'is' : '=', row.organization_id as any)
+          .executeTakeFirst() as { numUpdatedRows?: bigint | number } | undefined
+        if (updated && Number(updated.numUpdatedRows ?? 0) > 0) continue
         try {
-          await trx('entity_indexes').insert(row)
+          await trx.insertInto('entity_indexes').values({
+            ...row,
+            doc: sql`${JSON.stringify(row.doc)}::jsonb`,
+          } as any).execute()
         } catch {
           // ignored: row inserted concurrently
         }
@@ -2021,7 +2142,7 @@ async function seedCustomerStressTest(
         created_at: timestamp,
         deleted_at: null,
       }))
-      await knex.insert(payload).into('custom_field_values')
+      await db.insertInto('custom_field_values').values(payload).execute()
     }
   }
 
@@ -2184,11 +2305,14 @@ async function seedCustomerStressTest(
   const entityInsertBatchSize = 1000
   const contactsPerCompany = Math.max(1, Math.ceil(toCreate / companyCount))
 
-  await warnIfStressTestSchemaChanged(knex)
+  await warnIfStressTestSchemaChanged(db)
 
   const insertRows = async (trx: any, table: string, rows: unknown[]) => {
     if (!rows.length) return
-    await trx.batchInsert(table, rows, entityInsertBatchSize)
+    for (let i = 0; i < rows.length; i += entityInsertBatchSize) {
+      const chunk = rows.slice(i, i + entityInsertBatchSize)
+      await trx.insertInto(table).values(chunk as any).execute()
+    }
     rows.length = 0
   }
 
@@ -2204,7 +2328,7 @@ async function seedCustomerStressTest(
       activityRows.length +
       commentRows.length
     if (pendingCount === 0) return
-    await knex.transaction(async (trx) => {
+    await db.transaction().execute(async (trx: any) => {
       await insertRows(trx, 'customer_entities', customerEntityRows)
       await insertRows(trx, 'customer_companies', companyProfileRows)
       await insertRows(trx, 'customer_people', personProfileRows)
@@ -2643,15 +2767,17 @@ const STRESS_TEST_REQUIRED_COLUMNS: Record<string, readonly string[]> = {
   ],
 }
 
-async function warnIfStressTestSchemaChanged(knex: any) {
+async function warnIfStressTestSchemaChanged(db: Kysely<any>) {
   try {
     const warnings: string[] = []
     for (const [table, requiredColumns] of Object.entries(STRESS_TEST_REQUIRED_COLUMNS)) {
-      const rows = await knex('information_schema.columns')
+      const rows = await (db as any)
+        .selectFrom('information_schema.columns')
         .select('column_name')
-        .whereRaw('table_schema = current_schema()')
-        .where({ table_name: table })
-      const existing = new Set(rows.map((row: { column_name: string }) => row.column_name))
+        .where(sql<boolean>`table_schema = current_schema()`)
+        .where('table_name', '=', table)
+        .execute() as Array<{ column_name: string }>
+      const existing = new Set(rows.map((row) => row.column_name))
       const missing = requiredColumns.filter((column) => !existing.has(column))
       if (missing.length) warnings.push(`${table}: missing ${missing.join(', ')}`)
     }
@@ -2861,7 +2987,7 @@ async function backfillInteractions(
   container: { resolve: (name: string) => unknown },
   args: SeedArgs,
 ): Promise<{ activitiesMigrated: number; todosMigrated: number; projectionsRecomputed: number; errors: number }> {
-  const knex = em.getKnex()
+  const db = em.getKysely<any>() as any
   const { tenantId, organizationId } = args
 
   let activitiesMigrated = 0
@@ -2873,8 +2999,9 @@ async function backfillInteractions(
   // Step 1: Migrate activities → interactions
   console.log('[backfill] Migrating activities to interactions...')
   while (true) {
-    const activities = await knex('customer_activities')
-      .select(
+    const activities = await db
+      .selectFrom('customer_activities')
+      .select([
         'customer_activities.id',
         'customer_activities.organization_id',
         'customer_activities.tenant_id',
@@ -2887,23 +3014,24 @@ async function backfillInteractions(
         'customer_activities.appearance_color',
         'customer_activities.entity_id',
         'customer_activities.deal_id',
-      )
-      .where('customer_activities.tenant_id', tenantId)
-      .andWhere('customer_activities.organization_id', organizationId)
-      .whereNotExists(
-        knex('customer_interactions')
-          .select(knex.raw('1'))
-          .whereRaw('customer_interactions.id = customer_activities.id')
-      )
+      ])
+      .where('customer_activities.tenant_id', '=', tenantId)
+      .where('customer_activities.organization_id', '=', organizationId)
+      .where((eb: any) => eb.not(eb.exists(
+        eb.selectFrom('customer_interactions')
+          .select(sql<number>`1`.as('one'))
+          .whereRef('customer_interactions.id', '=', 'customer_activities.id')
+      )))
       .orderBy('customer_activities.created_at', 'asc')
       .limit(BACKFILL_BATCH_SIZE)
+      .execute() as any[]
 
     if (activities.length === 0) break
 
     for (const activity of activities) {
       try {
         const status = activity.occurred_at ? 'done' : 'planned'
-        await knex('customer_interactions').insert({
+        await db.insertInto('customer_interactions').values({
           id: activity.id,
           organization_id: activity.organization_id,
           tenant_id: activity.tenant_id,
@@ -2921,7 +3049,7 @@ async function backfillInteractions(
           deal_id: activity.deal_id,
           created_at: new Date(),
           updated_at: new Date(),
-        })
+        } as any).execute()
         activitiesMigrated++
         affectedEntityIds.add(activity.entity_id)
       } catch (err) {
@@ -2946,8 +3074,9 @@ async function backfillInteractions(
   }
 
   while (true) {
-    const todoLinks = await knex('customer_todo_links')
-      .select(
+    const todoLinks = await db
+      .selectFrom('customer_todo_links')
+      .select([
         'customer_todo_links.id',
         'customer_todo_links.organization_id',
         'customer_todo_links.tenant_id',
@@ -2955,16 +3084,17 @@ async function backfillInteractions(
         'customer_todo_links.todo_source',
         'customer_todo_links.entity_id',
         'customer_todo_links.created_at',
-      )
-      .where('customer_todo_links.tenant_id', tenantId)
-      .andWhere('customer_todo_links.organization_id', organizationId)
-      .whereNotExists(
-        knex('customer_interactions')
-          .select(knex.raw('1'))
-          .whereRaw('customer_interactions.id = customer_todo_links.todo_id')
-      )
+      ])
+      .where('customer_todo_links.tenant_id', '=', tenantId)
+      .where('customer_todo_links.organization_id', '=', organizationId)
+      .where((eb: any) => eb.not(eb.exists(
+        eb.selectFrom('customer_interactions')
+          .select(sql<number>`1`.as('one'))
+          .whereRef('customer_interactions.id', '=', 'customer_todo_links.todo_id')
+      )))
       .orderBy('customer_todo_links.created_at', 'asc')
       .limit(BACKFILL_BATCH_SIZE)
+      .execute() as any[]
 
     if (todoLinks.length === 0) break
 
@@ -3010,7 +3140,7 @@ async function backfillInteractions(
         const title = summary?.title ?? 'Migrated task'
         const status = summary?.isDone ? 'done' : 'planned'
 
-        await knex('customer_interactions').insert({
+        await db.insertInto('customer_interactions').values({
           id: link.todo_id,
           organization_id: link.organization_id,
           tenant_id: link.tenant_id,
@@ -3028,7 +3158,7 @@ async function backfillInteractions(
           deal_id: null,
           created_at: new Date(),
           updated_at: new Date(),
-        })
+        } as any).execute()
         todosMigrated++
         affectedEntityIds.add(link.entity_id)
       } catch (err) {

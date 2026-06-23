@@ -1,13 +1,65 @@
 import { z } from 'zod'
 import { isValidPhoneNumber } from '@open-mercato/shared/lib/phone'
+import { dictionaryEntrySortModeSchema } from '@open-mercato/core/modules/dictionaries/lib/entrySort'
 
 const uuid = () => z.string().uuid()
 
 export const CUSTOMER_PHONE_INVALID_MESSAGE_KEY = 'customers.people.form.primaryPhone.invalid'
+export const ACTIVITY_DATE_REQUIRED_MESSAGE_KEY = 'customers.activities.errors.dateRequired'
+export const ACTIVITY_TIME_REQUIRED_MESSAGE_KEY = 'customers.activities.errors.timeRequired'
+export const ACTIVITY_PHONE_REQUIRED_MESSAGE_KEY = 'customers.activities.errors.phoneRequired'
+export const ACTIVITY_PHONE_INVALID_MESSAGE_KEY = 'customers.activities.errors.phoneInvalid'
 
-const phoneSchema = z.string().trim().max(50).refine((val) => {
-  return isValidPhoneNumber(val)
-}, { message: CUSTOMER_PHONE_INVALID_MESSAGE_KEY }).optional()
+const emptyStringToNull = (value: unknown): unknown => {
+  if (typeof value !== 'string') return value
+  const trimmed = value.trim()
+  return trimmed.length ? trimmed : null
+}
+
+const phoneSchema = z.preprocess(
+  emptyStringToNull,
+  z
+    .string()
+    .trim()
+    .max(50)
+    .refine((val) => isValidPhoneNumber(val), { message: CUSTOMER_PHONE_INVALID_MESSAGE_KEY })
+    .nullable()
+    .optional(),
+)
+
+const clearableEmailSchema = z.preprocess(
+  emptyStringToNull,
+  z.string().email().max(320).nullable().optional(),
+)
+
+const clearableUrlSchema = z.preprocess(
+  emptyStringToNull,
+  z.string().url().max(300).nullable().optional(),
+)
+
+// Domain is a plain (non-URL) string that maps to a nullable column, so blanking
+// a previously-set value on edit must transmit null to clear it. See #2529.
+const clearableDomainSchema = z.preprocess(
+  emptyStringToNull,
+  z.string().trim().max(200).nullable().optional(),
+)
+
+// Plain optional string fields that map to nullable columns: blanking a previously-set
+// value on edit must transmit null to clear it, not be silently dropped. See #3050.
+const clearableStringSchema = (max: number) =>
+  z.preprocess(emptyStringToNull, z.string().trim().max(max).nullable().optional())
+
+// Annual revenue maps to a nullable numeric column. `''`/whitespace/null all clear it;
+// `.nullable()` short-circuits before coercion so null does not coerce to 0. See #3050.
+const clearableRevenueSchema = z.preprocess(
+  (value) => {
+    if (typeof value === 'string' && value.trim().length === 0) return null
+    return value
+  },
+  z.coerce.number().min(0).nullable().optional(),
+)
+
+const interactionPhoneNumberSchema = z.string().trim().max(50).optional().nullable()
 
 const scopedSchema = z.object({
   organizationId: uuid(),
@@ -33,18 +85,16 @@ const displayNameSchema = z.string().trim().min(1).max(200)
 
 const baseEntitySchema = {
   displayName: displayNameSchema,
-  description: z.string().trim().max(4000).optional(),
+  // Nullable so a blanked description on edit clears the column instead of being dropped. See #3050.
+  description: clearableStringSchema(4000),
   ownerUserId: uuid().optional(),
-  primaryEmail: z
-    .string()
-    .trim()
-    .email()
-    .max(320)
-    .optional(),
+  primaryEmail: clearableEmailSchema,
   primaryPhone: phoneSchema,
   status: z.string().trim().max(100).optional(),
   lifecycleStage: z.string().trim().max(100).optional(),
   source: z.string().trim().max(150).optional(),
+  temperature: z.string().trim().max(100).optional(),
+  renewalQuarter: z.string().trim().max(100).optional(),
   isActive: z.boolean().optional(),
   nextInteraction: nextInteractionSchema.nullable().optional(),
   tags: z.array(uuid()).optional(),
@@ -56,8 +106,8 @@ const personDetailsSchema = {
   department: z.string().trim().max(150).optional(),
   seniority: z.string().trim().max(100).optional(),
   timezone: z.string().trim().max(120).optional(),
-  linkedInUrl: z.string().trim().url().max(300).optional(),
-  twitterUrl: z.string().trim().url().max(300).optional(),
+  linkedInUrl: clearableUrlSchema,
+  twitterUrl: clearableUrlSchema,
   companyEntityId: uuid().nullable().optional(),
 }
 
@@ -65,13 +115,14 @@ const personFirstNameSchema = z.string().trim().min(1).max(120)
 const personLastNameSchema = z.string().trim().min(1).max(120)
 
 const companyDetailsSchema = {
-  legalName: z.string().trim().max(200).optional(),
-  brandName: z.string().trim().max(200).optional(),
-  domain: z.string().trim().max(200).optional(),
-  websiteUrl: z.string().trim().url().max(300).optional(),
+  // Nullable so blanked values on edit clear the columns instead of being dropped. See #3050.
+  legalName: clearableStringSchema(200),
+  brandName: clearableStringSchema(200),
+  domain: clearableDomainSchema,
+  websiteUrl: clearableUrlSchema,
   industry: z.string().trim().max(150).optional(),
-  sizeBucket: z.string().trim().max(100).optional(),
-  annualRevenue: z.coerce.number().min(0).optional(),
+  sizeBucket: clearableStringSchema(100),
+  annualRevenue: clearableRevenueSchema,
 }
 
 export const personCreateSchema = scopedSchema.extend({
@@ -118,8 +169,14 @@ export const dealCreateSchema = scopedSchema.extend({
   valueCurrency: z.string().min(3).max(3).optional(),
   probability: z.number().min(0).max(100).optional(),
   expectedCloseAt: z.coerce.date().optional(),
-  ownerUserId: uuid().optional(),
+  // Nullable: the bulk owner-update worker passes `null` to clear ownership.
+  // Without `.nullable()`, dealUpdateSchema.parse({ ownerUserId: null }) throws
+  // ZodError "expected string, received null" inside the queue worker (TC-CRM-069).
+  ownerUserId: uuid().optional().nullable(),
   source: z.string().max(150).optional(),
+  closureOutcome: z.enum(['won', 'lost']).optional(),
+  lossReasonId: uuid().optional(),
+  lossNotes: z.string().max(4000).optional(),
   companyIds: z.array(uuid()).optional(),
   personIds: z.array(uuid()).optional(),
 })
@@ -129,6 +186,24 @@ export const dealUpdateSchema = z
     id: uuid(),
   })
   .merge(dealCreateSchema.partial())
+
+// Bulk update schemas — used by `api/deals/bulk-update-{owner,stage}/route.ts`. Kept here
+// so all deal-write contracts live next to `dealCreateSchema` / `dealUpdateSchema`.
+export const dealsBulkUpdateOwnerSchema = z.object({
+  ids: z.array(uuid()).min(1).max(10000),
+  ownerUserId: uuid().nullable(),
+})
+
+export const dealsBulkUpdateStageSchema = z.object({
+  ids: z.array(uuid()).min(1).max(10000),
+  pipelineStageId: uuid(),
+})
+
+export const dealsBulkUpdateResponseSchema = z.object({
+  ok: z.boolean(),
+  progressJobId: uuid().nullable(),
+  message: z.string(),
+})
 
 const leadStatusSchema = z.enum(['open', 'in_progress', 'qualified', 'rejected'])
 
@@ -166,7 +241,7 @@ export const leadUpdateSchema = z
     }).partial()
   )
 
-export const leadConvertSchema = scopedSchema.extend({
+const leadConvertBaseSchema = scopedSchema.extend({
   id: uuid(),
   createDeal: z.boolean(),
   createPerson: z.boolean(),
@@ -180,15 +255,28 @@ export const leadConvertSchema = scopedSchema.extend({
       valueCurrency: z.string().trim().min(3).max(3).optional(),
     })
     .optional(),
-}).refine((data) => data.createDeal || data.createPerson || data.createCompany, {
-  message: 'customers.leads.convert.atLeastOneTargetRequired',
 })
+
+export const leadConvertSchema = leadConvertBaseSchema.refine(
+  (data) => data.createDeal || data.createPerson || data.createCompany,
+  { message: 'customers.leads.convert.atLeastOneTargetRequired' },
+)
+
+export const leadConvertBodySchema = leadConvertBaseSchema
+  .omit({ id: true, tenantId: true, organizationId: true })
+  .refine(
+    (data) => data.createDeal || data.createPerson || data.createCompany,
+    { message: 'customers.leads.convert.atLeastOneTargetRequired' },
+  )
 
 export const activityCreateSchema = scopedSchema.extend({
   entityId: uuid(),
   activityType: z.string().min(1).max(100),
   subject: z.string().max(200).optional(),
   body: z.string().max(8000).optional(),
+  date: z.string().trim().min(1, ACTIVITY_DATE_REQUIRED_MESSAGE_KEY).optional(),
+  time: z.string().trim().min(1, ACTIVITY_TIME_REQUIRED_MESSAGE_KEY).optional(),
+  phoneNumber: interactionPhoneNumberSchema,
   occurredAt: z.coerce.date().optional(),
   dealId: uuid().optional(),
   authorUserId: uuid().optional(),
@@ -268,7 +356,7 @@ export const tagUpdateSchema = z
   })
   .merge(tagCreateSchema.partial())
 
-const dictionaryKindEnum = z.enum([
+const KNOWN_DICTIONARY_KINDS = [
   'status',
   'source',
   'lifecycle_stage',
@@ -278,14 +366,32 @@ const dictionaryKindEnum = z.enum([
   'pipeline_stage',
   'job_title',
   'industry',
-])
+  'temperature',
+  'renewal_quarter',
+  'person_company_role',
+] as const
+const CUSTOM_DICTIONARY_KIND_PATTERN = /^[a-z0-9]+(?:[-_][a-z0-9]+)*$/
+const dictionaryKindEnum = z.string().trim().refine(
+  (value) =>
+    (KNOWN_DICTIONARY_KINDS as readonly string[]).includes(value) ||
+    CUSTOM_DICTIONARY_KIND_PATTERN.test(value),
+  { message: 'Unsupported dictionary kind' },
+)
 
 const dictionaryValueSchema = z.string().trim().min(1).max(150)
 const dictionaryLabelSchema = z.string().trim().max(150)
+// Pipeline-stage rows migrated to semantic tone identifiers in
+// Migration20260519120000_pipeline_stage_color_tones; AddStageDialog now writes those
+// directly. Other dictionary kinds still store hex. Accept either format so round-tripping
+// a migrated pipeline-stage entry through the dictionary edit UI doesn't fail validation.
+const DICTIONARY_COLOR_TONES = ['success', 'warning', 'info', 'error', 'neutral', 'brand', 'pink'] as const
 const dictionaryColorSchema = z
   .string()
   .trim()
-  .regex(/^#([0-9a-fA-F]{6})$/, 'Color must be a valid six-digit hex code like #3366ff')
+  .regex(
+    new RegExp(`^(#[0-9a-fA-F]{6}|${DICTIONARY_COLOR_TONES.join('|')})$`),
+    'Color must be a six-digit hex code (e.g. #3366ff) or a semantic tone identifier',
+  )
 const dictionaryIconSchema = z.string().trim().max(48)
 
 export const customerDictionaryEntryCreateSchema = scopedSchema.extend({
@@ -356,13 +462,50 @@ export const todoLinkWithTodoCreateSchema = scopedSchema.extend({
 export const interactionStatusValues = ['planned', 'done', 'canceled'] as const
 export type InteractionStatus = typeof interactionStatusValues[number]
 
-export const interactionCreateSchema = z.object({
+const interactionParticipantSchema = z.object({
+  userId: z.string().uuid(),
+  name: z.string().trim().max(200).optional(),
+  email: z.string().trim().max(320).optional(),
+  status: z.string().trim().max(50).optional(),
+})
+
+const interactionLinkedEntitySchema = z.object({
+  id: z.string().uuid(),
+  type: z.enum(['company', 'deal', 'offer']),
+  label: z.string().trim().max(500),
+})
+
+const interactionGuestPermissionsSchema = z
+  .object({
+    canInviteOthers: z.boolean().optional(),
+    canModify: z.boolean().optional(),
+    canSeeList: z.boolean().optional(),
+  })
+  .strict()
+
+const interactionExtendedFields = {
+  durationMinutes: z.number().int().min(0).optional().nullable(),
+  location: z.string().trim().max(500).optional().nullable(),
+  allDay: z.boolean().optional().nullable(),
+  recurrenceRule: z.string().trim().max(500).optional().nullable(),
+  recurrenceEnd: z.coerce.date().optional().nullable(),
+  participants: z.array(interactionParticipantSchema).optional().nullable(),
+  reminderMinutes: z.number().int().min(0).optional().nullable(),
+  visibility: z.string().trim().max(50).optional().nullable(),
+  linkedEntities: z.array(interactionLinkedEntitySchema).optional().nullable(),
+  guestPermissions: interactionGuestPermissionsSchema.optional().nullable(),
+} as const
+
+const interactionCreateBaseSchema = scopedSchema.extend({
   id: z.string().uuid().optional(),
   entityId: z.string().uuid(),
   interactionType: z.string().trim().min(1).max(100),
   title: z.string().trim().max(500).optional().nullable(),
   body: z.string().trim().max(10000).optional().nullable(),
   status: z.enum(interactionStatusValues).optional().default('planned'),
+  date: z.string().trim().min(1, ACTIVITY_DATE_REQUIRED_MESSAGE_KEY).optional(),
+  time: z.string().trim().min(1, ACTIVITY_TIME_REQUIRED_MESSAGE_KEY).optional(),
+  phoneNumber: interactionPhoneNumberSchema,
   scheduledAt: z.coerce.date().optional().nullable(),
   occurredAt: z.coerce.date().optional().nullable(),
   priority: z.number().int().min(0).max(100).optional().nullable(),
@@ -372,25 +515,106 @@ export const interactionCreateSchema = z.object({
   appearanceIcon: z.string().trim().max(100).optional().nullable(),
   appearanceColor: z.string().trim().regex(/^#([0-9a-fA-F]{6})$/).optional().nullable(),
   source: z.string().trim().max(100).optional().nullable(),
-}).passthrough()
+  ...interactionExtendedFields,
+})
+
+function deriveScheduledAtFromDateTime(date?: string, time?: string): Date | null {
+  if (!date || typeof date !== 'string') return null
+  const trimmedDate = date.trim()
+  if (!trimmedDate) return null
+  const trimmedTime = typeof time === 'string' ? time.trim() : ''
+  const iso = trimmedTime ? `${trimmedDate}T${trimmedTime}:00` : `${trimmedDate}T00:00:00`
+  const parsed = new Date(iso)
+  return Number.isNaN(parsed.getTime()) ? null : parsed
+}
+
+export const interactionCreateSchema = interactionCreateBaseSchema
+  .superRefine((value, ctx) => {
+    if (value.interactionType === 'call' && value.phoneNumber !== undefined && value.phoneNumber !== null) {
+      const phone = typeof value.phoneNumber === 'string' ? value.phoneNumber.trim() : ''
+      if (!phone) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['phoneNumber'],
+          message: ACTIVITY_PHONE_REQUIRED_MESSAGE_KEY,
+        })
+      } else if (!isValidPhoneNumber(phone)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['phoneNumber'],
+          message: ACTIVITY_PHONE_INVALID_MESSAGE_KEY,
+        })
+      }
+    }
+  })
+  // Derive `scheduledAt` from `date+time` when only the latter are sent so
+  // external API consumers don't silently persist `scheduled_at: null` after
+  // the validator already enforced non-empty date/time. The form already
+  // computes `scheduledAt` itself, so this branch is a no-op for the form path.
+  .transform((value) => {
+    if (value.scheduledAt) return value
+    const derived = deriveScheduledAtFromDateTime(value.date, value.time)
+    return derived ? { ...value, scheduledAt: derived } : value
+  })
 
 export type InteractionCreateInput = z.infer<typeof interactionCreateSchema>
 
-export const interactionUpdateSchema = z.object({
-  id: z.string().uuid(),
-  interactionType: z.string().trim().min(1).max(100).optional(),
-  title: z.string().trim().max(500).optional().nullable(),
-  body: z.string().trim().max(10000).optional().nullable(),
-  status: z.enum(interactionStatusValues).optional(),
-  scheduledAt: z.coerce.date().optional().nullable(),
-  occurredAt: z.coerce.date().optional().nullable(),
-  priority: z.number().int().min(0).max(100).optional().nullable(),
-  authorUserId: z.string().uuid().optional().nullable(),
-  ownerUserId: z.string().uuid().optional().nullable(),
-  dealId: z.string().uuid().optional().nullable(),
-  appearanceIcon: z.string().trim().max(100).optional().nullable(),
-  appearanceColor: z.string().trim().regex(/^#([0-9a-fA-F]{6})$/).optional().nullable(),
-}).passthrough()
+const interactionUpdateBaseSchema = z
+  .object({
+    id: z.string().uuid(),
+  })
+  .merge(
+    scopedSchema
+      .extend({
+        interactionType: z.string().trim().min(1).max(100).optional(),
+        title: z.string().trim().max(500).optional().nullable(),
+        body: z.string().trim().max(10000).optional().nullable(),
+        status: z.enum(interactionStatusValues).optional(),
+        date: z.string().trim().min(1, ACTIVITY_DATE_REQUIRED_MESSAGE_KEY).optional(),
+        time: z.string().trim().min(1, ACTIVITY_TIME_REQUIRED_MESSAGE_KEY).optional(),
+        phoneNumber: interactionPhoneNumberSchema,
+        scheduledAt: z.coerce.date().optional().nullable(),
+        occurredAt: z.coerce.date().optional().nullable(),
+        priority: z.number().int().min(0).max(100).optional().nullable(),
+        authorUserId: z.string().uuid().optional().nullable(),
+        ownerUserId: z.string().uuid().optional().nullable(),
+        dealId: z.string().uuid().optional().nullable(),
+        appearanceIcon: z.string().trim().max(100).optional().nullable(),
+        appearanceColor: z.string().trim().regex(/^#([0-9a-fA-F]{6})$/).optional().nullable(),
+        pinned: z.boolean().optional(),
+        ...interactionExtendedFields,
+      })
+      .partial(),
+  )
+
+export const interactionUpdateSchema = interactionUpdateBaseSchema
+  .superRefine((value, ctx) => {
+    if (value.interactionType === 'call' && value.phoneNumber !== undefined) {
+      const phone = typeof value.phoneNumber === 'string' ? value.phoneNumber.trim() : ''
+      if (!phone) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['phoneNumber'],
+          message: ACTIVITY_PHONE_REQUIRED_MESSAGE_KEY,
+        })
+      } else if (!isValidPhoneNumber(phone)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['phoneNumber'],
+          message: ACTIVITY_PHONE_INVALID_MESSAGE_KEY,
+        })
+      }
+    }
+  })
+  // Mirror the create-schema derivation for partial updates: when an external
+  // caller supplies `date+time` without `scheduledAt`, derive the timestamp so
+  // the update doesn't silently leave `scheduled_at` stale.
+  .transform((value) => {
+    if (value.scheduledAt !== undefined) return value
+    if (!value.date && !value.time) return value
+    const derived = deriveScheduledAtFromDateTime(value.date, value.time)
+    return derived ? { ...value, scheduledAt: derived } : value
+  })
 
 export type InteractionUpdateInput = z.infer<typeof interactionUpdateSchema>
 
@@ -407,6 +631,16 @@ export const customerAddressFormatSchema = z.enum(['line_first', 'street_first']
 
 export const customerSettingsUpsertSchema = scopedSchema.extend({
   addressFormat: customerAddressFormatSchema,
+})
+
+export const customerStuckThresholdUpsertSchema = scopedSchema.extend({
+  stuckThresholdDays: z.number().int().min(1).max(365),
+})
+
+export const customerDictionarySortModesSchema = z.record(z.string(), dictionaryEntrySortModeSchema)
+
+export const customerDictionarySortModesUpsertSchema = scopedSchema.extend({
+  dictionarySortModes: customerDictionarySortModesSchema,
 })
 
 export type PersonCreateInput = z.infer<typeof personCreateSchema>
@@ -430,6 +664,8 @@ export type TagAssignmentInput = z.infer<typeof tagAssignmentSchema>
 export type TodoLinkCreateInput = z.infer<typeof todoLinkCreateSchema>
 export type TodoLinkWithTodoCreateInput = z.infer<typeof todoLinkWithTodoCreateSchema>
 export type CustomerSettingsUpsertInput = z.infer<typeof customerSettingsUpsertSchema>
+export type CustomerStuckThresholdUpsertInput = z.infer<typeof customerStuckThresholdUpsertSchema>
+export type CustomerDictionarySortModesUpsertInput = z.infer<typeof customerDictionarySortModesUpsertSchema>
 export type CustomerAddressFormatInput = z.infer<typeof customerAddressFormatSchema>
 export type InteractionCompleteInput = z.infer<typeof interactionCompleteSchema>
 export type InteractionCancelInput = z.infer<typeof interactionCancelSchema>
@@ -461,16 +697,16 @@ export const pipelineStageCreateSchema = scopedSchema.extend({
   pipelineId: uuid(),
   label: z.string().trim().min(1).max(200),
   order: z.number().int().min(0).optional(),
-  color: z.string().trim().max(20).optional(),
-  icon: z.string().trim().max(100).optional(),
+  color: z.string().trim().max(20).nullish(),
+  icon: z.string().trim().max(100).nullish(),
 })
 
 export const pipelineStageUpdateSchema = z.object({
   id: uuid(),
   label: z.string().trim().min(1).max(200).optional(),
   order: z.number().int().min(0).optional(),
-  color: z.string().trim().max(20).optional(),
-  icon: z.string().trim().max(100).optional(),
+  color: z.string().trim().max(20).nullish(),
+  icon: z.string().trim().max(100).nullish(),
 })
 
 export const pipelineStageDeleteSchema = z.object({
@@ -488,3 +724,95 @@ export type PipelineStageCreateInput = z.infer<typeof pipelineStageCreateSchema>
 export type PipelineStageUpdateInput = z.infer<typeof pipelineStageUpdateSchema>
 export type PipelineStageDeleteInput = z.infer<typeof pipelineStageDeleteSchema>
 export type PipelineStageReorderInput = z.infer<typeof pipelineStageReorderSchema>
+
+export const entityRoleCreateSchema = scopedSchema.extend({
+  entityType: z.enum(['company', 'person']),
+  entityId: uuid(),
+  roleType: z.string().trim().min(1).max(100),
+  userId: uuid(),
+})
+
+export const entityRoleUpdateSchema = scopedSchema.extend({
+  id: uuid(),
+  userId: uuid(),
+})
+
+export const entityRoleDeleteSchema = scopedSchema.extend({
+  id: uuid(),
+})
+
+export type EntityRoleCreateInput = z.infer<typeof entityRoleCreateSchema>
+export type EntityRoleUpdateInput = z.infer<typeof entityRoleUpdateSchema>
+export type EntityRoleDeleteInput = z.infer<typeof entityRoleDeleteSchema>
+
+export const updateKindSettingSchema = z.object({
+  kind: z.string().trim().min(1).max(100),
+  selectionMode: z.enum(['single', 'multi']).optional(),
+  visibleInTags: z.boolean().optional(),
+  sortOrder: z.number().int().min(0).optional(),
+})
+
+export type UpdateKindSettingInput = z.infer<typeof updateKindSettingSchema>
+
+export const customerKindSettingsUpsertSchema = scopedSchema.extend({
+  kind: z.string().trim().min(1).max(100),
+  selectionMode: z.enum(['single', 'multi']).optional(),
+  visibleInTags: z.boolean().optional(),
+  sortOrder: z.number().int().min(0).optional(),
+})
+
+export type CustomerKindSettingsUpsertInput = z.infer<typeof customerKindSettingsUpsertSchema>
+
+export const labelCreateSchema = z.object({
+  label: z.string().trim().min(1).max(120),
+  slug: z.string().trim().min(1).max(80).regex(/^[a-z0-9_-]+$/).optional(),
+})
+
+export type LabelCreateInput = z.infer<typeof labelCreateSchema>
+
+export const labelCreateCommandSchema = scopedSchema.extend({
+  label: z.string().trim().min(1).max(120),
+  slug: z.string().trim().min(1).max(80).regex(/^[a-z0-9_-]+$/),
+  userId: uuid(),
+})
+
+export type LabelCreateCommandInput = z.infer<typeof labelCreateCommandSchema>
+
+export const labelAssignmentSchema = z.object({
+  labelId: z.string().uuid(),
+  entityId: z.string().uuid(),
+})
+
+export type LabelAssignmentInput = z.infer<typeof labelAssignmentSchema>
+
+export const labelAssignCommandSchema = scopedSchema.extend({
+  labelId: uuid(),
+  entityId: uuid(),
+})
+
+export const labelUnassignCommandSchema = scopedSchema.extend({
+  labelId: uuid(),
+  entityId: uuid(),
+})
+
+export type LabelAssignCommandInput = z.infer<typeof labelAssignCommandSchema>
+export type LabelUnassignCommandInput = z.infer<typeof labelUnassignCommandSchema>
+
+export const personCompanyLinkCreateSchema = scopedSchema.extend({
+  personEntityId: uuid(),
+  companyEntityId: uuid(),
+  isPrimary: z.boolean().optional(),
+})
+
+export const personCompanyLinkUpdateSchema = scopedSchema.extend({
+  linkId: uuid(),
+  isPrimary: z.boolean(),
+})
+
+export const personCompanyLinkDeleteSchema = scopedSchema.extend({
+  linkId: uuid(),
+})
+
+export type PersonCompanyLinkCreateInput = z.infer<typeof personCompanyLinkCreateSchema>
+export type PersonCompanyLinkUpdateInput = z.infer<typeof personCompanyLinkUpdateSchema>
+export type PersonCompanyLinkDeleteInput = z.infer<typeof personCompanyLinkDeleteSchema>

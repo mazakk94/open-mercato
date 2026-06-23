@@ -1,16 +1,17 @@
 import type { QueuedJob, JobContext, WorkerMeta } from '@open-mercato/queue'
+import type { Kysely } from 'kysely'
 import { FULLTEXT_INDEXING_QUEUE_NAME, type FulltextIndexJobPayload } from '../../../queue/fulltext-indexing'
 import type { FullTextSearchStrategy } from '../../../strategies/fulltext.strategy'
 import type { SearchIndexer } from '../../../indexer/search-indexer'
 import type { EntityManager } from '@mikro-orm/postgresql'
-import type { Knex } from 'knex'
+
 import type { EntityId } from '@open-mercato/shared/modules/entities'
 import { recordIndexerLog } from '@open-mercato/shared/lib/indexers/status-log'
 import { recordIndexerError } from '@open-mercato/shared/lib/indexers/error-log'
 import type { ProgressService } from '@open-mercato/core/modules/progress/lib/progressService'
 import { searchDebug, searchDebugWarn, searchError } from '../../../lib/debug'
 import { clearReindexLock, updateReindexProgress } from '../lib/reindex-lock'
-import { incrementReindexProgress } from '../lib/reindex-progress'
+import { hasActiveReindexProgress, incrementReindexProgress } from '../lib/reindex-progress'
 
 // Worker metadata for auto-discovery
 const DEFAULT_CONCURRENCY = 2
@@ -22,6 +23,54 @@ export const metadata: WorkerMeta = {
 }
 
 type HandlerContext = { resolve: <T = unknown>(name: string) => T }
+
+async function advanceFulltextReindexProgress(params: {
+  db: Kysely<any> | null
+  em: EntityManager | null
+  progressService: ProgressService | null
+  tenantId: string
+  organizationId?: string | null
+  delta: number
+}): Promise<void> {
+  if (!Number.isFinite(params.delta) || params.delta <= 0) return
+
+  if (params.progressService && params.em) {
+    const hasActiveProgress = await hasActiveReindexProgress({
+      em: params.em,
+      type: 'fulltext',
+      tenantId: params.tenantId,
+      organizationId: params.organizationId ?? null,
+    })
+
+    if (!hasActiveProgress) {
+      if (params.db) {
+        await clearReindexLock(params.db, params.tenantId, 'fulltext', params.organizationId ?? null)
+      }
+      return
+    }
+
+    if (params.db) {
+      await updateReindexProgress(params.db, params.tenantId, 'fulltext', params.delta, params.organizationId ?? null)
+    }
+
+    const completed = await incrementReindexProgress({
+      em: params.em,
+      progressService: params.progressService,
+      type: 'fulltext',
+      tenantId: params.tenantId,
+      organizationId: params.organizationId ?? null,
+      delta: params.delta,
+    })
+    if (completed && params.db) {
+      await clearReindexLock(params.db, params.tenantId, 'fulltext', params.organizationId ?? null)
+    }
+    return
+  }
+
+  if (params.db) {
+    await updateReindexProgress(params.db, params.tenantId, 'fulltext', params.delta, params.organizationId ?? null)
+  }
+}
 
 /**
  * Process a fulltext indexing job.
@@ -51,16 +100,16 @@ export async function handleFulltextIndexJob(
     return
   }
 
-  // Resolve EntityManager for logging and knex for database queries
+  // Resolve EntityManager for logging and Kysely for database queries
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let em: any | null = null
-  let knex: Knex | null = null
+  let db: Kysely<any> | null = null
   try {
     em = ctx.resolve('em') as EntityManager
-    knex = (em.getConnection() as unknown as { getKnex: () => Knex }).getKnex()
+    db = (em as unknown as { getKysely: () => Kysely<any> }).getKysely()
   } catch {
     em = null
-    knex = null
+    db = null
   }
 
   // Resolve searchIndexer for loading fresh data
@@ -192,23 +241,14 @@ export async function handleFulltextIndexJob(
         }
       }
 
-      // Update heartbeat to signal worker is still processing
-      if (knex && records.length > 0) {
-        await updateReindexProgress(knex, tenantId, 'fulltext', successCount, organizationId ?? null)
-      }
-      if (progressService && em && records.length > 0) {
-        const completed = await incrementReindexProgress({
-          em,
-          progressService,
-          type: 'fulltext',
-          tenantId,
-          organizationId: organizationId ?? null,
-          delta: successCount,
-        })
-        if (completed && knex) {
-          await clearReindexLock(knex, tenantId, 'fulltext', organizationId ?? null)
-        }
-      }
+      await advanceFulltextReindexProgress({
+        db,
+        em,
+        progressService,
+        tenantId,
+        organizationId: organizationId ?? null,
+        delta: records.length,
+      })
 
       searchDebug('fulltext-index.worker', 'Batch indexed to fulltext', {
         jobId: jobCtx.jobId,

@@ -4,11 +4,20 @@
 
 import * as React from 'react'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
-import { apiCall, apiCallOrThrow } from '@open-mercato/ui/backend/utils/apiCall'
+import { apiCall, apiCallOrThrow, withScopedApiRequestHeaders } from '@open-mercato/ui/backend/utils/apiCall'
+import { buildOptimisticLockHeader } from '@open-mercato/ui/backend/utils/optimisticLock'
 import { createCrud } from '@open-mercato/ui/backend/utils/crud'
+import { useGuardedMutation } from '@open-mercato/ui/backend/injection/useGuardedMutation'
 import { ErrorMessage, LoadingMessage, TabEmptyState } from '@open-mercato/ui/backend/detail'
 import { Button } from '@open-mercato/ui/primitives/button'
-import { Switch } from '@open-mercato/ui/primitives/switch'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@open-mercato/ui/primitives/select'
+import { SwitchField } from '@open-mercato/ui/primitives/switch-field'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
 import { useConfirmDialog } from '@open-mercato/ui/backend/confirm-dialog'
 import { AddressEditor, type AddressEditorDraft } from '@open-mercato/core/modules/customers/components/AddressEditor'
@@ -148,6 +157,12 @@ function mapApiAddress(item: Record<string, unknown>, format: AddressFormatStrat
   return { id, label, summary, value, name: name || null, purpose: purpose || null }
 }
 
+function mergeAddressOption(options: AddressOption[], selected: AddressOption | null): AddressOption[] {
+  if (!selected) return options
+  if (options.some((option) => option.id === selected.id)) return options
+  return [selected, ...options]
+}
+
 function draftFromDocumentAddress(entry: DocumentAddressAssignment): AddressEditorDraft {
   return {
     name: entry.name ?? '',
@@ -219,6 +234,40 @@ export function SalesDocumentAddressesSection({
   const [editingAddressId, setEditingAddressId] = React.useState<string | null>(null)
   const [editingDraft, setEditingDraft] = React.useState<AddressEditorDraft>(emptyDraft)
   const [editingSaving, setEditingSaving] = React.useState(false)
+  const mutationContextId = React.useMemo(
+    () => `sales-document-addresses:${kind}:${documentId}`,
+    [documentId, kind],
+  )
+  const resourceKind = React.useMemo(() => (kind === 'order' ? 'sales.order' : 'sales.quote'), [kind])
+  const { runMutation, retryLastMutation } = useGuardedMutation<{
+    formId: string
+    resourceKind: string
+    resourceId: string
+    kind: 'order' | 'quote'
+    retryLastMutation: () => Promise<boolean>
+  }>({
+    contextId: mutationContextId,
+    blockedMessage: t('ui.forms.flash.saveBlocked', 'Save blocked by validation'),
+  })
+  const mutationContext = React.useMemo(
+    () => ({
+      formId: mutationContextId,
+      resourceKind,
+      resourceId: documentId,
+      kind,
+      retryLastMutation,
+    }),
+    [documentId, kind, mutationContextId, resourceKind, retryLastMutation],
+  )
+  const runGuardedMutation = React.useCallback(
+    async <T,>(operation: () => Promise<T>, mutationPayload: Record<string, unknown>) =>
+      runMutation({
+        operation,
+        mutationPayload,
+        context: mutationContext,
+      }),
+    [mutationContext, runMutation],
+  )
 
   const customerRequired = !customerId
   const addressOptionsMap = React.useMemo(() => {
@@ -405,9 +454,42 @@ export function SalesDocumentAddressesSection({
     [addressFormat, t]
   )
 
+  const loadAddressOptionById = React.useCallback(
+    async (addressId: string): Promise<AddressOption | null> => {
+      const call = await apiCall<{ items?: Array<Record<string, unknown>> }>(
+        `/api/customers/addresses?id=${encodeURIComponent(addressId)}&pageSize=1`
+      )
+      const items = Array.isArray(call.result?.items) ? call.result.items : []
+      return (
+        items
+          .map((item) => mapApiAddress(item, addressFormat))
+          .find((entry): entry is AddressOption => entry?.id === addressId) ?? null
+      )
+    },
+    [addressFormat]
+  )
+
   React.useEffect(() => {
     loadAddresses(customerId).catch(() => {})
   }, [customerId, loadAddresses])
+
+  React.useEffect(() => {
+    const selectedIds = [shippingAddressIdState, billingAddressIdState].filter(
+      (id): id is string => typeof id === 'string' && id.length > 0
+    )
+    const missingIds = selectedIds.filter((id) => !addressOptions.some((option) => option.id === id))
+    if (!missingIds.length) return
+    Promise.all(missingIds.map((id) => loadAddressOptionById(id).catch(() => null)))
+      .then((selectedOptions) => {
+        setAddressOptions((current) =>
+          selectedOptions.reduce(
+            (next, selected) => mergeAddressOption(next, selected),
+            current
+          )
+        )
+      })
+      .catch(() => {})
+  }, [addressOptions, billingAddressIdState, loadAddressOptionById, shippingAddressIdState])
 
   const guardLocked = React.useCallback(() => {
     if (!locked) return false
@@ -630,30 +712,38 @@ export function SalesDocumentAddressesSection({
 
     setEditingSaving(true)
     try {
-      await apiCallOrThrow(
-        '/api/sales/document-addresses',
-        {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            id: editingAddressId,
-            documentId,
-            documentKind: kind,
-            customerAddressId: current.customerAddressId ?? undefined,
-            name: nameValue,
-            purpose: purposeValue,
-            companyName: updatedValue.companyName,
-            addressLine1: updatedValue.addressLine1,
-            addressLine2: updatedValue.addressLine2,
-            buildingNumber: updatedValue.buildingNumber,
-            flatNumber: updatedValue.flatNumber,
-            city: updatedValue.city,
-            region: updatedValue.region,
-            postalCode: updatedValue.postalCode,
-            country: updatedValue.country,
-          }),
-        },
-        { errorMessage: t('sales.documents.detail.addresses.saveError', 'Failed to update addresses.') }
+      const payload = {
+        id: editingAddressId,
+        documentId,
+        documentKind: kind,
+        customerAddressId: current.customerAddressId ?? undefined,
+        name: nameValue,
+        purpose: purposeValue,
+        companyName: updatedValue.companyName,
+        addressLine1: updatedValue.addressLine1,
+        addressLine2: updatedValue.addressLine2,
+        buildingNumber: updatedValue.buildingNumber,
+        flatNumber: updatedValue.flatNumber,
+        city: updatedValue.city,
+        region: updatedValue.region,
+        postalCode: updatedValue.postalCode,
+        country: updatedValue.country,
+      }
+      await runGuardedMutation(
+        () =>
+          // TODO(#2373-C): thread document updatedAt
+          withScopedApiRequestHeaders(buildOptimisticLockHeader(undefined), () =>
+            apiCallOrThrow(
+              '/api/sales/document-addresses',
+              {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+              },
+              { errorMessage: t('sales.documents.detail.addresses.saveError', 'Failed to update addresses.') },
+            ),
+          ),
+        payload,
       )
       setDocumentAddresses((prev) =>
         prev.map((entry) =>
@@ -680,7 +770,7 @@ export function SalesDocumentAddressesSection({
     } finally {
       setEditingSaving(false)
     }
-  }, [documentAddresses, documentId, editingAddressId, editingDraft, handleCancelEdit, kind, resolveAddressSummary, t])
+  }, [documentAddresses, documentId, editingAddressId, editingDraft, handleCancelEdit, kind, resolveAddressSummary, runGuardedMutation, t])
 
   const handleDeleteDocumentAddress = React.useCallback(
     async (id: string) => {
@@ -700,14 +790,22 @@ export function SalesDocumentAddressesSection({
         return next
       })
       try {
-        await apiCallOrThrow(
-          '/api/sales/document-addresses',
-          {
-            method: 'DELETE',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ id, documentId, documentKind: kind }),
-          },
-          { errorMessage: t('sales.documents.detail.addresses.deleteError', 'Failed to remove address.') }
+        const payload = { id, documentId, documentKind: kind }
+        await runGuardedMutation(
+          () =>
+            // TODO(#2373-C): thread document updatedAt
+            withScopedApiRequestHeaders(buildOptimisticLockHeader(undefined), () =>
+              apiCallOrThrow(
+                '/api/sales/document-addresses',
+                {
+                  method: 'DELETE',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(payload),
+                },
+                { errorMessage: t('sales.documents.detail.addresses.deleteError', 'Failed to remove address.') },
+              ),
+            ),
+          payload,
         )
         setDocumentAddresses((prev) => prev.filter((entry) => entry.id !== id))
         if (editingAddressId === id) {
@@ -728,7 +826,7 @@ export function SalesDocumentAddressesSection({
         })
       }
     },
-    [confirm, documentId, editingAddressId, handleCancelEdit, kind, t]
+    [confirm, documentId, editingAddressId, handleCancelEdit, kind, runGuardedMutation, t]
   )
 
   const handleSave = React.useCallback(async () => {
@@ -795,14 +893,21 @@ export function SalesDocumentAddressesSection({
       payload.billingAddressId = billingSnapshot ? null : billingId
 
       const endpoint = kind === 'order' ? '/api/sales/orders' : '/api/sales/quotes'
-      const call = await apiCallOrThrow<Record<string, unknown>>(
-        endpoint,
-        {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        },
-        { errorMessage: t('sales.documents.detail.updateError', 'Failed to update document.') }
+      const call = await runGuardedMutation(
+        () =>
+          // TODO(#2373-C): thread document updatedAt
+          withScopedApiRequestHeaders(buildOptimisticLockHeader(undefined), () =>
+            apiCallOrThrow<Record<string, unknown>>(
+              endpoint,
+              {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+              },
+              { errorMessage: t('sales.documents.detail.updateError', 'Failed to update document.') },
+            ),
+          ),
+        payload,
       )
       const result = call.result ?? {}
       onUpdated?.({
@@ -843,6 +948,7 @@ export function SalesDocumentAddressesSection({
     shippingDraft,
     t,
     loadAddresses,
+    runGuardedMutation,
     useCustomBilling,
     useCustomShipping,
   ])
@@ -852,28 +958,48 @@ export function SalesDocumentAddressesSection({
     options: AddressOption[],
     onChange: (next: string | null) => void,
     disabled: boolean
-  ) => (
-    <select
-      className="w-full rounded border px-2 py-2 text-sm"
-      value={value}
-      onChange={(evt) => onChange(evt.target.value || null)}
-      disabled={disabled}
-    >
-      <option value="">
-        {addressesLoading
-          ? t('sales.documents.form.address.loading', 'Loading addresses…')
-          : t('sales.documents.form.address.placeholder', 'Select address')}
-      </option>
-      {options.map((addr) => {
-        const optionLabel = addr.summary ? `${addr.label} — ${addr.summary}` : addr.label
-        return (
-          <option key={addr.id} value={addr.id}>
-            {optionLabel}
-          </option>
-        )
-      })}
-    </select>
-  )
+  ) => {
+    const selectedOption = options.find((addr) => addr.id === value) ?? null
+    const selectedLabel = selectedOption
+      ? selectedOption.summary
+        ? `${selectedOption.label} — ${selectedOption.summary}`
+        : selectedOption.label
+      : null
+    const optionsKey = options
+      .map((addr) => `${addr.id}:${addr.summary ? `${addr.label} — ${addr.summary}` : addr.label}`)
+      .join('\0')
+
+    return (
+      <Select
+        key={`address:${value}:${optionsKey}`}
+        value={value || undefined}
+        onValueChange={(next) => onChange(next || null)}
+        disabled={disabled}
+      >
+        <SelectTrigger>
+          <SelectValue
+            placeholder={
+              addressesLoading
+                ? t('sales.documents.form.address.loading', 'Loading addresses…')
+                : t('sales.documents.form.address.placeholder', 'Select address')
+            }
+          >
+            {selectedLabel ?? undefined}
+          </SelectValue>
+        </SelectTrigger>
+        <SelectContent>
+          {options.map((addr) => {
+            const optionLabel = addr.summary ? `${addr.label} — ${addr.summary}` : addr.label
+            return (
+              <SelectItem key={addr.id} value={addr.id}>
+                {optionLabel}
+              </SelectItem>
+            )
+          })}
+        </SelectContent>
+      </Select>
+    )
+  }
 
   return (
     <div className="space-y-4">
@@ -912,14 +1038,13 @@ export function SalesDocumentAddressesSection({
                   : t('sales.documents.form.shipping.hint', 'Select an address or define a new one.')}
               </p>
             </div>
-            <label className="flex items-center gap-2 text-sm">
-              <Switch
-                checked={useCustomShipping}
-                onCheckedChange={(checked) => setUseCustomShipping(checked)}
-                disabled={customerRequired || locked}
-              />
-              <span>{t('sales.documents.form.shipping.custom', 'Define new address')}</span>
-            </label>
+            <SwitchField
+              label={t('sales.documents.form.shipping.custom', 'Define new address')}
+              flip
+              checked={useCustomShipping}
+              onCheckedChange={(checked) => setUseCustomShipping(checked)}
+              disabled={customerRequired || locked}
+            />
           </div>
           {!useCustomShipping
             ? renderAddressSelect(
@@ -938,14 +1063,13 @@ export function SalesDocumentAddressesSection({
                 onChange={(next) => setShippingDraft(next)}
                 hidePrimaryToggle
               />
-              <label className="flex items-center gap-2 text-sm">
-                <Switch
-                  checked={saveShippingAddress && !customerRequired}
-                  onCheckedChange={(checked) => setSaveShippingAddress(checked)}
-                  disabled={customerRequired || locked}
-                />
-                {t('sales.documents.form.address.saveToCustomer', 'Save this address to the customer')}
-              </label>
+              <SwitchField
+                label={t('sales.documents.form.address.saveToCustomer', 'Save this address to the customer')}
+                flip
+                checked={saveShippingAddress && !customerRequired}
+                onCheckedChange={(checked) => setSaveShippingAddress(checked)}
+                disabled={customerRequired || locked}
+              />
             </div>
           ) : null}
         </div>
@@ -963,21 +1087,20 @@ export function SalesDocumentAddressesSection({
                   : t('sales.documents.form.billing.hint', 'Select an address or define a new one.')}
               </p>
             </div>
-            <label className="flex items-center gap-2 text-sm">
-              <Switch
-                checked={sameAsShipping}
-                onCheckedChange={(checked) => {
-                  setSameAsShipping(checked)
-                  if (checked) {
-                    setUseCustomBilling(useCustomShipping)
-                    setBillingAddressId(useCustomShipping ? null : shippingAddressIdState)
-                    setBillingDraft(useCustomShipping ? shippingDraft : emptyDraft)
-                  }
-                }}
-                disabled={locked}
-              />
-              <span>{t('sales.documents.form.address.sameAsShipping', 'Same as shipping')}</span>
-            </label>
+            <SwitchField
+              label={t('sales.documents.form.address.sameAsShipping', 'Same as shipping')}
+              flip
+              checked={sameAsShipping}
+              onCheckedChange={(checked) => {
+                setSameAsShipping(checked)
+                if (checked) {
+                  setUseCustomBilling(useCustomShipping)
+                  setBillingAddressId(useCustomShipping ? null : shippingAddressIdState)
+                  setBillingDraft(useCustomShipping ? shippingDraft : emptyDraft)
+                }
+              }}
+              disabled={locked}
+            />
           </div>
 
           {!sameAsShipping ? (
@@ -990,14 +1113,13 @@ export function SalesDocumentAddressesSection({
                     addressesLoading || customerRequired || locked
                   )
                 : null}
-              <label className="flex items-center gap-2 text-sm">
-                <Switch
-                  checked={useCustomBilling}
-                  onCheckedChange={(checked) => setUseCustomBilling(checked)}
-                  disabled={customerRequired || locked}
-                />
-                <span>{t('sales.documents.form.shipping.custom', 'Define new address')}</span>
-              </label>
+              <SwitchField
+                label={t('sales.documents.form.shipping.custom', 'Define new address')}
+                flip
+                checked={useCustomBilling}
+                onCheckedChange={(checked) => setUseCustomBilling(checked)}
+                disabled={customerRequired || locked}
+              />
 
               {useCustomBilling ? (
                 <div className="space-y-3">
@@ -1008,14 +1130,13 @@ export function SalesDocumentAddressesSection({
                     onChange={(next) => setBillingDraft(next)}
                     hidePrimaryToggle
                   />
-                  <label className="flex items-center gap-2 text-sm">
-                    <Switch
-                      checked={saveBillingAddress && !customerRequired}
-                      onCheckedChange={(checked) => setSaveBillingAddress(checked)}
-                      disabled={customerRequired || locked}
-                    />
-                    {t('sales.documents.form.address.saveToCustomer', 'Save this address to the customer')}
-                  </label>
+                  <SwitchField
+                    label={t('sales.documents.form.address.saveToCustomer', 'Save this address to the customer')}
+                    flip
+                    checked={saveBillingAddress && !customerRequired}
+                    onCheckedChange={(checked) => setSaveBillingAddress(checked)}
+                    disabled={customerRequired || locked}
+                  />
                 </div>
               ) : null}
             </>
@@ -1202,14 +1323,13 @@ export function SalesDocumentAddressesSection({
               </Button>
             </div>
 
-            <label className="flex items-center gap-2 text-sm">
-              <Switch
-                checked={additionalUseCustom}
-                onCheckedChange={(checked) => setAdditionalUseCustom(checked)}
-                disabled={customerRequired || locked}
-              />
-              <span>{t('sales.documents.form.shipping.custom', 'Define new address')}</span>
-            </label>
+            <SwitchField
+              label={t('sales.documents.form.shipping.custom', 'Define new address')}
+              flip
+              checked={additionalUseCustom}
+              onCheckedChange={(checked) => setAdditionalUseCustom(checked)}
+              disabled={customerRequired || locked}
+            />
 
             {!additionalUseCustom
               ? renderAddressSelect(

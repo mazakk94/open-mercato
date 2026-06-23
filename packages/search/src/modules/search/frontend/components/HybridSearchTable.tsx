@@ -17,6 +17,7 @@ import {
 } from '@open-mercato/shared/lib/frontend/organizationEvents'
 import { isAllOrganizationsSelection } from '@open-mercato/core/modules/directory/constants'
 import { parseSelectedOrganizationCookie } from '@open-mercato/core/modules/directory/utils/scopeCookies'
+import { resolveSearchMinTokenLength } from '@open-mercato/shared/lib/search/config'
 import { fetchHybridSearchResults } from '../utils'
 
 type Row = {
@@ -30,7 +31,7 @@ type Row = {
   metadata: Record<string, unknown> | null
 }
 
-const MIN_QUERY_LENGTH = 2
+const MIN_QUERY_LENGTH = resolveSearchMinTokenLength()
 const ALL_STRATEGIES: SearchStrategyId[] = ['fulltext', 'vector', 'tokens']
 
 type Translator = (
@@ -84,7 +85,7 @@ function createColumns(t: Translator): ColumnDef<Row>[] {
                         className={cn(
                           'rounded-full border px-2 py-0.5 text-xs',
                           link.kind === 'primary'
-                            ? 'border-primary text-primary'
+                            ? 'border-accent-indigo text-foreground'
                             : 'border-muted-foreground/40 text-muted-foreground'
                         )}
                       >
@@ -126,13 +127,13 @@ function createColumns(t: Translator): ColumnDef<Row>[] {
 function getStrategyColorClass(strategy: string): string {
   switch (strategy) {
     case 'fulltext':
-      return 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200'
+      return 'bg-status-info-bg text-status-info-text'
     case 'vector':
-      return 'bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-200'
+      return 'bg-brand-violet/10 text-brand-violet'
     case 'tokens':
-      return 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200'
+      return 'bg-status-success-bg text-status-success-text'
     default:
-      return 'bg-gray-100 text-gray-800 dark:bg-gray-800 dark:text-gray-200'
+      return 'bg-status-neutral-bg text-status-neutral-text'
   }
 }
 
@@ -373,7 +374,7 @@ export function HybridSearchTable({
             <label key={strategy} className="flex cursor-pointer items-center gap-2">
               <input
                 type="checkbox"
-                className="size-4 rounded border-gray-300"
+                className="size-4 rounded border-input"
                 checked={enabledStrategies.has(strategy)}
                 onChange={() => toggleStrategy(strategy)}
               />

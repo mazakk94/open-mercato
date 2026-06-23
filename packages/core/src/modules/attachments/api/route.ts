@@ -2,15 +2,17 @@ import { NextResponse } from 'next/server'
 import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
 import { getAuthFromRequest } from '@open-mercato/shared/lib/auth/server'
 import { z } from 'zod'
+import { sql } from 'kysely'
 import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
 import { buildAttachmentFileUrl, buildAttachmentImageUrl, slugifyAttachmentFileName } from '../lib/imageUrls'
 import { ensureDefaultPartitions, resolveDefaultPartitionCode, sanitizePartitionCode } from '../lib/partitions'
 import { Attachment, AttachmentPartition } from '../data/entities'
-import { storePartitionFile, deletePartitionFile } from '../lib/storage'
 import { extractAttachmentContent } from '../lib/textExtraction'
 import { requestOcrProcessing } from '../lib/ocrQueue'
+import { StorageDriverFactory } from '../lib/drivers'
 import { OcrService, shouldUseLlmOcr } from '../lib/ocrService'
 import { clearAttachmentThumbnailCache } from '../lib/thumbnailCache'
+import { assertAttachmentScopeInvariant } from '../lib/access'
 import {
   mergeAttachmentMetadata,
   normalizeAttachmentAssignments,
@@ -23,9 +25,22 @@ import { randomUUID } from 'crypto'
 import type { EntityManager } from '@mikro-orm/postgresql'
 import { splitCustomFieldPayload } from '@open-mercato/shared/lib/crud/custom-fields'
 import { emitCrudSideEffects, setCustomFieldsIfAny } from '@open-mercato/shared/lib/commands/helpers'
+import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
 import { attachmentCrudEvents, attachmentCrudIndexer } from '../lib/crud'
 import { E } from '#generated/entities.ids.generated'
 import { resolveDefaultAttachmentOcrEnabled } from '../lib/ocrConfig'
+import {
+  detectAttachmentMimeType,
+  hasDangerousExecutableExtension,
+  isActiveContentAttachment,
+  sanitizeUploadedFileName,
+} from '../lib/security'
+import {
+  isMultipartRequestWithinUploadLimit,
+  resolveAttachmentMaxBytes,
+  willExceedAttachmentTenantQuota,
+} from '../lib/upload-limits'
+import { findWithDecryption } from '@open-mercato/shared/lib/encryption/find'
 
 export const metadata = {
   GET: { requireAuth: true, requireFeatures: ['attachments.view'] },
@@ -36,6 +51,8 @@ export const metadata = {
 const attachmentQuerySchema = z.object({
   entityId: z.string().min(1).describe('Entity identifier that owns the attachments'),
   recordId: z.string().min(1).describe('Record identifier within the entity'),
+  page: z.coerce.number().min(1).optional(),
+  pageSize: z.coerce.number().min(1).max(100).optional(),
 })
 
 const attachmentAssignmentSchema = z.object({
@@ -61,6 +78,10 @@ const attachmentItemSchema = z.object({
 
 const attachmentListResponseSchema = z.object({
   items: z.array(attachmentItemSchema),
+  total: z.number().int().nonnegative().optional(),
+  page: z.number().int().min(1).optional(),
+  pageSize: z.number().int().min(1).optional(),
+  totalPages: z.number().int().min(1).optional(),
 })
 
 const attachmentUploadBodySchema = z.object({
@@ -163,18 +184,45 @@ export async function GET(req: Request) {
   const auth = await getAuthFromRequest(req)
   if (!auth || !auth.tenantId || (!auth.orgId && !auth.isSuperAdmin)) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   const url = new URL(req.url)
-  const entityId = url.searchParams.get('entityId') || ''
-  const recordId = url.searchParams.get('recordId') || ''
-  if (!entityId || !recordId) return NextResponse.json({ error: 'entityId and recordId are required' }, { status: 400 })
+  const parsedQuery = attachmentQuerySchema.safeParse({
+    entityId: url.searchParams.get('entityId') || '',
+    recordId: url.searchParams.get('recordId') || '',
+    page: url.searchParams.get('page') ?? undefined,
+    pageSize: url.searchParams.get('pageSize') ?? undefined,
+  })
+  if (!parsedQuery.success) {
+    return NextResponse.json({ error: 'entityId and recordId are required' }, { status: 400 })
+  }
+  const { entityId, recordId, page, pageSize } = parsedQuery.data
 
   const { resolve } = await createRequestContainer()
-  const em = resolve('em') as any
+  const em = resolve('em') as EntityManager
   const filter: Record<string, unknown> = { entityId, recordId, tenantId: auth.tenantId! }
   if (auth.orgId) filter.organizationId = auth.orgId
-  const items = await em.find(
+  const orderBy: Record<string, 'ASC' | 'DESC'> = { createdAt: 'DESC' }
+  const usePaging = typeof page === 'number' && typeof pageSize === 'number'
+  const total = usePaging ? await em.count(Attachment, filter) : null
+  const currentPage = usePaging ? Math.max(1, page) : null
+  const currentPageSize = usePaging ? pageSize : null
+  const totalPages = usePaging && total !== null ? Math.max(1, Math.ceil(total / currentPageSize!)) : null
+  const pageOffset = usePaging ? (Math.min(currentPage!, totalPages!) - 1) * currentPageSize! : undefined
+  const items = await findWithDecryption(
+    em,
     Attachment,
     filter,
-    { orderBy: { createdAt: 'desc' } as any }
+    {
+      orderBy,
+      ...(usePaging
+        ? {
+            limit: currentPageSize!,
+            offset: pageOffset,
+          }
+        : {}),
+    },
+    {
+      tenantId: auth.tenantId ?? null,
+      organizationId: auth.orgId ?? null,
+    },
   )
   return NextResponse.json({
     items: items.map((a: any) => {
@@ -197,10 +245,19 @@ export async function GET(req: Request) {
         assignments: metadata.assignments ?? [],
       }
     }),
+    ...(usePaging
+      ? {
+          total,
+          page: Math.min(currentPage!, totalPages!),
+          pageSize: currentPageSize,
+          totalPages,
+        }
+      : {}),
   })
 }
 
 export async function POST(req: Request) {
+  const { t } = await resolveTranslations()
   const auth = await getAuthFromRequest(req)
   if (!auth || !auth.tenantId || !auth.orgId) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   const tenantId = auth.tenantId
@@ -209,6 +266,9 @@ export async function POST(req: Request) {
   const contentType = req.headers.get('content-type') || ''
   if (!contentType.toLowerCase().includes('multipart/form-data')) {
     return NextResponse.json({ error: 'Expected multipart/form-data' }, { status: 400 })
+  }
+  if (!isMultipartRequestWithinUploadLimit(req.headers.get('content-length'))) {
+    return NextResponse.json({ error: 'Attachment exceeds the maximum upload size.' }, { status: 413 })
   }
 
   const form = await req.formData()
@@ -230,9 +290,12 @@ export async function POST(req: Request) {
   const { resolve } = await createRequestContainer()
   const em = resolve('em') as EntityManager
   const dataEngine = resolve('dataEngine')
+  const storageDriverFactory =
+    (resolve('storageDriverFactory') as StorageDriverFactory | null) ?? new StorageDriverFactory(em)
   await ensureDefaultPartitions(em)
   // Optional per-field validations
   let partitionFromField: string | null = null
+  let fieldMaxAttachmentSizeMb: number | null = null
   if (fieldKey) {
     try {
       const { CustomFieldDef } = await import('@open-mercato/core/modules/entities/data/entities')
@@ -251,18 +314,38 @@ export async function POST(req: Request) {
         if (!allowed.has(ext)) return NextResponse.json({ error: 'File type not allowed' }, { status: 400 })
       }
       if (typeof cfg.maxAttachmentSizeMb === 'number' && cfg.maxAttachmentSizeMb > 0) {
-        const maxBytes = Math.floor(cfg.maxAttachmentSizeMb * 1024 * 1024)
-        const size = (await file.arrayBuffer()).byteLength
-        if (size > maxBytes) return NextResponse.json({ error: `File exceeds ${cfg.maxAttachmentSizeMb} MB limit` }, { status: 400 })
+        fieldMaxAttachmentSizeMb = cfg.maxAttachmentSizeMb
       }
       if (typeof cfg.partitionCode === 'string' && cfg.partitionCode.trim().length > 0) {
         partitionFromField = sanitizePartitionCode(cfg.partitionCode)
       }
     } catch {}
   }
+  if (hasDangerousExecutableExtension(file.name)) {
+    return NextResponse.json({
+      error: t('attachments.errors.dangerousExecutable', 'Executable file types are not allowed as attachments.'),
+    }, { status: 400 })
+  }
+  const effectiveMaxBytes = resolveAttachmentMaxBytes(fieldMaxAttachmentSizeMb)
+  if (file.size > effectiveMaxBytes) {
+    return NextResponse.json({
+      error: t('attachments.errors.maxUploadSize', 'Attachment exceeds the maximum upload size.'),
+    }, { status: 413 })
+  }
+  const tenantUsageBytes = await readTenantAttachmentUsageBytes(em, tenantId)
+  if (willExceedAttachmentTenantQuota(tenantUsageBytes, file.size)) {
+    return NextResponse.json({
+      error: t('attachments.errors.quotaExceeded', 'Attachment storage quota exceeded for this tenant.'),
+    }, { status: 413 })
+  }
   const buf = Buffer.from(await file.arrayBuffer())
-  const safeName = String(file.name || 'file').replace(/[^a-zA-Z0-9._-]/g, '_')
-  const resolvedPartitionCode = partitionOverride ?? partitionFromField ?? resolveDefaultPartitionCode(entityId)
+  const safeName = sanitizeUploadedFileName(file.name)
+  const fileMimeType = detectAttachmentMimeType(buf, safeName, (file as any).type)
+  if (isActiveContentAttachment(buf, safeName, fileMimeType)) {
+    return NextResponse.json({ error: t('attachments.errors.activeContentBlocked', 'Active content uploads are not allowed.') }, { status: 400 })
+  }
+  const defaultPartitionCode = resolveDefaultPartitionCode(entityId)
+  const resolvedPartitionCode = partitionOverride ?? partitionFromField ?? defaultPartitionCode
   const partitionCodeCandidates = Array.from(
     new Set(
       [partitionOverride, partitionFromField, resolvedPartitionCode].filter(
@@ -279,20 +362,32 @@ export async function POST(req: Request) {
     }
   }
   if (!partition) {
-    partition = await em.findOne(AttachmentPartition, { code: resolveDefaultPartitionCode(entityId) })
+    partition = await em.findOne(AttachmentPartition, { code: defaultPartitionCode })
   }
   if (!partition) {
     return NextResponse.json({ error: 'Storage partition is not configured.' }, { status: 400 })
   }
-  let stored
+  const requestedPublicOverride =
+    typeof partitionOverride === 'string' &&
+    partitionOverride.length > 0 &&
+    partition.code === partitionOverride &&
+    partition.isPublic === true &&
+    partition.code !== defaultPartitionCode &&
+    partition.code !== partitionFromField
+  if (requestedPublicOverride) {
+    return NextResponse.json({ error: t('attachments.errors.publicPartitionBlocked', 'Public storage partitions cannot be selected explicitly for this upload.') }, { status: 403 })
+  }
+  const uploadDriver = await storageDriverFactory.resolveForPartition(partition.code, { tenantId, organizationId: orgId })
+  let storedPath: string
   try {
-    stored = await storePartitionFile({
+    const stored = await uploadDriver.store({
       partitionCode: partition.code,
       orgId,
       tenantId,
       fileName: safeName,
       buffer: buf,
     })
+    storedPath = stored.storagePath
   } catch (error) {
     console.error('[attachments] failed to persist file', error)
     return NextResponse.json({ error: 'Failed to persist attachment.' }, { status: 500 })
@@ -303,17 +398,21 @@ export async function POST(req: Request) {
       ? Boolean((partition as any).requiresOcr)
       : resolveDefaultAttachmentOcrEnabled()
   let extractedContent: string | null = null
-  const fileMimeType = (file as any).type || 'application/octet-stream'
-  const useLlmOcr = requiresOcr && shouldUseLlmOcr(fileMimeType, safeName)
+  const wantsLlmOcr = requiresOcr && shouldUseLlmOcr(fileMimeType, safeName)
+  const ocrService = wantsLlmOcr ? new OcrService() : null
+  const useLlmOcr = Boolean(wantsLlmOcr && ocrService?.available)
 
   if (requiresOcr && !useLlmOcr) {
+    const { filePath: localPath, cleanup } = await uploadDriver.toLocalPath(partition.code, storedPath)
     try {
       extractedContent = await extractAttachmentContent({
-        filePath: stored.absolutePath,
+        filePath: localPath,
         mimeType: fileMimeType,
       })
     } catch (error) {
       console.error('[attachments] failed to extract attachment content', error)
+    } finally {
+      await cleanup().catch(() => {})
     }
   }
 
@@ -323,6 +422,7 @@ export async function POST(req: Request) {
   }
   const metadata = mergeAttachmentMetadata(null, { assignments, tags })
   const attachmentId = randomUUID()
+  assertAttachmentScopeInvariant({ tenantId: auth.tenantId, organizationId: auth.orgId })
   const att = em.create(Attachment, {
     id: attachmentId,
     entityId,
@@ -330,42 +430,45 @@ export async function POST(req: Request) {
     organizationId: auth.orgId!,
     tenantId: auth.tenantId!,
     fileName: safeName,
-    mimeType: (file as any).type || 'application/octet-stream',
+    mimeType: fileMimeType,
     fileSize: buf.length,
     partitionCode: partition.code,
     storageDriver: partition.storageDriver || 'local',
-    storagePath: stored.storagePath,
+    storagePath: storedPath,
     url: buildAttachmentFileUrl(attachmentId),
     content: extractedContent,
     storageMetadata: metadata,
   })
-  await em.persistAndFlush(att)
+  // Persist the attachment row and its custom-field values atomically so a
+  // custom-field failure cannot leave behind a committed orphan attachment.
+  try {
+    await em.transactional(async (tx) => {
+      await tx.persist(att).flush()
+      if (dataEngine) {
+        await setCustomFieldsIfAny({
+          dataEngine,
+          entityId: E.attachments.attachment,
+          recordId: attachmentId,
+          tenantId,
+          organizationId: orgId,
+          values: customFieldValues,
+        })
+      }
+    })
+  } catch (error) {
+    console.error('[attachments] failed to persist attachment with custom attributes', error)
+    return NextResponse.json({ error: 'Failed to save attachment attributes.' }, { status: 500 })
+  }
 
   if (useLlmOcr) {
-    const ocrService = new OcrService()
-    if (ocrService.available) {
-      requestOcrProcessing(em, att, stored.absolutePath).catch((error) => {
-        console.error('[attachments] failed to queue OCR processing', error)
-      })
-    } else {
-      console.warn('[attachments] OCR requested but OPENAI_API_KEY not configured')
-    }
+    requestOcrProcessing(em, att, uploadDriver, storedPath).catch((error) => {
+      console.error('[attachments] failed to queue OCR processing', error)
+    })
+  } else if (wantsLlmOcr) {
+    console.warn('[attachments] OCR requested but OPENAI_API_KEY not configured, falling back to text extraction when available')
   }
 
   if (dataEngine) {
-    try {
-      await setCustomFieldsIfAny({
-        dataEngine,
-        entityId: E.attachments.attachment,
-        recordId: attachmentId,
-        tenantId,
-        organizationId: orgId,
-        values: customFieldValues,
-      })
-    } catch (error) {
-      console.error('[attachments] failed to persist custom attributes', error)
-      return NextResponse.json({ error: 'Failed to save attachment attributes.' }, { status: 500 })
-    }
     await emitCrudSideEffects({
       dataEngine,
       action: 'created',
@@ -402,6 +505,26 @@ export async function POST(req: Request) {
   })
 }
 
+async function readTenantAttachmentUsageBytes(em: EntityManager, tenantId: string): Promise<number> {
+  try {
+    const db = em.getKysely<any>() as any
+    const row = await db
+      .selectFrom('attachments')
+      .select(sql<string>`sum(file_size)`.as('total_size'))
+      .where('tenant_id', '=', tenantId)
+      .executeTakeFirst() as { total_size: string | number | null } | undefined
+    const total = row?.total_size
+    if (typeof total === 'number') return Number.isFinite(total) ? total : 0
+    if (typeof total === 'string') {
+      const parsed = Number(total)
+      return Number.isFinite(parsed) ? parsed : 0
+    }
+    return 0
+  } catch {
+    return 0
+  }
+}
+
 export async function DELETE(req: Request) {
   const auth = await getAuthFromRequest(req)
   if (!auth || !auth.tenantId || !auth.orgId) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
@@ -411,15 +534,21 @@ export async function DELETE(req: Request) {
   const { resolve } = await createRequestContainer()
   const em = resolve('em') as EntityManager
   const dataEngine = resolve('dataEngine')
+  const storageDriverFactory =
+    (resolve('storageDriverFactory') as StorageDriverFactory | null) ?? new StorageDriverFactory(em)
   const deleteFilter: Record<string, unknown> = { id, tenantId: auth.tenantId!, organizationId: auth.orgId }
   const record = await em.findOne(Attachment, deleteFilter)
   if (!record) return NextResponse.json({ error: 'Attachment not found' }, { status: 404 })
-  await em.removeAndFlush(record)
+  await em.remove(record).flush()
   await clearAttachmentThumbnailCache(record.partitionCode, record.id).catch((error) => {
     console.error('[attachments] failed to cleanup cached thumbnails', error)
   })
   if (record.storagePath) {
-    await deletePartitionFile(record.partitionCode, record.storagePath, record.storageDriver)
+    const delDriver = await storageDriverFactory.resolveForPartition(record.partitionCode, {
+      tenantId: record.tenantId ?? auth.tenantId!,
+      organizationId: record.organizationId ?? auth.orgId,
+    })
+    await delDriver.delete(record.partitionCode, record.storagePath)
   }
   if (dataEngine) {
     await emitCrudSideEffects({

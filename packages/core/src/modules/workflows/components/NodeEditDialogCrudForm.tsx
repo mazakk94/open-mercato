@@ -1,13 +1,12 @@
 'use client'
 
-import { Node } from '@xyflow/react'
+import type { Node } from '@xyflow/react'
 import { useState, useEffect, useCallback, useMemo } from 'react'
-import { useConfirmDialog } from '@open-mercato/ui/backend/confirm-dialog'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@open-mercato/ui/primitives/dialog'
 import { Badge } from '@open-mercato/ui/primitives/badge'
 import { Alert, AlertDescription } from '@open-mercato/ui/primitives/alert'
 import { Button } from '@open-mercato/ui/primitives/button'
-import { Info, Trash2 } from 'lucide-react'
+import { Trash2 } from 'lucide-react'
 import { CrudForm, type CrudFormGroup, type CrudField, type CrudCustomFieldRenderProps } from '@open-mercato/ui/backend/CrudForm'
 import { JsonBuilder } from '@open-mercato/ui/backend/JsonBuilder'
 import { FormFieldArrayEditor } from './fields/FormFieldArrayEditor'
@@ -58,7 +57,6 @@ export interface NodeEditDialogCrudFormProps {
  * - decision: Basic fields only
  */
 export function NodeEditDialogCrudForm({ node, isOpen, onClose, onSave, onDelete }: NodeEditDialogCrudFormProps) {
-  const { confirm, ConfirmDialogElement } = useConfirmDialog()
   const [initialValues, setInitialValues] = useState<Partial<NodeFormValues>>({})
   const [showJsonSchemaWarning, setShowJsonSchemaWarning] = useState(false)
 
@@ -94,18 +92,10 @@ export function NodeEditDialogCrudForm({ node, isOpen, onClose, onSave, onDelete
     }
   }, [node, onSave, onClose])
 
-  const handleDelete = useCallback(async () => {
+  const handleDelete = useCallback(() => {
     if (!node || !onDelete) return
-    const confirmed = await confirm({
-      title: 'Delete Step',
-      text: 'Are you sure you want to delete this step?',
-      variant: 'destructive',
-    })
-    if (!confirmed) return
-
     onDelete(node.id)
-    onClose()
-  }, [confirm, node, onDelete, onClose])
+  }, [node, onDelete])
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
     if (e.key === 'Escape') {
@@ -125,8 +115,7 @@ export function NodeEditDialogCrudForm({ node, isOpen, onClose, onSave, onDelete
           column: 1,
           bare: true,
           component: () => (
-            <Alert variant="default" className="border-blue-200 bg-blue-50">
-              <Info className="size-4" />
+            <Alert variant="info">
               <AlertDescription>
                 End nodes cannot be edited. They mark the completion of the workflow.
               </AlertDescription>
@@ -144,8 +133,7 @@ export function NodeEditDialogCrudForm({ node, isOpen, onClose, onSave, onDelete
           column: 1,
           bare: true,
           component: () => (
-            <Alert variant="default" className="border-blue-200 bg-blue-50 mb-4">
-              <Info className="size-4" />
+            <Alert variant="info" className="mb-4">
               <AlertDescription>
                 Start nodes mark the beginning of the workflow. You can define pre-conditions that must pass before the workflow can be started.
               </AlertDescription>
@@ -486,8 +474,7 @@ export function NodeEditDialogCrudForm({ node, isOpen, onClose, onSave, onDelete
         <div className="flex-1 overflow-y-auto min-h-0 px-6">
           {/* JSON Schema Conversion Warning */}
           {showJsonSchemaWarning && (
-            <Alert variant="default" className="border-blue-200 bg-blue-50 mb-4">
-              <Info className="size-4" />
+            <Alert variant="info" className="mb-4">
               <AlertDescription className="text-xs">
                 This form uses JSON Schema format. Fields have been converted for visual editing.
                 When you save, it will be converted to the simplified format. To preserve the original JSON Schema,
@@ -518,7 +505,6 @@ export function NodeEditDialogCrudForm({ node, isOpen, onClose, onSave, onDelete
             }
           />
         </div>
-        {ConfirmDialogElement}
       </DialogContent>
     </Dialog>
   )

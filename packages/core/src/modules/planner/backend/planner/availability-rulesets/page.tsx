@@ -4,15 +4,14 @@ import * as React from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import type { ColumnDef, SortingState } from '@tanstack/react-table'
-import type { PluggableList } from 'unified'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
 import { Page, PageBody } from '@open-mercato/ui/backend/Page'
+import { markdownToPlainText } from '@open-mercato/ui/backend/markdown/markdownToPlainText'
 import { DataTable, withDataTableNamespaces } from '@open-mercato/ui/backend/DataTable'
 import { RowActions } from '@open-mercato/ui/backend/RowActions'
 import { Button } from '@open-mercato/ui/primitives/button'
-import { readApiResultOrThrow } from '@open-mercato/ui/backend/utils/apiCall'
+import { readApiResultOrThrow, withScopedApiRequestHeaders } from '@open-mercato/ui/backend/utils/apiCall'
 import { deleteCrud } from '@open-mercato/ui/backend/utils/crud'
+import { buildOptimisticLockHeader } from '@open-mercato/ui/backend/utils/optimisticLock'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
 import { normalizeCrudServerError } from '@open-mercato/ui/backend/utils/serverErrors'
 import { useOrganizationScopeVersion } from '@open-mercato/shared/lib/frontend/useOrganizationScope'
@@ -21,9 +20,7 @@ import { useConfirmDialog } from '@open-mercato/ui/backend/confirm-dialog'
 import { formatDateTime } from '@open-mercato/shared/lib/time'
 
 const PAGE_SIZE = 50
-const MARKDOWN_PLUGINS: PluggableList = [remarkGfm]
-const MARKDOWN_SUBTEXT_CLASSNAME =
-  'line-clamp-2 text-xs text-muted-foreground [&>p]:m-0 [&_ul]:ml-4 [&_ul]:list-disc [&_ol]:ml-4 [&_ol]:list-decimal [&_code]:rounded [&_code]:bg-muted [&_code]:px-1 [&_code]:py-0.5'
+const SUBTEXT_CLASSNAME = 'line-clamp-2 text-xs text-muted-foreground'
 
 type RuleSetRow = {
   id: string
@@ -130,7 +127,10 @@ export default function PlannerAvailabilityRuleSetsPage() {
     })
     if (!confirmed) return
     try {
-      await deleteCrud('planner/availability-rule-sets', entry.id, { errorMessage: labels.errors.delete })
+      const headers = buildOptimisticLockHeader(entry.updatedAt)
+      await withScopedApiRequestHeaders(headers, () => (
+        deleteCrud('planner/availability-rule-sets', entry.id, { errorMessage: labels.errors.delete })
+      ))
       flash(labels.messages.deleted, 'success')
       handleRefresh()
     } catch (error) {
@@ -149,9 +149,9 @@ export default function PlannerAvailabilityRuleSetsPage() {
         <div className="flex flex-col">
           <span className="font-medium">{row.original.name}</span>
           {row.original.description ? (
-            <ReactMarkdown remarkPlugins={MARKDOWN_PLUGINS} className={MARKDOWN_SUBTEXT_CLASSNAME}>
-              {row.original.description}
-            </ReactMarkdown>
+            <span className={SUBTEXT_CLASSNAME}>
+              {markdownToPlainText(row.original.description)}
+            </span>
           ) : null}
         </div>
       ),
@@ -241,4 +241,3 @@ function mapRuleSet(item: Record<string, unknown>): RuleSetRow {
     updatedAt,
   }, item)
 }
-

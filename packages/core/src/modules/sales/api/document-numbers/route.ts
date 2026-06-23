@@ -5,7 +5,7 @@ import { getAuthFromRequest } from '@open-mercato/shared/lib/auth/server'
 import { resolveOrganizationScopeForRequest } from '@open-mercato/core/modules/directory/utils/organizationScope'
 import type { CommandRuntimeContext } from '@open-mercato/shared/lib/commands'
 import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
-import { CrudHttpError } from '@open-mercato/shared/lib/crud/errors'
+import { CrudHttpError, isCrudHttpError } from '@open-mercato/shared/lib/crud/errors'
 import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
 import type { RbacService } from '@open-mercato/core/modules/auth/services/rbacService'
 import { documentNumberRequestSchema } from '../../data/validators'
@@ -52,14 +52,20 @@ async function resolveRequestContext(req: Request): Promise<RequestContext> {
 
 async function ensureKindPermission(
   ctx: CommandRuntimeContext,
-  kind: 'order' | 'quote',
+  kind: 'order' | 'quote' | 'invoice' | 'credit_memo',
   translate: (key: string, fallback?: string) => string
 ) {
   const rbac = ctx.container.resolve('rbacService') as RbacService | null
   const auth = ctx.auth
   if (!rbac || !auth?.sub) return
+  const kindFeatureMap: Record<string, string> = {
+    order: 'sales.orders.manage',
+    quote: 'sales.quotes.manage',
+    invoice: 'sales.invoices.manage',
+    credit_memo: 'sales.credit_memos.manage',
+  }
   const requiredFeatures = [
-    kind === 'order' ? 'sales.orders.manage' : 'sales.quotes.manage',
+    kindFeatureMap[kind] ?? 'sales.orders.manage',
     'sales.documents.number.edit',
   ]
   const ok = await rbac.userHasAllFeatures(auth.sub, requiredFeatures, {
@@ -95,7 +101,7 @@ export async function POST(req: Request) {
       sequence: result.sequence,
     })
   } catch (err) {
-    if (err instanceof CrudHttpError) {
+    if (isCrudHttpError(err)) {
       return NextResponse.json(err.body, { status: err.status })
     }
     const { translate } = await resolveTranslations()

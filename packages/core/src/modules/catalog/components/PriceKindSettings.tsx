@@ -7,6 +7,7 @@ import { RowActions } from '@open-mercato/ui/backend/RowActions'
 import { Button } from '@open-mercato/ui/primitives/button'
 import { Input } from '@open-mercato/ui/primitives/input'
 import { Label } from '@open-mercato/ui/primitives/label'
+import { RadioGroup, Radio } from '@open-mercato/ui/primitives/radio'
 import {
   Dialog,
   DialogContent,
@@ -16,7 +17,8 @@ import {
   DialogTitle,
 } from '@open-mercato/ui/primitives/dialog'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
-import { apiCall, readApiResultOrThrow } from '@open-mercato/ui/backend/utils/apiCall'
+import { apiCall, readApiResultOrThrow, withScopedApiRequestHeaders } from '@open-mercato/ui/backend/utils/apiCall'
+import { buildOptimisticLockHeader, extractOptimisticLockConflict } from '@open-mercato/ui/backend/utils/optimisticLock'
 import { raiseCrudError } from '@open-mercato/ui/backend/utils/serverErrors'
 import { useOrganizationScopeVersion } from '@open-mercato/shared/lib/frontend/useOrganizationScope'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
@@ -210,11 +212,17 @@ export function PriceKindSettings() {
         dialog.mode === 'edit'
           ? JSON.stringify({ id: dialog.entry.id, ...payload })
           : JSON.stringify(payload)
-      const call = await apiCall(path, {
+      const savePriceKind = () => apiCall(path, {
         method,
         headers: { 'content-type': 'application/json' },
         body,
       })
+      const optimisticLockHeader = buildOptimisticLockHeader(
+        dialog.mode === 'edit' ? dialog.entry.updatedAt : null,
+      )
+      const call = Object.keys(optimisticLockHeader).length > 0
+        ? await withScopedApiRequestHeaders(optimisticLockHeader, savePriceKind)
+        : await savePriceKind()
       if (!call.ok) {
         await raiseCrudError(call.response, t('catalog.priceKinds.errors.save', 'Failed to save price kind.'))
       }
@@ -228,8 +236,9 @@ export function PriceKindSettings() {
       await loadItems()
     } catch (err) {
       console.error('catalog.price-kinds.save failed', err)
-      const message =
-        err instanceof Error ? err.message : t('catalog.priceKinds.errors.save', 'Failed to save price kind.')
+      const message = extractOptimisticLockConflict(err)
+        ? t('ui.forms.flash.recordModified', 'This record was modified by someone else. Refresh and try again.')
+        : err instanceof Error ? err.message : t('catalog.priceKinds.errors.save', 'Failed to save price kind.')
       setError(message)
     } finally {
       setSubmitting(false)
@@ -245,11 +254,15 @@ export function PriceKindSettings() {
       })
       if (!confirmed) return
       try {
-        const call = await apiCall('/api/catalog/price-kinds', {
+        const deletePriceKind = () => apiCall('/api/catalog/price-kinds', {
           method: 'DELETE',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ id: entry.id }),
         })
+        const optimisticLockHeader = buildOptimisticLockHeader(entry.updatedAt)
+        const call = Object.keys(optimisticLockHeader).length > 0
+          ? await withScopedApiRequestHeaders(optimisticLockHeader, deletePriceKind)
+          : await deletePriceKind()
         if (!call.ok) {
           await raiseCrudError(call.response, t('catalog.priceKinds.errors.delete', 'Failed to delete price kind.'))
         }
@@ -257,8 +270,9 @@ export function PriceKindSettings() {
         await loadItems()
       } catch (err) {
         console.error('catalog.price-kinds.delete failed', err)
-        const message =
-          err instanceof Error ? err.message : t('catalog.priceKinds.errors.delete', 'Failed to delete price kind.')
+        const message = extractOptimisticLockConflict(err)
+          ? t('ui.forms.flash.recordModified', 'This record was modified by someone else. Refresh and try again.')
+          : err instanceof Error ? err.message : t('catalog.priceKinds.errors.delete', 'Failed to delete price kind.')
         flash(message, 'error')
       }
     },
@@ -480,7 +494,12 @@ export function PriceKindSettings() {
               </div>
               <div className="space-y-2">
                 <Label>{t('catalog.priceKinds.form.displayModeLabel', 'Display mode')}</Label>
-                <div className="grid gap-2 md:grid-cols-2">
+                <RadioGroup
+                  className="grid gap-2 md:grid-cols-2"
+                  name="displayMode"
+                  value={form.displayMode}
+                  onValueChange={(next) => setForm((prev) => ({ ...prev, displayMode: next as CatalogPriceDisplayMode }))}
+                >
                   {displayModeOptions.map((mode) => (
                     <label
                       key={mode.value}
@@ -488,17 +507,11 @@ export function PriceKindSettings() {
                         form.displayMode === mode.value ? 'border-primary bg-primary/5' : 'border-border'
                       }`}
                     >
-                      <input
-                        type="radio"
-                        name="displayMode"
-                        value={mode.value}
-                        checked={form.displayMode === mode.value}
-                        onChange={() => setForm((prev) => ({ ...prev, displayMode: mode.value }))}
-                      />
+                      <Radio value={mode.value} />
                       <span>{mode.label}</span>
                     </label>
                   ))}
-                </div>
+                </RadioGroup>
               </div>
               <div className="space-y-2">
                 <Label>{t('catalog.priceKinds.form.currencyLabel', 'Currency (optional)')}</Label>
@@ -508,6 +521,7 @@ export function PriceKindSettings() {
                   fetchOptions={currencyOptionsLoader}
                   labels={currencyLabels}
                   allowInlineCreate={false}
+                  sortOptions="none"
                 />
               </div>
               <div className="flex flex-col gap-2">

@@ -1,6 +1,8 @@
 /** @type {import('jest').Config} */
+const base = require('../../jest.config.base.cjs')
+
 module.exports = {
-  preset: 'ts-jest',
+  ...base,
   testEnvironment: 'node',
   watchman: false,
   rootDir: '.',
@@ -28,16 +30,22 @@ module.exports = {
   },
   transform: {
     '^.+\\.(t|j)sx?$': [
-      'ts-jest',
+      '<rootDir>/../../scripts/jest-mikroorm-transformer.cjs',
       {
         tsconfig: {
           jsx: 'react-jsx',
+          rootDir: '.',
+          ignoreDeprecations: '6.0',
         },
       },
     ],
   },
   setupFiles: ['<rootDir>/../../jest.setup.ts'],
   setupFilesAfterEnv: ['<rootDir>/../../jest.dom.setup.ts'],
+  transformIgnorePatterns: [
+    '/node_modules/(?!(@mikro-orm|kysely|meilisearch)/)',
+    '\\.pnp\\.[^\\/]+$',
+  ],
   testMatch: ['<rootDir>/src/**/__tests__/**/*.test.(ts|tsx)'],
   passWithNoTests: true,
 }

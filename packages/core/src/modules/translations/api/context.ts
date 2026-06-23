@@ -5,16 +5,23 @@ import { CrudHttpError } from '@open-mercato/shared/lib/crud/errors'
 import type { CommandRuntimeContext } from '@open-mercato/shared/lib/commands'
 import type { EntityManager } from '@mikro-orm/postgresql'
 import type { AwilixContainer } from 'awilix'
-import type { Knex } from 'knex'
+import type { Kysely } from 'kysely'
 
 export type TranslationsRouteContext = {
   container: AwilixContainer
   auth: NonNullable<Awaited<ReturnType<typeof getAuthFromRequest>>>
   em: EntityManager
-  knex: Knex
+  db: Kysely<any>
   organizationId: string | null
   tenantId: string
   commandCtx: CommandRuntimeContext
+}
+
+export function resolveTranslationsActorId(auth: TranslationsRouteContext['auth']): string {
+  if (typeof auth.sub === 'string' && auth.sub.trim().length > 0) return auth.sub
+  if (typeof auth.userId === 'string' && auth.userId.trim().length > 0) return auth.userId
+  if (typeof auth.keyId === 'string' && auth.keyId.trim().length > 0) return auth.keyId
+  return 'system'
 }
 
 export async function resolveTranslationsRouteContext(req: Request): Promise<TranslationsRouteContext> {
@@ -26,7 +33,7 @@ export async function resolveTranslationsRouteContext(req: Request): Promise<Tra
 
   const scope = await resolveOrganizationScopeForRequest({ container, auth, request: req })
   const em = container.resolve('em') as EntityManager
-  const knex = (em as unknown as { getConnection(): { getKnex(): Knex } }).getConnection().getKnex()
+  const db = em.getKysely<any>()
   const tenantId: string = scope?.tenantId ?? auth.tenantId
   const organizationId = scope?.selectedId ?? auth.orgId ?? null
 
@@ -43,7 +50,7 @@ export async function resolveTranslationsRouteContext(req: Request): Promise<Tra
     container,
     auth,
     em,
-    knex,
+    db,
     organizationId,
     tenantId,
     commandCtx,

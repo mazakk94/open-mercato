@@ -9,6 +9,7 @@ import { executeTool } from './tool-executor'
 import { loadAllModuleTools, indexToolsForSearch } from './tool-loader'
 import { authenticateMcpRequest, extractApiKeyFromHeaders, hasRequiredFeatures } from './auth'
 import { jsonSchemaToZod, toSafeZodSchema } from './schema-utils'
+import { redactSecretForLog, deriveApiKeySessionId } from './log-redaction'
 import type { McpServerConfig, McpToolContext } from './types'
 import type { SearchService } from '@open-mercato/search/service'
 import type { RbacService } from '@open-mercato/core/modules/auth/services/rbacService'
@@ -42,7 +43,7 @@ async function resolveSessionContext(
     const sessionResult = await findSessionApiKeyWithSecret(em, sessionToken)
     if (!sessionResult) {
       if (debug) {
-        console.error(`[MCP HTTP] Session token not found, expired, or secret unavailable: ${sessionToken}`)
+        console.error(`[MCP HTTP] Session token not found, expired, or secret unavailable: ${redactSecretForLog(sessionToken)}`)
       }
       return null
     }
@@ -277,7 +278,7 @@ function createMcpServerForRequest(
             if (!effectiveContext.sessionId && effectiveContext.apiKeySecret) {
               effectiveContext = {
                 ...effectiveContext,
-                sessionId: 'apikey_' + effectiveContext.apiKeySecret.slice(0, 16),
+                sessionId: deriveApiKeySessionId(effectiveContext.apiKeySecret),
               }
             }
           }
@@ -435,21 +436,14 @@ export async function runMcpHttpServer(options: McpHttpServerOptions): Promise<v
     console.error('[MCP HTTP] OpenAPI spec caching skipped:', error instanceof Error ? error.message : error)
   }
 
-  // Index tools, API endpoints, and entity schemas for hybrid search discovery (if search service available)
+  // Index tools and entity schemas for hybrid search discovery (if search service available)
   try {
     const searchService = container.resolve('searchService') as SearchService
 
     // Index MCP tools
     await indexToolsForSearch(searchService)
 
-    // Index API endpoints for find_api
-    const { indexApiEndpoints } = await import('./api-endpoint-index')
-    const endpointCount = await indexApiEndpoints(searchService)
-    if (endpointCount > 0) {
-      console.error(`[MCP HTTP] Indexed ${endpointCount} API endpoints for hybrid search`)
-    }
-
-    // Index entity schemas for discover_schema
+    // Index entity schemas for hybrid search
     try {
       const { getCachedEntityGraph } = await import('./entity-graph')
       const { indexEntitiesForSearch } = await import('./entity-index')

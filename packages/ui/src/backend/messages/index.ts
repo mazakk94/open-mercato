@@ -15,8 +15,22 @@ export type { MessageObjectRecordPickerProps } from './MessageObjectRecordPicker
 export { MessagesIcon } from './MessagesIcon'
 export type { MessagesIconProps } from './MessagesIcon'
 
+export { useMessages } from './useMessages'
 export { useMessagesPoll } from './useMessagesPoll'
+export { useMessagesSse } from './useMessagesSse'
 export type { MessagePollItem, UseMessagesPollResult } from './useMessagesPoll'
 
 export { MessageObjectPreview } from './MessageObjectPreview'
 export { MessageObjectDetail } from './MessageObjectDetail'
+
+export { EmailThreadsPanel } from './EmailThreadsPanel'
+export type {
+  EmailThread,
+  EmailThreadMessage,
+  EmailThreadMessageStatus,
+  EmailThreadDirection,
+  EmailThreadsPanelProps,
+} from './EmailThreadsPanel'
+
+export { mergeOptimisticEmailThreads } from './mergeOptimisticEmailThreads'
+export type { OptimisticEmailMessage } from './mergeOptimisticEmailThreads'
