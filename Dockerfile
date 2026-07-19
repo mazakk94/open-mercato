@@ -38,7 +38,10 @@ COPY packages/storage-s3/package.json ./packages/storage-s3/
 COPY packages/sync-akeneo/package.json ./packages/sync-akeneo/
 COPY packages/ui/package.json ./packages/ui/
 COPY packages/webhooks/package.json ./packages/webhooks/
+COPY external/official-modules/packages/carrier-inpost/package.json ./external/official-modules/packages/carrier-inpost/
+COPY external/official-modules/packages/forms/package.json ./external/official-modules/packages/forms/
 COPY external/official-modules/packages/risk-management/package.json ./external/official-modules/packages/risk-management/
+COPY external/official-modules/packages/test-package/package.json ./external/official-modules/packages/test-package/
 COPY scripts/official-modules-setup.mjs ./scripts/
 COPY scripts/lib/official-modules.mjs ./scripts/lib/
 
@@ -111,7 +114,10 @@ COPY packages/storage-s3/package.json ./packages/storage-s3/
 COPY packages/sync-akeneo/package.json ./packages/sync-akeneo/
 COPY packages/ui/package.json ./packages/ui/
 COPY packages/webhooks/package.json ./packages/webhooks/
+COPY external/official-modules/packages/carrier-inpost/package.json ./external/official-modules/packages/carrier-inpost/
+COPY external/official-modules/packages/forms/package.json ./external/official-modules/packages/forms/
 COPY external/official-modules/packages/risk-management/package.json ./external/official-modules/packages/risk-management/
+COPY external/official-modules/packages/test-package/package.json ./external/official-modules/packages/test-package/
 COPY scripts/official-modules-setup.mjs ./scripts/
 COPY scripts/lib/official-modules.mjs ./scripts/lib/
 
@@ -224,7 +230,10 @@ COPY --from=builder /app/packages/storage-s3/package.json ./packages/storage-s3/
 COPY --from=builder /app/packages/sync-akeneo/package.json ./packages/sync-akeneo/
 COPY --from=builder /app/packages/ui/package.json ./packages/ui/
 COPY --from=builder /app/packages/webhooks/package.json ./packages/webhooks/
+COPY --from=builder /app/external/official-modules/packages/carrier-inpost/package.json ./external/official-modules/packages/carrier-inpost/
+COPY --from=builder /app/external/official-modules/packages/forms/package.json ./external/official-modules/packages/forms/
 COPY --from=builder /app/external/official-modules/packages/risk-management/package.json ./external/official-modules/packages/risk-management/
+COPY --from=builder /app/external/official-modules/packages/test-package/package.json ./external/official-modules/packages/test-package/
 
 # Install only production dependencies
 RUN yarn workspaces focus @open-mercato/app --production

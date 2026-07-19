@@ -24,6 +24,7 @@ coverage
 
 # Generated files (will be regenerated)
 apps/mercato/.mercato/generated
+apps/mercato/.mercato/next
 packages/core/generated
 
 # Local development files
