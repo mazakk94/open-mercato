@@ -178,6 +178,8 @@
     "yaml": "2.8.3"
   },
   "resolutions": {
+    "@open-mercato/shared@npm:0.6.3-develop.3778.1.25fdb35f2e": "workspace:*",
+    "@open-mercato/ui@npm:0.6.3-develop.3778.1.25fdb35f2e": "workspace:*",
     "@xmldom/xmldom": "0.8.13",
     "tmp": "0.2.7",
     "@hono/node-server": "1.19.14",

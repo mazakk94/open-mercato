@@ -38,6 +38,7 @@ COPY packages/storage-s3/package.json ./packages/storage-s3/
 COPY packages/sync-akeneo/package.json ./packages/sync-akeneo/
 COPY packages/ui/package.json ./packages/ui/
 COPY packages/webhooks/package.json ./packages/webhooks/
+COPY external/official-modules/packages/risk-management/package.json ./external/official-modules/packages/risk-management/
 COPY scripts/official-modules-setup.mjs ./scripts/
 COPY scripts/lib/official-modules.mjs ./scripts/lib/
 
@@ -47,6 +48,7 @@ RUN yarn install --immutable
 # Copy source files after dependencies are installed.
 COPY packages/ ./packages/
 COPY apps/ ./apps/
+COPY external/official-modules/packages/risk-management/ ./external/official-modules/packages/risk-management/
 COPY scripts/ ./scripts/
 
 # Copy other necessary files
@@ -58,6 +60,7 @@ COPY eslint.config.mjs ./
 # Build the app
 # Limit Node.js heap to 4GB and reduce worker count to avoid OOM in constrained Docker environments
 ENV NODE_OPTIONS="--max-old-space-size=4096"
+RUN node external/official-modules/packages/risk-management/build.mjs
 RUN yarn build
 
 # Dev prebuild stage: install + build at NATIVE VM filesystem speed.
@@ -108,6 +111,7 @@ COPY packages/storage-s3/package.json ./packages/storage-s3/
 COPY packages/sync-akeneo/package.json ./packages/sync-akeneo/
 COPY packages/ui/package.json ./packages/ui/
 COPY packages/webhooks/package.json ./packages/webhooks/
+COPY external/official-modules/packages/risk-management/package.json ./external/official-modules/packages/risk-management/
 COPY scripts/official-modules-setup.mjs ./scripts/
 COPY scripts/lib/official-modules.mjs ./scripts/lib/
 
@@ -115,6 +119,7 @@ RUN yarn install --immutable
 
 COPY packages/ ./packages/
 COPY apps/ ./apps/
+COPY external/official-modules/packages/risk-management/ ./external/official-modules/packages/risk-management/
 COPY scripts/ ./scripts/
 COPY newrelic.js ./
 COPY jest.config.cjs jest.setup.ts jest.dom.setup.ts ./
@@ -124,7 +129,10 @@ COPY eslint.config.mjs ./
 # up dist/generated — the same sequence dev-entrypoint.sh runs, done once here.
 # `yarn generate` degrades gracefully without a database (skips cache purge).
 ENV NODE_OPTIONS="--max-old-space-size=4096"
-RUN yarn build:packages && yarn generate && yarn build:packages
+RUN node external/official-modules/packages/risk-management/build.mjs \
+ && yarn build:packages \
+ && yarn generate \
+ && yarn build:packages
 
 # Dev stage: lean runtime + /opt/prebuilt artifacts for volume seeding.
 # Stage-to-stage COPY keeps a SINGLE copy of node_modules in the final image
@@ -216,12 +224,14 @@ COPY --from=builder /app/packages/storage-s3/package.json ./packages/storage-s3/
 COPY --from=builder /app/packages/sync-akeneo/package.json ./packages/sync-akeneo/
 COPY --from=builder /app/packages/ui/package.json ./packages/ui/
 COPY --from=builder /app/packages/webhooks/package.json ./packages/webhooks/
+COPY --from=builder /app/external/official-modules/packages/risk-management/package.json ./external/official-modules/packages/risk-management/
 
 # Install only production dependencies
 RUN yarn workspaces focus @open-mercato/app --production
 
 # Copy workspace sources after production dependencies are installed.
 COPY --from=builder /app/packages/ ./packages/
+COPY --from=builder /app/external/official-modules/packages/risk-management/ ./external/official-modules/packages/risk-management/
 
 # Copy built Next.js application
 COPY --from=builder /app/apps/mercato/.mercato/next ./apps/mercato/.mercato/next

@@ -47,6 +47,17 @@ export interface PackageResolver {
   getPackageRoot(from?: string): string
 }
 
+function linkedWorkspacePackageRoot(rootDir: string, from?: string): string | null {
+  if (!from?.startsWith('@open-mercato/')) return null
+  const linkedRoot = path.join(rootDir, 'node_modules', ...from.split('/'))
+  if (!fs.existsSync(linkedRoot)) return null
+  try {
+    return fs.realpathSync(linkedRoot)
+  } catch {
+    return null
+  }
+}
+
 function pkgDirFor(rootDir: string, from?: string, isMonorepo = true): string {
   if (!isMonorepo) {
     const pkgName = from || '@open-mercato/core'
@@ -59,6 +70,11 @@ function pkgDirFor(rootDir: string, from?: string, isMonorepo = true): string {
   // Monorepo mode - read from src/modules (TypeScript source)
   if (!from || from === '@open-mercato/core') {
     return path.resolve(rootDir, 'packages/core/src/modules')
+  }
+  const linkedRoot = linkedWorkspacePackageRoot(rootDir, from)
+  if (linkedRoot) {
+    const linkedModules = path.join(linkedRoot, 'src', 'modules')
+    if (fs.existsSync(linkedModules)) return linkedModules
   }
   // Support other local packages like '@open-mercato/onboarding' => packages/onboarding/src/modules
   const m = from.match(/^@open-mercato\/(.+)$/)
@@ -78,6 +94,8 @@ function pkgRootFor(rootDir: string, from?: string, isMonorepo = true): string {
   if (!from || from === '@open-mercato/core') {
     return path.resolve(rootDir, 'packages/core')
   }
+  const linkedRoot = linkedWorkspacePackageRoot(rootDir, from)
+  if (linkedRoot) return linkedRoot
   const m = from.match(/^@open-mercato\/(.+)$/)
   if (m) {
     return path.resolve(rootDir, `packages/${m[1]}`)
@@ -263,10 +281,13 @@ function collectPushEntriesFromStatement(
   })
 }
 
-function parseModulesFromSource(source: string, env: NodeJS.ProcessEnv = process.env): ModuleEntry[] {
+function parseModulesFromSource(
+  source: string,
+  env: NodeJS.ProcessEnv = process.env,
+  variableName = 'enabledModules',
+): ModuleEntry[] {
   const sourceFile = ts.createSourceFile('modules.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
   const modules: ModuleEntry[] = []
-  const variableName = 'enabledModules'
   const scope = new Map<string, unknown>()
   let foundDeclaration = false
 
@@ -307,7 +328,20 @@ function parseModulesFromSource(source: string, env: NodeJS.ProcessEnv = process
 
 function readEnabledModulesFromConfig(cfgPath: string): ModuleEntry[] {
   const source = fs.readFileSync(cfgPath, 'utf8')
-  return parseModulesFromSource(source)
+  const modules = parseModulesFromSource(source)
+  const officialModulesPath = path.join(path.dirname(cfgPath), 'official-modules.generated.ts')
+  if (!fs.existsSync(officialModulesPath)) return modules
+
+  const officialSource = fs.readFileSync(officialModulesPath, 'utf8')
+  const officialModules = parseModulesFromSource(
+    officialSource,
+    process.env,
+    'officialModuleEntries',
+  )
+  for (const entry of officialModules) {
+    if (!modules.some((existing) => existing.id === entry.id)) modules.push(entry)
+  }
+  return modules
 }
 
 function loadEnabledModulesFromConfig(appDir: string): ModuleEntry[] {

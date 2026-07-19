@@ -67,6 +67,23 @@ if (enabledModules.some((entry) => entry.id === 'example')) {
   )
 }
 
+function writeOfficialModulesConfig(rootDir: string) {
+  const srcDir = path.join(rootDir, 'src')
+  fs.mkdirSync(srcDir, { recursive: true })
+  fs.writeFileSync(
+    path.join(srcDir, 'official-modules.generated.ts'),
+    `
+import type { ModuleEntry } from './modules'
+
+export const officialModuleEntries: ModuleEntry[] = [
+  { id: 'risk_management', from: '@open-mercato/risk-management' },
+  { id: 'customers', from: '@open-mercato/duplicate-must-not-win' },
+]
+`,
+    'utf8',
+  )
+}
+
 describe('resolver enterprise module toggle', () => {
   const originalEnv = process.env.OM_ENABLE_ENTERPRISE_MODULES
   const originalResolverMarker = (globalThis as Record<string, unknown>).__resolver_evaluated__
@@ -139,5 +156,18 @@ describe('resolver enterprise module toggle', () => {
         { id: 'example_customers_sync', from: '@app' },
       ]),
     )
+  })
+
+  it('loads and deduplicates the generated Official Modules registry', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'resolver-official-modules-'))
+    writeModulesConfig(tempDir)
+    writeOfficialModulesConfig(tempDir)
+
+    const modules = createResolver(tempDir).loadEnabledModules()
+
+    expect(modules).toEqual([
+      { id: 'customers', from: '@open-mercato/core' },
+      { id: 'risk_management', from: '@open-mercato/risk-management' },
+    ])
   })
 })

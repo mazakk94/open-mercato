@@ -11,4 +11,5 @@
 import type { ModuleEntry } from './modules'
 
 export const officialModuleEntries: ModuleEntry[] = [
+  { id: 'risk_management', from: '@open-mercato/risk-management' },
 ]

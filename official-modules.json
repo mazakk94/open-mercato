@@ -1,7 +1,14 @@
 {
-  "repo": "https://github.com/open-mercato/official-modules.git",
+  "repo": "https://github.com/mazakk94/official-modules.git",
   "path": "external/official-modules",
-  "branch": "main",
-  "available": [],
-  "activated": []
+  "branch": "feat/risk-management",
+  "available": [
+    "carrier-inpost",
+    "forms",
+    "risk-management",
+    "test-package"
+  ],
+  "activated": [
+    "risk-management"
+  ]
 }
