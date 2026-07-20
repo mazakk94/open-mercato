@@ -42,6 +42,7 @@ COPY external/official-modules/packages/carrier-inpost/package.json ./external/o
 COPY external/official-modules/packages/forms/package.json ./external/official-modules/packages/forms/
 COPY external/official-modules/packages/risk-management/package.json ./external/official-modules/packages/risk-management/
 COPY external/official-modules/packages/test-package/package.json ./external/official-modules/packages/test-package/
+COPY external/official-modules/tsconfig.base.json ./external/official-modules/
 COPY scripts/official-modules-setup.mjs ./scripts/
 COPY scripts/lib/official-modules.mjs ./scripts/lib/
 
