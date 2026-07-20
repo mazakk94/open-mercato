@@ -708,12 +708,12 @@ temporary contract names.
 ### Tasks
 
 - [x] Complete pre-implementation review.
-- [ ] Implement entity, migration/snapshot, constraints, indexes, encryption,
+- [x] Implement entity, migration/snapshot, constraints, indexes, encryption,
       validators, scoring, ACL/setup, commands/events, CRUD, and OpenAPI.
-- [ ] Implement canonical `DataTable` and `CrudForm` flows.
-- [ ] Add unit/API/component tests and self-contained CRUD integration tests.
-- [ ] Verify `OM_SEARCH_STORE_RAW_TOKENS` is unset or `false`.
-- [ ] Generate but do not apply migrations during local planning/review without
+- [x] Implement canonical `DataTable` and `CrudForm` flows.
+- [x] Add unit/API/component tests and self-contained CRUD integration tests.
+- [x] Verify `OM_SEARCH_STORE_RAW_TOKENS` is unset or `false`.
+- [x] Generate but do not apply migrations during local planning/review without
       approval.
 - [ ] Ensure migration failures are fatal/independently verified as required by
       Safety Rule 7.
@@ -723,6 +723,33 @@ temporary contract names.
 - [ ] Deploy and verify migration identity/status before smoke tests.
 - [ ] Synchronize and test view/manage ACLs, API denial, and cross-tenant
       isolation using the declared role matrix.
+
+### Local implementation record — 2026-07-20
+
+- Runner: local for package/platform checks; Docker-backed disposable
+  PostgreSQL and production application build at `http://127.0.0.1:5001` for
+  migration and Playwright verification.
+- The Official Module builds successfully with 34 emitted entry points; its
+  five Jest suites pass all 40 tests and package typecheck is clean.
+- Official Module implementation commit
+  `25c6e7a2a91c2072473e4fa5c65e7f9c25e053c9` is pushed to
+  `mazakk94/official-modules:feat/risk-management`.
+- Host `yarn generate` completed using the supported static OpenAPI fallback,
+  host typecheck passed, and lint completed with 12 pre-existing warnings and
+  no errors.
+- Platform guards passed: 84 tests across module decoupling, editable-entity
+  optimistic locking, and mutating-UI optimistic-lock coverage.
+- Eight Playwright tests passed, covering sidebar/direct-route ACL behavior,
+  persistent register loading, complete UI create/edit/reload/delete, strict
+  API scope ownership, server scoring, category/criticality filtering, and a
+  stale optimistic-lock conflict. Test fixtures are deleted in `finally`.
+- The disposable environment applied the additive Risk Management migration
+  and completed a clean production application build. No developer or staging
+  database migration was applied.
+- `OM_SEARCH_STORE_RAW_TOKENS=false` is set for the application environment.
+- Staging deployment remains intentionally pending the documented backup,
+  explicit migration approval, and post-deploy migration/ACL/browser
+  verification.
 
 ### Demo and stop condition
 
