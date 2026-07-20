@@ -569,8 +569,16 @@ through the ACL contract.
 - the identification route declares
   `requireFeatures: ['risk_management.risk.identify']`;
 - both routes use the same translated `pageGroupKey`, distinct translated
-  `pageTitleKey` values, deterministic `pageOrder` values, and `pageContext:
-  'main'`;
+  `pageTitleKey` values, `pagePriority: 0`, deterministic `pageOrder` values
+  (`10` for Register and `20` for Identify), and `pageContext: 'main'`;
+- this metadata places Risk Management first among optional-module groups, but
+  Open Mercato intentionally keeps its known core groups in a protected default
+  order; the module must not couple core navigation to an optional package just
+  to override that order;
+- for the staging demonstration, use the built-in Sidebar Customization page to
+  move the `risk_management.nav.group` group to the absolute first position and
+  apply that layout to the staging `admin` role; inspect and reconcile any
+  user-level sidebar preference that would override the role layout;
 - the temporary `/backend/risk-management` shell remains only as a
   `navHidden: true` compatibility redirect to the register and must not create
   a third sidebar item;
@@ -603,7 +611,11 @@ through the ACL contract.
       `risk_management.risk.identify`.
 - [ ] Use shared design-system primitives and EN/PL/DE/ES translations.
 - [ ] Add a navigation-registry test asserting the translated group, exact two
-      paths, order, `pageContext`, `navHidden` behavior, and feature gates.
+      paths, priority/order, `pageContext`, `navHidden` behavior, and feature
+      gates.
+- [ ] Configure a staging sidebar variant with Risk Management first, apply it
+      to the `admin` role through the supported Sidebar Customization flow, and
+      record the prior preference so the change can be rolled back.
 - [ ] Add Playwright coverage that logs in as the real/default admin role,
       expands the main sidebar, sees both entries, clicks each entry, and
       verifies the expected URL and page heading.
@@ -624,10 +636,10 @@ through the ACL contract.
 
 ### Demo and stop condition
 
-Show the expanded Risk Management sidebar group as the staging admin, click
-both destinations, and prove that reload creates no record and sends no AI
-request. Also record evidence that the same entries are absent and both direct
-routes are denied for a plain employee.
+Show the expanded Risk Management group in the absolute first sidebar position
+as the staging admin, click both destinations, and prove that reload creates no
+record and sends no AI request. Also record evidence that the same entries are
+absent and both direct routes are denied for a plain employee.
 
 Safe to stop: stakeholders can review the information architecture with no
 schema, write, or AI cost.

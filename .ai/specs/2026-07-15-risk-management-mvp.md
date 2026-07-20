@@ -533,6 +533,14 @@ No persisted enum uses a translated label.
 
 Only register and identify appear in navigation. Each route has colocated `page.meta.ts`, translated breadcrumbs, and server-enforced feature metadata. The identify navigation/page is gated only by the risk feature; it does not disappear merely because AI Assistant is inactive.
 
+Both routes declare `pagePriority: 0`; Register uses `pageOrder: 10` and
+Identify uses `pageOrder: 20`. This keeps the two entries deterministic and
+places Risk Management first among optional-module groups. Absolute placement
+ahead of Open Mercato's protected core-group defaults is a host/sidebar
+preference, not an Official Module contract; staging may apply a saved
+Risk-Management-first layout to the `admin` role through Sidebar Customization
+without coupling core code to this optional package.
+
 ### Risk Register
 
 Use `Page`, `PageHeader`, `PageBody`, and `DataTable`; do not copy the prototype’s raw table.
