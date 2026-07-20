@@ -111,6 +111,7 @@ function resolveEnabledModuleIds(projectRoot: string): Set<string> {
   const appModulesRoot = path.join(projectRoot, 'src', 'modules')
   const appsRoot = path.join(projectRoot, 'apps')
   const packagesRoot = path.join(projectRoot, 'packages')
+  const officialPackagesRoot = path.join(projectRoot, 'external', 'official-modules', 'packages')
   const installedPackagesRoot = path.join(projectRoot, 'node_modules', '@open-mercato')
   const enterpriseEnabled = isEnterpriseModulesEnabled()
 
@@ -126,6 +127,10 @@ function resolveEnabledModuleIds(projectRoot: string): Set<string> {
       continue
     }
     const moduleRoot = path.join(packagesRoot, packageName, 'src', 'modules')
+    collectModuleIdsFromModulesRoot(moduleRoot, enabledModules)
+  }
+  for (const packageName of collectDirectDirectoryNames(officialPackagesRoot)) {
+    const moduleRoot = path.join(officialPackagesRoot, packageName, 'src', 'modules')
     collectModuleIdsFromModulesRoot(moduleRoot, enabledModules)
   }
   // Standalone app: installed @open-mercato packages in node_modules
@@ -350,6 +355,7 @@ export function discoverIntegrationSpecFiles(projectRoot: string, legacyIntegrat
     path.join(projectRoot, 'src', 'modules'),
     path.join(projectRoot, 'apps'),
     path.join(projectRoot, 'packages'),
+    path.join(projectRoot, 'external', 'official-modules', 'packages'),
     path.join(projectRoot, 'node_modules', '@open-mercato'),
   ]
 

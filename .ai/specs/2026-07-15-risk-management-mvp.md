@@ -535,10 +535,13 @@ Only register and identify appear in navigation. Each route has colocated `page.
 
 Both routes declare `pagePriority: 0`; Register uses `pageOrder: 10` and
 Identify uses `pageOrder: 20`. This keeps the two entries deterministic and
-places Risk Management first among optional-module groups. Absolute placement
+places the user-facing `Risk AI` group first among optional-module groups.
+`Risk AI` is the product/module title; the stable package, module ID, routes,
+ACL IDs, and persistence contracts retain the `risk-management` /
+`risk_management` technical namespace. Absolute placement
 ahead of Open Mercato's protected core-group defaults is a host/sidebar
 preference, not an Official Module contract; staging may apply a saved
-Risk-Management-first layout to the `admin` role through Sidebar Customization
+Risk-AI-first layout to the `admin` role through Sidebar Customization
 without coupling core code to this optional package.
 
 ### Risk Register

@@ -159,6 +159,19 @@ describe('integration discovery', () => {
     ])
   })
 
+  it('discovers source-backed Official Module integration tests', async () => {
+    await writeTestFile(
+      tempRoot,
+      'external/official-modules/packages/risk-management/src/modules/risk_management/__integration__/TC-RISK-001.spec.ts',
+      'export {}\n',
+    )
+
+    const discovered = discoverIntegrationSpecFiles(tempRoot, path.join(tempRoot, '.ai', 'qa', 'tests'))
+    expect(discovered.map((entry) => entry.path)).toEqual([
+      'external/official-modules/packages/risk-management/src/modules/risk_management/__integration__/TC-RISK-001.spec.ts',
+    ])
+  })
+
   it('applies folder and per-test metadata environment requirements', async () => {
     await writeTestFile(tempRoot, 'packages/ai-assistant/src/modules/ai_assistant/.gitkeep')
     await writeTestFile(

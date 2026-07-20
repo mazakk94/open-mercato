@@ -12,6 +12,10 @@ demonstration, and be safe to leave deployed if work stops there.
 **Target module:** Official Module package
 `@open-mercato/risk-management`, module ID `risk_management`.
 
+**Product name:** `Risk AI`. The package name and module ID remain stable so
+activation, ACL, route, migration, and rollback contracts do not change when
+the user-facing brand is applied.
+
 **Application deployment:** Direct Ansible deployment from the local
 `open-mercato-infra` repository. Do not use
 `.github/workflows/dev-deploy.yml` or Dokploy for this plan.
@@ -560,7 +564,7 @@ through the ACL contract.
 
 **Sidebar contract:**
 
-- the expanded main sidebar contains one translated `Risk Management` group;
+- the expanded main sidebar contains one `Risk AI` group;
 - the group contains exactly two top-level destinations in this order:
   `Risk Register` → `/backend/risk-management/risks`, then
   `Identify Risks` → `/backend/risk-management/identify`;
@@ -571,7 +575,7 @@ through the ACL contract.
 - both routes use the same translated `pageGroupKey`, distinct translated
   `pageTitleKey` values, `pagePriority: 0`, deterministic `pageOrder` values
   (`10` for Register and `20` for Identify), and `pageContext: 'main'`;
-- this metadata places Risk Management first among optional-module groups, but
+- this metadata places Risk AI first among optional-module groups, but
   Open Mercato intentionally keeps its known core groups in a protected default
   order; the module must not couple core navigation to an optional package just
   to override that order;
@@ -613,7 +617,7 @@ through the ACL contract.
 - [ ] Add a navigation-registry test asserting the translated group, exact two
       paths, priority/order, `pageContext`, `navHidden` behavior, and feature
       gates.
-- [ ] Configure a staging sidebar variant with Risk Management first, apply it
+- [ ] Configure a staging sidebar variant with Risk AI first, apply it
       to the `admin` role through the supported Sidebar Customization flow, and
       record the prior preference so the change can be rolled back.
 - [ ] Add Playwright coverage that logs in as the real/default admin role,
@@ -636,7 +640,7 @@ through the ACL contract.
 
 ### Demo and stop condition
 
-Show the expanded Risk Management group in the absolute first sidebar position
+Show the expanded Risk AI group in the absolute first sidebar position
 as the staging admin, click both destinations, and prove that reload creates no
 record and sends no AI request. Also record evidence that the same entries are
 absent and both direct routes are denied for a plain employee.
