@@ -608,36 +608,55 @@ through the ACL contract.
 
 ### Tasks
 
-- [ ] Add the two route roots and registry-safe metadata implementing the exact
+- [x] Add the two route roots and registry-safe metadata implementing the exact
       Sidebar contract above.
-- [ ] Replace the temporary landing navigation with Register and Identify,
+- [x] Replace the temporary landing navigation with Register and Identify,
       retaining only the hidden compatibility redirect.
-- [ ] Add `risk_management.risk.view` and
+- [x] Add `risk_management.risk.view` and
       `risk_management.risk.identify`.
-- [ ] Use shared design-system primitives and EN/PL/DE/ES translations.
-- [ ] Add a navigation-registry test asserting the translated group, exact two
+- [x] Use shared design-system primitives and EN/PL/DE/ES translations.
+- [x] Add a navigation-registry test asserting the translated group, exact two
       paths, priority/order, `pageContext`, `navHidden` behavior, and feature
       gates.
-- [ ] Configure a staging sidebar variant with Risk AI first, apply it
+- [x] Configure a staging sidebar variant with Risk AI first, apply it
       to the `admin` role through the supported Sidebar Customization flow, and
       record the prior preference so the change can be rolled back.
-- [ ] Add Playwright coverage that logs in as the real/default admin role,
+- [x] Add Playwright coverage that logs in as the real/default admin role,
       expands the main sidebar, sees both entries, clicks each entry, and
       verifies the expected URL and page heading.
-- [ ] Add direct-route ACL coverage proving admin and superadmin can open both
+- [x] Add direct-route ACL coverage proving admin and superadmin can open both
       pages while a plain employee sees neither sidebar entry and receives the
       standard access-denied result for both direct URLs.
-- [ ] Add hydration, accessibility, and no-network tests for both preview
+- [x] Add hydration, accessibility, and no-network tests for both preview
       pages.
-- [ ] Commit/push module, update host gitlink, validate, and deploy through the
+- [x] Commit/push module, update host gitlink, validate, and deploy through the
       recurring workflow.
-- [ ] Synchronize target-tenant role ACLs, invalidate `rbac:all`, purge
+- [x] Synchronize target-tenant role ACLs, invalidate `rbac:all`, purge
       structural navigation cache for all tenants, and then verify both access
       paths with a fresh admin browser session.
-- [ ] Inspect the actual staging admin's role assignments and any user-level
+- [x] Inspect the actual staging admin's role assignments and any user-level
       ACL override; do not accept the role definition alone as proof of access.
-- [ ] Record the ACL row changes and test navigation plus direct-route denial
+- [x] Record the ACL row changes and test navigation plus direct-route denial
       with the declared role matrix.
+
+### Execution record — 2026-07-20
+
+- Deployed host commit:
+  `0be1461995d820a153fce22ede06ebe21a160c39`.
+- Deployed Official Modules commit:
+  `001551e228277a21e03125a6ca5bb1150d117830`.
+- Deployment automation follow-up, committed locally in
+  `openmercato-infra`:
+  `84791d6d0bebc0d5c287f44dd7d2d4672d296061`. It makes the structural
+  navigation-cache purge part of every app deployment after ACL sync.
+- The staging `admin` role received the Risk AI-first sidebar layout. Its prior
+  role preference was absent, and the tested admin account had no personal
+  sidebar override, so rollback is removal of that role preference.
+- Fresh-session browser verification passed: admin rendered both pages and saw
+  the two links in Register → Identify order; both preview forms remained
+  non-mutating; no Risk or AI API requests occurred.
+- A plain employee saw no Risk AI group and received the standard access-denied
+  page for both direct routes. Admin and superadmin direct-route access passed.
 
 ### Demo and stop condition
 
