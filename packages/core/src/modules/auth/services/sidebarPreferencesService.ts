@@ -248,9 +248,12 @@ export function applySidebarPreference<T extends SidebarGroupLike>(
     }
   })
   mapped.sort((a, b) => {
-    const ao = orderIndex.has(a.id) ? orderIndex.get(a.id)! : Number.POSITIVE_INFINITY
-    const bo = orderIndex.has(b.id) ? orderIndex.get(b.id)! : Number.POSITIVE_INFINITY
+    const aHasOrder = orderIndex.has(a.id)
+    const bHasOrder = orderIndex.has(b.id)
+    const ao = aHasOrder ? orderIndex.get(a.id)! : Number.POSITIVE_INFINITY
+    const bo = bHasOrder ? orderIndex.get(b.id)! : Number.POSITIVE_INFINITY
     if (ao !== bo) return ao - bo
+    if (!aHasOrder && !bHasOrder) return 0
     const aw = typeof a.weight === 'number' ? a.weight : 10_000
     const bw = typeof b.weight === 'number' ? b.weight : 10_000
     if (aw !== bw) return aw - bw
