@@ -132,3 +132,90 @@ These items are already present in the incremental staging plan and should be im
 ## Recommendation
 
 Ready to implement Checkpoint 2. The full MVP remains appropriately phased; database, CRUD, command, AI, and release work must not leak into this preview checkpoint.
+
+## Checkpoint 3 Readiness Addendum — 2026-07-20
+
+### Decision
+
+Ready to implement Checkpoint 3 in **external extension mode**. The product and
+placement decision has already been made: persistence, commands, API routes,
+and UI remain inside `@open-mercato/risk-management` in the Official Modules
+repository. The host repository is limited to supported activation,
+generation, and exact-revision integration. No core or auth change is
+authorized or currently required.
+
+### Increment Boundary
+
+Checkpoint 3 exposes only the first persistent contract:
+
+- encrypted `title`;
+- `category`, `probability`, `impact`, and server-computed `risk_score`;
+- tenant, organization, timestamp, and soft-delete columns;
+- derived `criticality` and `updatedAt` in API responses;
+- manual create, list/filter, detail/edit, soft-delete, undo, ACL, and
+  optimistic-lock behavior.
+
+Description, financial impact, installed custom-field UI, AI, and global/title
+search remain deferred. Later nullable fields will be additive and existing
+Checkpoint 3 records will require no backfill.
+
+### Backward-Compatibility Audit
+
+| Surface | Checkpoint 3 result |
+|---|---|
+| Auto-discovery conventions | Additive module-owned `data`, `commands`, `api`, `migrations`, `events`, `ce`, `encryption`, and backend route files only. |
+| Types/interfaces | New risk-local schemas and types only; no shared type is narrowed. |
+| Function signatures | Existing CRUD, command, encryption, event, UI, and optimistic-lock helpers are consumed unchanged. |
+| Import paths | New package-local files and existing documented package exports only. |
+| Event IDs | Adds frozen singular IDs `risk_management.risk.created`, `.updated`, and `.deleted`. |
+| Widget/host IDs | Adds stable `risk_management:risk`, `risk_management.risk.list`, and risk page handles only. |
+| API routes | Adds the final `/api/risk_management/risks` route; no existing route changes. |
+| Database schema | One additive module-owned table, constraints, and indexes; no migration is applied without approval. |
+| DI services | No new shared DI key and no service rename. |
+| ACL IDs | Preserves shipped `.view`/`.identify` and additively introduces frozen `.manage`. |
+| Notification IDs | None. |
+| AI IDs | None in this checkpoint. |
+| CLI/generated contracts | Existing generation and migration commands are used; generated files are not edited by hand. |
+
+No deprecation bridge is needed because no existing public contract is removed,
+renamed, narrowed, or behaviorally replaced.
+
+### Implementation Constraints Resolved
+
+- To make the generator produce the specified final entity ID
+  `risk_management:risk`, the exported ORM class is named `Risk`; using
+  `RiskManagementRisk` would incorrectly generate
+  `risk_management:risk_management_risk`.
+- Both `tenant_id` and `organization_id` are mandatory in every command and
+  read filter. Encrypted reads use the platform decryption helpers with both
+  scope values.
+- `updated_at` is present from the first migration. `CrudForm` supplies the
+  expected-version header for edit/delete; any table-row delete must use the
+  row's own `updatedAt` through the guarded mutation path.
+- Score and criticality are rejected as request input. Commands compute
+  `risk_score = probability × impact`; the database enforces the same equality;
+  API/UI derive criticality from the shared pure helper.
+- The supported deployment requires
+  `OM_SEARCH_STORE_RAW_TOKENS` unset or `false`. The module registers no
+  `search.ts`, presenter, fulltext/vector source, or title-search control.
+- Migration application remains a separate approval boundary. Local work may
+  generate and inspect the package-owned migration and snapshot, but must not
+  run `yarn db:migrate`.
+
+### Risk Gate
+
+The high-risk areas are tenant isolation, encryption, optimistic locking,
+command undo, and migration correctness. Checkpoint completion therefore
+requires route-level/API integration coverage for cross-tenant and
+cross-organization denial, stale update/delete conflicts, encrypted round-trip,
+server-authoritative scoring, soft delete/undo, and ACL separation before a
+deployment SHA is proposed.
+
+### Recommendation
+
+Proceed with the Official Module foundation first: entity, validators, scoring,
+ACL/setup, encryption, custom-entity metadata, events, and generated migration.
+Then add commands/API, followed by DataTable/CrudForm UI and the executable
+integration gate. Keep each internal slice buildable and do not deploy until
+the complete Checkpoint 3 stop condition passes and migration deployment is
+explicitly approved.

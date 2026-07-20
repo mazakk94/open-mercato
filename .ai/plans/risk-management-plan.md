@@ -707,7 +707,7 @@ temporary contract names.
 
 ### Tasks
 
-- [ ] Complete pre-implementation review.
+- [x] Complete pre-implementation review.
 - [ ] Implement entity, migration/snapshot, constraints, indexes, encryption,
       validators, scoring, ACL/setup, commands/events, CRUD, and OpenAPI.
 - [ ] Implement canonical `DataTable` and `CrudForm` flows.

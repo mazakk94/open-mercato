@@ -736,6 +736,15 @@ No existing core contract, auth service, app module list, or create-app template
 
 Each phase ends in a working application and includes its tests.
 
+### Implementation Status
+
+| Increment | Status | Date | Notes |
+|---|---|---|---|
+| Checkpoint 2 — previews and navigation | Done | 2026-07-20 | Deployed and verified on staging at pinned host and Official Modules revisions. |
+| Checkpoint 3 — minimal real register | In Progress | 2026-07-20 | Pre-implementation audit complete; Official Module entity, strict validators, scoring, encryption/ACL/event metadata, generated package entity metadata, and additive migration foundation started. Migration generated but not applied. |
+| Checkpoint 4 — complete manual register | Not Started | — | Description, financial impact, custom fields, and final privacy/UI coverage remain deferred. |
+| Checkpoints 5–6 — AI identification/add | Not Started | — | No AI runtime work is part of Checkpoint 3. |
+
 ### Phase 1: Official Module, Data, and Manual Register
 
 1. Scaffold package wrapper/build/test metadata and `src/modules/risk_management/` metadata, local `AGENTS.md`, ACL, setup, entity, validators, `translations.ts`, encryption, custom-entity declaration, scoring helper, events, migration, and snapshot.
