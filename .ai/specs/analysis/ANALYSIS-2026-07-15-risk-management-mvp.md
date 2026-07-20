@@ -219,3 +219,64 @@ Then add commands/API, followed by DataTable/CrudForm UI and the executable
 integration gate. Keep each internal slice buildable and do not deploy until
 the complete Checkpoint 3 stop condition passes and migration deployment is
 explicitly approved.
+
+## Checkpoint 4 Readiness Addendum — 2026-07-21
+
+### Decision
+
+Ready to implement Checkpoint 4 in the existing Official Module. The change is
+additive: nullable built-in fields, installed custom-field support, and final
+manual-register UI/API/privacy coverage. No route, ACL, event, entity, widget,
+or module identifier changes are required.
+
+### Contract and Compatibility Audit
+
+| Surface | Checkpoint 4 result |
+|---|---|
+| Database schema | Add nullable `description`, `financial_impact_amount`, and `financial_impact_currency` columns plus a pair-consistency check. Existing Checkpoint 3 rows remain valid without a backfill. |
+| API request/response | Add optional nullable camel-case fields and canonical `customValues`/`customFields` decoration. Existing required fields and response keys remain unchanged. |
+| Validation | Normalize blank optional values to null, require amount and currency together, enforce a non-negative 18/2 decimal string and uppercase three-letter currency code, and continue rejecting client-supplied score/criticality. |
+| Encryption | Extend the existing map to `description` and `financial_impact_amount`; retain scoped decrypted reads for all command snapshots and CRUD list/detail reads. |
+| Commands and undo | Move create/update writes to the platform custom-field-aware command helper; snapshot and restore custom fields for update/delete undo. This is required for query-index and cache side effects, not optional UI polish. |
+| Query index/search | Keep the standard scoped entity index and no `search.ts` registration. Validate encrypted stored documents and hashed token rows with `OM_SEARCH_STORE_RAW_TOKENS=false`; do not add global/title/fulltext/vector search. |
+| UI | Reuse the shared `CrudForm` groups and `DataTable`; pass the canonical entity ID so installed fields render and persist. Add description and optional financial amount/currency without changing the shipped routes. |
+| OpenAPI/i18n/tests | Extend schemas, all four locale catalogs, unit/API contract tests, and self-contained Playwright CRUD/privacy coverage in the same checkpoint. |
+
+No backward-compatibility bridge is needed. All new database fields are
+nullable and all new wire fields are optional or nullable, so clients and rows
+created by Checkpoint 3 remain valid.
+
+### Mandatory Implementation Gates
+
+1. Use `splitCustomFieldPayload`/`parseWithCustomFields`,
+   `runCrudCommandWrite`, `loadCustomFieldSnapshot`, and
+   `buildCustomFieldResetMap` following the `customers` command patterns.
+2. Configure CRUD list decoration with the canonical generated entity ID and
+   `stripPrefixedKeys: true`; the new module must expose one canonical custom
+   field response shape.
+3. Keep tenant and organization scope on entity reads, custom-field snapshots,
+   writes, index projections, and tests.
+4. Add a package-owned additive migration and snapshot, but do not apply the
+   migration locally or on staging without a fresh explicit approval.
+5. Treat `OM_SEARCH_STORE_RAW_TOKENS=false` as a deployment precondition and
+   prove the privacy contract before proposing the deployable Checkpoint 4 SHA.
+6. Do not deploy a partial internal slice. The visible staging checkpoint must
+   include the complete manual-register acceptance path and pass upgrade tests
+   from the deployed Checkpoint 3 schema/data.
+
+### Risk Assessment
+
+- **High:** encrypted-field storage/indexing, tenant/organization isolation,
+  migration correctness, and custom-field undo/index consistency.
+- **Medium:** amount/currency normalization, existing-row compatibility,
+  optimistic locking after added fields, and complete locale/UI coverage.
+- **Low:** additive table columns and additional form/table presentation once
+  the data and command contracts pass.
+
+### Recommendation
+
+Proceed with implementation in buildable internal slices: data/validation and
+migration first; command/API custom-field integration second; UI/i18n/OpenAPI
+third; then unit and self-contained integration/privacy gates. Commit internal
+slices when green, but deploy only the completed Checkpoint 4 revision and only
+after migration application is explicitly approved.
