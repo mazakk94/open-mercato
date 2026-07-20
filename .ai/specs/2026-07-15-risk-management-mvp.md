@@ -533,9 +533,10 @@ No persisted enum uses a translated label.
 
 Only register and identify appear in navigation. Each route has colocated `page.meta.ts`, translated breadcrumbs, and server-enforced feature metadata. The identify navigation/page is gated only by the risk feature; it does not disappear merely because AI Assistant is inactive.
 
-Both routes declare `pagePriority: 0`; Register uses `pageOrder: 10` and
-Identify uses `pageOrder: 20`. This keeps the two entries deterministic and
-places the user-facing `Risk AI` group first among optional-module groups.
+Register declares `pagePriority: 0` and `pageOrder: 10`; Identify declares
+`pagePriority: 1` and `pageOrder: 20`. This keeps the two entries deterministic
+under Open Mercato's priority-first item sorting and places the user-facing
+`Risk AI` group first among optional-module groups.
 `Risk AI` is the product/module title; the stable package, module ID, routes,
 ACL IDs, and persistence contracts retain the `risk-management` /
 `risk_management` technical namespace. Absolute placement

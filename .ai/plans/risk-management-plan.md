@@ -573,8 +573,9 @@ through the ACL contract.
 - the identification route declares
   `requireFeatures: ['risk_management.risk.identify']`;
 - both routes use the same translated `pageGroupKey`, distinct translated
-  `pageTitleKey` values, `pagePriority: 0`, deterministic `pageOrder` values
-  (`10` for Register and `20` for Identify), and `pageContext: 'main'`;
+  `pageTitleKey` values, deterministic `pagePriority` values (`0` for Register
+  and `1` for Identify), deterministic `pageOrder` values (`10` and `20`
+  respectively), and `pageContext: 'main'`;
 - this metadata places Risk AI first among optional-module groups, but
   Open Mercato intentionally keeps its known core groups in a protected default
   order; the module must not couple core navigation to an optional package just
