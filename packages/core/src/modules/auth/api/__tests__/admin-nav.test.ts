@@ -223,6 +223,40 @@ describe('GET /api/auth/admin/nav', () => {
     expect(matchingChildren).toHaveLength(1)
   })
 
+  it('applies sidebar preferences from global roles in a tenant scope', async () => {
+    mockGetAuthFromRequest.mockResolvedValue({
+      sub: 'user-1',
+      tenantId: 'tenant-1',
+      orgId: 'org-1',
+      roles: ['admin'],
+    })
+    setupRoutesForUserEntities('entities.nav.group')
+    mockEmFind
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([
+        { id: 'global-admin-role', tenantId: null },
+      ] as unknown[])
+
+    await getGroupsFromResponse()
+
+    expect(mockEmFind).toHaveBeenNthCalledWith(
+      2,
+      expect.anything(),
+      {
+        name: { $in: ['admin'] },
+        $or: [{ tenantId: 'tenant-1' }, { tenantId: null }],
+      },
+    )
+    expect(mockLoadFirstRoleSidebarPreference).toHaveBeenCalledWith(
+      expect.anything(),
+      {
+        roleIds: ['global-admin-role'],
+        tenantId: 'tenant-1',
+        locale: 'pl',
+      },
+    )
+  })
+
   it('returns navigation without throwing when the user entities anchor is missing', async () => {
     mockGetBackendRouteManifests.mockReturnValue([
       {
