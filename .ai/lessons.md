@@ -1012,3 +1012,20 @@ Centralize shared command utilities like undo extraction in `packages/shared/src
 **Rule**: When code must write a row that a subsequent out-of-band request (self `fetch`, worker, another connection) has to read, create/flush it on a context-detached EM: `em.fork({ clear: true, freshEventManager: true, useContext: false })`. That fork commits on its own pooled connection, matching the query_index/webhooks isolated-EM convention.
 
 **Applies to**: `activity-executor` `CALL_API`, any one-time credential minted for a self-request, and anything that persists data then reads it back over HTTP or from a second connection while a transaction is open.
+
+## Refresh the host lockfile after changing an activated Official Module manifest
+
+**Context**: A source-backed Official Module added peer dependencies after its
+package was already activated in the host. Local typecheck and application
+builds reused an existing install, but the clean production Docker build ran
+`yarn install --immutable` and rejected the stale workspace lock entry.
+
+**Rule**: Whenever an activated package under
+`external/official-modules/packages/*/package.json` changes dependencies,
+peers, or package metadata represented in the lockfile, run `yarn install` in
+the host and verify `yarn install --immutable --mode=skip-build` before
+committing or deploying the new gitlink. Review and commit the resulting
+`yarn.lock` change with the host integration checkpoint.
+
+**Applies to**: source-backed Official Module activation, Docker build adapters,
+workspace gitlink updates, and every exact-SHA staging deployment.
