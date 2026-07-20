@@ -741,7 +741,7 @@ Each phase ends in a working application and includes its tests.
 | Increment | Status | Date | Notes |
 |---|---|---|---|
 | Checkpoint 2 — previews and navigation | Done | 2026-07-20 | Deployed and verified on staging at pinned host and Official Modules revisions. |
-| Checkpoint 3 — minimal real register | Ready for Staging Deploy | 2026-07-20 | Complete CRUD, deterministic scoring, scoped/encrypted persistence, ACL, locking, migration, UI, and executable coverage are implemented and validated locally. The additive migration is generated and verified in a disposable environment but has not been applied to staging; backup, explicit approval, deployment, and staging smoke verification remain. |
+| Checkpoint 3 — minimal real register | Done | 2026-07-21 | Deployed from pinned unmerged host/Official Module commits after a verified backup. The additive migration, exact revisions, admin CRUD, role/API denial, scoring/filtering/locking, sidebar, preview, and clean runtime logs were verified on staging. |
 | Checkpoint 4 — complete manual register | Not Started | — | Description, financial impact, custom fields, and final privacy/UI coverage remain deferred. |
 | Checkpoints 5–6 — AI identification/add | Not Started | — | No AI runtime work is part of Checkpoint 3. |
 

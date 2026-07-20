@@ -715,13 +715,13 @@ temporary contract names.
 - [x] Verify `OM_SEARCH_STORE_RAW_TOKENS` is unset or `false`.
 - [x] Generate but do not apply migrations during local planning/review without
       approval.
-- [ ] Ensure migration failures are fatal/independently verified as required by
+- [x] Ensure migration failures are fatal/independently verified as required by
       Safety Rule 7.
-- [ ] Commit/push module and host checkpoint SHAs.
-- [ ] Run and record the pre-deployment database backup.
-- [ ] Obtain explicit migration deployment approval.
-- [ ] Deploy and verify migration identity/status before smoke tests.
-- [ ] Synchronize and test view/manage ACLs, API denial, and cross-tenant
+- [x] Commit/push module and host checkpoint SHAs.
+- [x] Run and record the pre-deployment database backup.
+- [x] Obtain explicit migration deployment approval.
+- [x] Deploy and verify migration identity/status before smoke tests.
+- [x] Synchronize and test view/manage ACLs, API denial, and cross-tenant
       isolation using the declared role matrix.
 
 ### Local implementation record — 2026-07-20
@@ -747,9 +747,42 @@ temporary contract names.
   and completed a clean production application build. No developer or staging
   database migration was applied.
 - `OM_SEARCH_STORE_RAW_TOKENS=false` is set for the application environment.
-- Staging deployment remains intentionally pending the documented backup,
-  explicit migration approval, and post-deploy migration/ACL/browser
-  verification.
+- Staging deployment was completed after the documented backup, explicit
+  migration approval, and post-deploy migration/ACL/browser verification.
+
+### Staging execution record — 2026-07-21
+
+- Infra commit: `84791d6d0bebc0d5c287f44dd7d2d4672d296061` on the
+  unmerged `open-mercato-infra` branch.
+- Deployed host commit:
+  `82be7774e2bd7c40441918c765973b4ebb9e0234` on
+  `feat/risk-management-staging`.
+- Deployed Official Modules commit:
+  `25c6e7a2a91c2072473e4fa5c65e7f9c25e053c9` on
+  `feat/risk-management`.
+- Backup `/opt/backups/open-mercato-20260720-215343.sql.gz` passed `gzip -t`
+  and a disposable PostgreSQL 17 restore check before deployment.
+- Ansible completed with no failed tasks, treated migration failure as fatal,
+  synchronized default role ACLs, invalidated RBAC cache, and purged structural
+  navigation cache.
+- The database contains `risk_management_risks`, migration ledger
+  `mikro_orm_migrations_risk_management`, and applied migration
+  `Migration20260720200101_risk_management`.
+- Exact server host/submodule revisions match the values above. The new app
+  container started successfully, HTTPS `/backend` returned the expected login
+  redirect, and recent application logs contained no errors.
+- Fresh staging browser/API QA passed for admin sidebar order and both routes,
+  inert Identify preview, complete UI create/edit/reload/delete, server-owned
+  scope/scoring/filtering, optimistic-lock conflict, and employee navigation,
+  direct-route, API-read, and API-create denial. Optional demo/cookie/contact
+  overlays are dismissed by the staging-aware UI test.
+- Both `admin` and `superadmin` role ACL rows contain `risk_management.*`.
+  The staging demo rejects the repository's default superadmin password, so
+  current superadmin permission wiring was verified from synchronized ACL data;
+  admin access was verified through a real fresh browser session.
+- QA cleanup left zero active risks and two expected soft-deleted audit rows.
+  No AI request or persistence was introduced. Checkpoint 2 remains the
+  rollback application SHA; the additive Risk table must be retained.
 
 ### Demo and stop condition
 
