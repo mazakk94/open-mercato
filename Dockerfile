@@ -62,8 +62,12 @@ COPY eslint.config.mjs ./
 
 
 # Build the app
-# Limit Node.js heap to 4GB and reduce worker count to avoid OOM in constrained Docker environments
-ENV NODE_OPTIONS="--max-old-space-size=4096"
+# Limit build memory and concurrency so shared VPS hosts remain responsive.
+# Next derives its worker count from CIRCLE_NODE_TOTAL, while Turbopack's
+# native work uses Rayon's separate thread pool.
+ENV NODE_OPTIONS="--max-old-space-size=4096" \
+    CIRCLE_NODE_TOTAL=2 \
+    RAYON_NUM_THREADS=2
 RUN node external/official-modules/packages/risk-management/build.mjs
 RUN yarn build
 
