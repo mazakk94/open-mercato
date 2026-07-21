@@ -4,10 +4,10 @@
 
 **Key Points:**
 
-- Publish a new Official Module package, `@open-mercato/risk-management`, whose module ID is `risk_management`.
+- Build a source-backed Official Module package, `@open-mercato/risk-management`, whose module ID is `risk_management`; the incremental staging execution does not publish a package or merge either feature branch.
 - The package lives in the `open-mercato/official-modules` repository at `packages/risk-management/`; when that repository is attached locally, the host path is `external/official-modules/packages/risk-management/`.
 - Deliver two top-level backoffice surfaces: a persistent risk register with complete manual CRUD and an AI-assisted risk-identification panel that produces reviewable candidates.
-- Preserve the useful domain and interaction ideas from `riskai-v2.1`, but replace its hard-coded AI results, in-memory store, custom UI patterns, and Polish-only strings with Open Mercato contracts.
+- Preserve the useful domain and interaction ideas from `riskai-v2.1`, but replace its in-memory store, custom UI patterns, and Polish-only strings with Open Mercato contracts. A new, versioned deterministic candidate fixture is used only as an explicit delivery/test source before live AI; it is not copied from the prototype and is never a silent AI fallback.
 - Use one fixed 5×5 scoring model: `riskScore = probability × impact`. Criticality is derived from the score and is never accepted as authoritative client or model input.
 - Do not assign risks to platform users in this MVP. There is no owner field, auth-directory API, auth DI service, or change to `@open-mercato/core`.
 
@@ -16,7 +16,7 @@
 - Risk register list, create, edit, detail, and soft-delete flows.
 - Risk fields: title, description, fixed category, probability, impact, derived score and criticality, and optional encrypted financial-impact amount with currency.
 - AI identification input: business context, industry, area, methodology, regulations, and time horizon.
-- Structured AI candidates with review, local edit, reject, and explicit add-to-register actions.
+- One shared candidate-review workflow with review, local edit, reject, and explicit add-to-register actions: Checkpoint 5 feeds it a fixed English demo set, then Checkpoint 6 replaces only the source with validated AI output.
 - Official Module packaging, ACL, setup grants, commands, events, encryption, custom fields, safe query-index integration, OpenAPI, optimistic locking, i18n, migrations, unit/API/component tests, and self-contained Playwright integration coverage.
 
 **Out of Scope:**
@@ -26,7 +26,7 @@
 - Configurable scoring matrices or claiming that the fixed MVP score implements ISO 31000, COSO ERM, NIST RMF, FAIR, or any regulation.
 - Persisting AI identification inputs, prompts, sessions, rejected candidates, rationales, provider/model metadata, or generated candidates that the operator did not add.
 - AI tools that mutate records, AI pending-action approval cards, chat UI, autonomous enrichment of existing risks, or AI-generated controls/mitigations.
-- Copying `riskai-v2.1` source code, demo data, simulated delays, custom table/form controls, Framer Motion effects, or hard-coded status colors.
+- Copying `riskai-v2.1` source code or demo data, simulated delays, custom table/form controls, Framer Motion effects, or hard-coded status colors. The Checkpoint 5 fixture is newly authored, versioned domain demo content behind an explicit demo label.
 - Adding the module to `@open-mercato/core`, editing `apps/mercato/src/modules.ts` manually, or modifying the create-app template.
 - Global search and free-text register search. The module does not register `search.ts`, a presenter, fulltext, or vector indexing.
 
@@ -34,8 +34,8 @@
 
 - Business context, risk descriptions, titles, and financial exposure can be sensitive. Stored free text and financial amounts require encryption. This module must not persist or log AI input/output; the shared AI Assistant runtime and configured provider remain separate trusted boundaries governed by their existing contracts and policies.
 - The platform-wide search debug option `OM_SEARCH_STORE_RAW_TOKENS=true` stores plaintext query tokens. Supported Risk Management deployments must leave it unset or `false` (the platform default); the module cannot safely override a host-wide setting.
-- Model output is advisory and untrusted. It must pass the registered object schema, deterministic scoring must be recomputed locally, and no record is written without an explicit operator action.
-- The AI object dispatcher does not currently guarantee a dedicated per-request rate limit or a stable provider-unavailable status. The UI must handle its documented generic failures without inventing `429` or `503` contracts.
+- Model output is advisory and untrusted. Extracted JSON must pass the strict candidate schema, deterministic scoring must be recomputed locally/server-side, and no record is written without an explicit operator action.
+- The AI runtime does not currently guarantee a dedicated per-request rate limit or a stable provider-unavailable status for this in-process use. The UI must handle generic failures without inventing `429` or `503` contracts.
 - Published package, module, entity, API, ACL, event, AI-agent, and widget IDs become stable or frozen contracts.
 
 ## Overview
@@ -54,7 +54,7 @@ The prototype demonstrates the product idea but leaves production concerns unres
 
 - no database or tenant/organization isolation;
 - no authentication, ACL, command audit, undo, encryption, or optimistic locking;
-- no real AI provider call or structured-output validation;
+- no real AI provider call or robust output validation;
 - no persistence path from candidate to register;
 - no server-authoritative scoring or validation;
 - no Open Mercato design-system, routing, module-discovery, i18n, packaging, or test integration.
@@ -72,7 +72,9 @@ Supporting create and detail/edit routes belong to the register workflow but do 
 
 The register uses one `RiskManagementRisk` entity and standard Open Mercato CRUD infrastructure. Commands compute `riskScore` from probability and impact. API responses derive `criticality` from that score. Stored risk content is created or changed only through command-backed CRUD.
 
-The identification page invokes the existing `POST /api/ai_assistant/ai/run-object` dispatcher with the registered read-only object-mode agent `risk_management.risk_identifier`. The agent has no tools and cannot mutate data. Its strict Zod schema returns at most five candidates. The browser recomputes score/criticality for display; accepting a candidate is a separate `risk_management.risk.create` mutation initiated by the operator.
+The identification page is built once around a small candidate-source boundary. Checkpoint 5 validates the complete six-field form (only `businessContext` is required), then returns the same newly authored English demo candidates without a network request or simulated delay. Operators can review, edit, reject, and explicitly add one candidate through the normal guarded risk-create API.
+
+Checkpoint 6 keeps that UI and write path unchanged and replaces only the source with the registered read-only agent `risk_management.risk_identifier`. A module-owned identification action invokes the standard AI Assistant runtime and model resolution, collects text, extracts JSON, validates a strict at-most-five candidate schema, and makes at most one repair attempt. The agent has no tools and cannot mutate data. The browser recomputes score/criticality for display; accepting a candidate remains a separate `risk_management.risk.create` mutation initiated by the operator.
 
 ### Design Decisions
 
@@ -82,9 +84,10 @@ The identification page invokes the existing `POST /api/ai_assistant/ai/run-obje
 | Module ID `risk_management` | It follows the documented package-to-module mapping: package suffix `risk-management` becomes snake-case module ID `risk_management`. |
 | No core or auth changes | Removing platform-user ownership leaves no cross-module business reference. The package can remain isolated and uninstallable. |
 | One spec, register delivered before AI | The maintainer explicitly chose one specification. AI identification is an intake path into the same risk aggregate, while the register remains useful when AI is disabled or unconfigured. |
+| Deterministic workflow before live AI | Checkpoint 5 proves the final context/review/Edit/Reject/Add path using an explicitly labelled, fixed English fixture. Checkpoint 6 swaps only the source, reducing provider and malformed-output risk without creating a second product path. |
 | Fixed 5×5 model | Matches the prototype’s useful baseline and keeps the first contract deterministic; methodology selection is contextual, not computational. |
 | Server-computed `risk_score`; response-derived `criticality` | Supports database sorting while preventing score/label drift and model/client tampering. |
-| Object-mode agent with no tools | Gives strict structured output and minimizes prompt-injection blast radius; no mutation approval is needed because the agent cannot write. |
+| Text-mode agent with no tools plus strict parser | Ollama Cloud is targeted through its OpenAI-compatible configuration without assuming strict provider-side structured output. The module extracts bounded JSON, validates it with Zod, permits one repair attempt, and never gives the agent a mutation tool. |
 | AI runs are ephemeral | Meets the “start small” direction and avoids a prompt/audit/session data model. |
 | Financial amount stored as encrypted decimal text | Preserves commercial confidentiality and exact decimal representation; amount sorting/range filtering is deferred. |
 | No global/free-text search in MVP | Category/criticality filters meet the first register need. The module does not expose sensitive risk content through a search presenter, fulltext index, or embeddings, and it does not require a new core token-projection contract. |
@@ -100,7 +103,9 @@ The identification page invokes the existing `POST /api/ai_assistant/ai/run-obje
 | Free-text owner | Also deferred; introducing a second ownership model now would make a later platform-user migration harder. |
 | Copy the prototype scoring wizard and all risk fields | Pulls mitigation/review/lifecycle scope into the MVP and hard-codes PLN impact bands. |
 | AI mutation tool calling risk create | Adds pending-action complexity without value; the operator already reviews a visible candidate and can use normal guarded CRUD. |
-| Custom risk identification model endpoint | Duplicates the existing object-agent policy and provider/model resolution. |
+| Existing object dispatcher | Deferred for the Ollama Cloud checkpoint because it assumes provider-side structured output. The module-owned action still delegates model/provider/policy resolution to the AI Assistant runtime and adds only bounded text extraction/validation. |
+| Existing chat dispatcher | Rejected because the focused one-shot identification flow must not create a persisted chat conversation/session. |
+| Direct provider SDK or Ollama-specific client | Rejected because it would bypass the AI Assistant model factory, allowlists, ACL policy, and provider portability. |
 | Persist AI runs for audit | Adds sensitive prompt storage, retention, browsing, and deletion requirements outside the starter scope. |
 | Configurable scoring methodology | Requires settings, migrations, score-version lineage, bulk recalculation, and compatibility rules; defer to a future spec. |
 
@@ -145,7 +150,8 @@ The package uses published Open Mercato packages through their public exports. A
 
 - `package.json` declares `@open-mercato/ai-assistant` as an optional peer dependency through `peerDependenciesMeta` and as a development dependency for typechecking/tests;
 - `ai-agents.ts` uses type-only imports, so published runtime code does not require the package merely to load the risk register;
-- the supported peer range matches the Open Mercato release line used to build/test the module and is updated through changesets when that contract changes;
+- the supported peer range matches the Open Mercato source revision used to build/test the module; any future release/version metadata is a separate post-staging decision;
+- the identification action has no top-level value import from the optional peer: its AI branch loads the runtime lazily/optionally and maps an unavailable package or registry to the documented `404`, while demo mode and the register remain loadable without AI Assistant;
 - module-decoupling coverage exercises `risk_management` without AI Assistant active.
 
 When AI Assistant, its provider, or its model is unavailable, CRUD and register pages continue to work. The identification page is owned by `risk_management`, remains accessible with `risk_management.risk.identify`, and explains the unavailable or failed generation state.
@@ -159,12 +165,15 @@ Although the register can operate without AI, the maintainer explicitly chose on
 ```text
 Manual form ───────────────┐
                            ├─> risk CRUD API ─> command ─> scoped/encrypted Risk row
-AI context ─> object agent ─> candidate review ─> explicit Add ─┘
+Context form ─> candidate source ─> candidate review ─> explicit Add ─┘
+                    │
+                    ├─ Checkpoint 5: fixed local demo fixture
+                    └─ Checkpoint 6: module action ─> read-only text agent ─> validated JSON
 
 Risk row ─> scoped/decrypted CRUD response ─> derived criticality ─> DataTable/CrudForm
 ```
 
-AI generation and candidate editing before Add are read-only/local operations. They emit no domain event and create no undo record. Explicit Add is indistinguishable from manual create at the domain layer.
+Candidate generation is read-only, and candidate editing before Add is local/transient. They emit no domain event and create no undo record. Explicit Add is indistinguishable from manual create at the domain layer.
 
 ### Canonical Scoring Contract
 
@@ -221,7 +230,7 @@ No notification, subscriber, worker, or external side effect is introduced.
 Module-root `ai-agents.ts` declares `risk_management.risk_identifier`:
 
 - `moduleId: 'risk_management'`;
-- `executionMode: 'object'`;
+- `executionMode: 'chat'`, used only for a one-shot `runAiAgentText` invocation rather than chat UI/session persistence;
 - `allowedTools: []`;
 - `readOnly: true` and `mutationPolicy: 'read-only'`;
 - `requiredFeatures: ['risk_management.risk.identify']`;
@@ -232,7 +241,7 @@ Module-root `ai-agents.ts` declares `risk_management.risk_identifier`:
 
 The prompt uses the standard seven named sections (`role`, `scope`, `data`, `tools`, `attachments`, `mutationPolicy`, `responseStyle`). It treats submitted business text as untrusted data rather than instructions, does not claim regulatory compliance, does not invent company facts, returns no controls/mitigations, and uses only allowed category values.
 
-The output schema is strict:
+The requested response is JSON matching this strict schema:
 
 ```typescript
 z.object({
@@ -252,15 +261,15 @@ z.object({
 
 Score, criticality, and financial value are absent from AI output. The UI derives score/criticality from validated probability/impact. Financial value defaults to null unless the operator supplies it while reviewing the candidate.
 
-The UI calls the existing `POST /api/ai_assistant/ai/run-object`. Dispatcher metadata requires `ai_assistant.view`; agent policy additionally requires `risk_management.risk.identify`. The identification page itself requires only `risk_management.risk.identify`, which keeps the page renderable when AI Assistant is absent or the caller lacks its feature. A generation attempt maps:
+The module owns `POST /api/risk_management/identify`. Its declarative route metadata requires `risk_management.risk.identify`, as does the registered agent. When the configured source is `ai`, the handler additionally checks `ai_assistant.view` with the standard wildcard-aware feature helper before lazily resolving the optional runtime. Demo mode does not require AI Assistant access. The identification page itself requires only `risk_management.risk.identify`, which keeps the page renderable when AI Assistant is absent or the caller lacks its feature.
 
-- missing route/module or stale agent registry (`404`) to an “AI Assistant is unavailable or not active” message;
-- missing dispatcher permission (`403`) to an AI-access message;
-- provider/runtime `500` to a configured-provider/runtime failure message.
+The action validates the input again on the server, serializes it as untrusted data, resolves and calls the registered agent through the AI Assistant runtime, and consumes the returned text stream in-process. It caps collected output at 32 KiB, accepts either one direct JSON object or one fenced `json` object, rejects ambiguous/multiple payloads, and applies the strict Zod schema. If the first model response is malformed, it may make one repair call containing the validation problem and bounded malformed response; oversize output is rejected without echoing it into a repair prompt, and a second failure is final. Score and criticality are recomputed after parsing and again by the create command if a candidate is added.
 
-The current dispatcher does not promise a dedicated `429` rate-limit response and generally surfaces provider/runtime failures as `500 internal_error`. The risk module consumes this route unchanged.
+The action does not call a public chat endpoint, create a conversation/session, import a provider SDK, expose model selection to the browser, or give the agent tools. It logs only request ID, scope IDs, latency, source, candidate count, retry count, and error code—never form content, prompt/model text, parsed candidates, or provider credentials.
 
-The object endpoint does not create chat sessions. The risk package sends only the validated message required for generation and does not add analytics, persistence, or logger calls containing context/candidates. It relies on the supported AI Assistant version’s current metadata-oriented logging behavior and cannot independently guarantee provider-side or future shared-runtime logging behavior; those boundaries are covered by peer compatibility review and provider policy.
+The route returns the same validated candidate response contract regardless of provider. It maps unauthenticated and feature failures through normal route metadata, distinguishes absent/inactive AI Assistant from provider/runtime and malformed-output failures with stable module-owned error codes, and does not promise dedicated `429` or `503` behavior. The UI retains inputs and the last valid result on every failure. When `RISK_MANAGEMENT_IDENTIFICATION_SOURCE=ai`, it never substitutes demo candidates.
+
+The risk package does not add analytics or persistence containing context/candidates. It relies on the supported AI Assistant version's metadata-oriented runtime behavior and cannot independently guarantee provider-side or future shared-runtime logging/retention; those boundaries are covered by peer compatibility review, staging configuration, and provider policy.
 
 ### Identification Input Contract
 
@@ -295,7 +304,7 @@ ACL feature IDs are frozen once shipped:
 - `risk_management.risk.manage`
 - `risk_management.risk.identify`
 
-`manage` is required for create/update/delete and includes no implicit AI access. `identify` controls the page/agent. `ai_assistant.view` is checked only by the optional dispatcher when generation is attempted.
+`manage` is required for create/update/delete and includes no implicit AI access. `identify` controls the page/agent. In Checkpoint 6, `ai_assistant.view` is additionally required by the module-owned identification action only when AI generation is attempted.
 
 Default role grants:
 
@@ -384,7 +393,7 @@ Every CRUD list/detail read uses `findWithDecryption`/`findOneWithDecryption` un
 - Risk title, description, rationale, and business context render as React text only; no `dangerouslySetInnerHTML`, Markdown HTML passthrough, or model-supplied markup is allowed.
 - IDs inserted into URLs use `encodeURIComponent`; AI input uses `JSON.stringify` after validation; file paths are not accepted.
 - API responses never include provider credentials, prompt/system text, tenant secrets, role data, or fields beyond the documented projection.
-- Structured logs contain IDs, counts, durations, status/error codes, and agent ID only—not risk text, financial amount, AI context, or candidates.
+- Structured logs contain IDs, source, counts, retry counts, durations, status/error codes, and agent ID only—not risk text, financial amount, AI context, model output, or candidates.
 
 ### Derived Response Fields
 
@@ -475,34 +484,44 @@ Optimistic locking uses the standard expected-version header built from `updated
 
 Requires `id` and expected version. It soft-deletes through `risk_management.risk.delete` and supports command undo.
 
-### AI Structured Object Dispatch (Existing Route)
+### Risk Identification Action (New Route)
 
-Route consumed unchanged: `POST /api/ai_assistant/ai/run-object`.
+Route: `POST /api/risk_management/identify`.
 
-The risk page sends:
+The risk page sends the validated identification object directly:
 
 ```json
 {
-  "agent": "risk_management.risk_identifier",
-  "messages": [
-    { "role": "user", "content": "<validated JSON identification input>" }
-  ],
-  "pageContext": { "pageId": "risk_management.identify" }
+  "businessContext": "Current company and operating context...",
+  "industry": "technology",
+  "area": "operations",
+  "methodology": null,
+  "regulations": ["gdpr"],
+  "timeHorizon": "next_12_months"
 }
 ```
 
-The page does not send `modelOverride`, system messages, attachments, raw scope IDs, or stored risk data. Success uses the dispatcher’s standard `{ object, usage?, finishReason? }` response.
+The page does not send an agent ID, model override, system messages, attachments, raw scope IDs, or stored risk data. The route selects the frozen agent and source server-side. Success returns only the validated contract:
 
-Observed error contract to handle:
+```typescript
+{
+  source: 'demo' | 'ai'
+  risks: RiskIdentificationCandidate[] // 1..5
+}
+```
 
-- `400`: invalid dispatcher payload;
+In Checkpoint 5 the browser uses the local demo source and this route does not yet exist. After Checkpoint 6 the browser calls this route in both modes; the action reads the server-owned selector and either returns the same versioned fixture (`demo`, staging/tests only) or invokes AI (`ai`). The browser cannot choose the source per request, and the default after Checkpoint 6 is `ai`.
+
+Module-owned errors to document in OpenAPI and handle in the UI:
+
+- `400`: invalid identification input;
 - `401`: unauthenticated;
-- `403`: missing route/agent features;
-- `404`: agent registry missing or stale;
-- `409`/`422`: policy, execution-mode, or output-contract issue;
-- `500`: provider/runtime/internal failure, including the current generic `internal_error` mapping.
+- `403`: missing identify or AI Assistant access;
+- `404`: AI Assistant or registered agent unavailable;
+- `422`: model output remains invalid after the single repair attempt;
+- `500`: provider/runtime/internal failure.
 
-The spec does not require `429` or `503`, because the current route does not promise them. The UI shows an actionable translated error, retains the input form and existing results, and never substitutes demo results.
+The action may pass through a future standard throttling response, but this spec does not invent `429` or `503` guarantees. The UI shows an actionable translated error, retains the input form and existing results, and never substitutes demo results after an AI error.
 
 ## Internationalization
 
@@ -515,7 +534,7 @@ Add complete EN/PL/DE/ES locale keys for:
 - category and criticality labels;
 - financial amount/currency pairing messages;
 - identification fields and every industry/area/methodology/regulation/horizon ID;
-- AI transparency notice, generation button/loading/error/no-provider copy;
+- demo-source disclosure; AI transparency notice; generation button/loading/error/no-provider/malformed-output copy;
 - candidate count, rationale, relevant-regulation labels, Edit/Reject/Add/Added actions, and discard/regenerate confirmation.
 
 No persisted enum uses a translated label.
@@ -529,7 +548,7 @@ No persisted enum uses a translated label.
 | `/backend/risk-management/risks` | Register list | `risk_management.risk.view` |
 | `/backend/risk-management/risks/create` | Manual create | `risk_management.risk.manage` |
 | `/backend/risk-management/risks/[id]` | Detail/edit/delete | view; manage for mutations |
-| `/backend/risk-management/identify` | AI input/candidate review | page: `risk_management.risk.identify`; generation dispatcher: also `ai_assistant.view` |
+| `/backend/risk-management/identify` | Context input/candidate review | page: `risk_management.risk.identify`; Checkpoint 6 AI action: also `ai_assistant.view` |
 
 Only register and identify appear in navigation. Each route has colocated `page.meta.ts`, translated breadcrumbs, and server-enforced feature metadata. The identify navigation/page is gated only by the risk feature; it does not disappear merely because AI Assistant is inactive.
 
@@ -585,20 +604,22 @@ Groups:
 
 The preview is convenience only; the server remains authoritative. Currency is disabled/cleared when amount is null according to final-pair validation. Detail loading follows `loading -> notFound -> error -> ready` and uses `RecordNotFoundState`. `CrudForm` derives optimistic-lock headers from `initialValues.updatedAt` for edit and delete.
 
-### AI Identification
+### Risk Identification
 
 The page uses the standard layout and a route-local `RiskIdentificationClient`, split into smaller components.
 
-Input is a `CrudForm` in custom-submit mode with the six approved context fields. A prominent `Alert` explains that submitted content is sent to the configured external AI provider, is not saved by this module, and must not include unnecessary personal data.
+Input is a `CrudForm` in custom-submit mode with all six approved context fields. `businessContext` is the only required field; the other five are nullable/optional but validated when present.
+
+Checkpoint 5 shows a prominent translated `Alert` that results are fixed English demonstration data, do not depend on the entered context, and are not an actual risk assessment. It returns the same versioned set after every valid submission without a network request or artificial delay. Checkpoint 6, when configured with `source=ai`, replaces this with an `Alert` explaining that submitted content is sent to the configured external AI provider, is not saved by this module, and must not include unnecessary personal data.
 
 Generation behavior:
 
 1. Validate the form locally.
-2. Disable generation and show shared loading feedback while the object request is in flight; enforce a client-side single in-flight request.
+2. Disable generation while the source is being resolved; for AI, show shared loading feedback and enforce a client-side single in-flight request.
 3. Replace results only after a successful, fully validated response.
 4. Preserve current results on failure.
 5. Ask with `ConfirmDialog` before replacing unadded/edited candidates on regenerate or reset.
-6. Distinguish absent/inactive AI Assistant (`404`), missing AI access (`403`), and generic provider/runtime failure (`500`) without hiding the page or fabricating candidates.
+6. In AI mode, distinguish absent/inactive AI Assistant (`404`), missing AI access (`403`), malformed output (`422`), and generic provider/runtime failure (`500`) without hiding the page or fabricating candidates.
 
 Candidate presentation uses shared `Card`, `StatusBadge`, `Tag`, text, and button primitives. Each card shows title, description, category, probability, impact, derived score/criticality, rationale, and relevant regulations.
 
@@ -606,7 +627,7 @@ Actions:
 
 - **Edit** opens an embedded `CrudForm` dialog for candidate fields and optional financial value; `Cmd/Ctrl+Enter` applies local changes and `Escape` cancels.
 - **Reject** removes only the local candidate; no confirmation is required because it was never persisted.
-- **Add to register** calls the normal risk create API through `useGuardedMutation`; on success the card becomes Added with a link to the new risk.
+- **Add to register** is shown only with manage permission and calls the normal risk create API through `useGuardedMutation`; on success the card becomes Added, repeat Add is disabled, and the card links to the new risk. An ambiguous network result shows “Result unknown — refresh the Risk Register before retrying” rather than automatically retrying.
 
 There is no Add All action. One explicit action per candidate keeps review and failure handling clear.
 
@@ -628,7 +649,7 @@ There is no Add All action. One explicit action per candidate keeps review and f
 | register list | route `page.tsx` and metadata | `RiskRegisterClient` | risk CRUD API | DataTable state only; no page-root client blob. |
 | create | route `page.tsx` and metadata | `RiskFormClient` | risk CRUD API | Shared field builder with detail. |
 | detail/edit | route `page.tsx` and metadata | `RiskFormClient` | risk CRUD API | Distinct loading/not-found/error/ready states. |
-| identify | route `page.tsx` and metadata | `RiskIdentificationClient`, `RiskIdentificationForm`, `RiskCandidateList`, `RiskCandidateEditDialog` | existing object-agent API; risk CRUD only on Add | No AI/chat provider at app root. |
+| identify | route `page.tsx` and metadata | `RiskIdentificationClient`, `RiskIdentificationForm`, `RiskCandidateList`, `RiskCandidateEditDialog` | candidate-source boundary; module identification API in AI mode; risk CRUD only on Add | No AI/chat provider at app root. |
 
 ### `"use client"` Ledger
 
@@ -657,9 +678,17 @@ No React provider or global bootstrap UI is added. The AI provider/model is reso
 
 ## Configuration
 
-No risk-management settings page or environment variable is added.
+No risk-management settings page is added. Checkpoint 5 needs no provider or Risk Management environment variable.
 
-Security prerequisite: the existing platform variable `OM_SEARCH_STORE_RAW_TOKENS` must be unset or `false`. Official Module installation/release documentation and the implementation validation gate check this condition. Enabling raw-token debug storage is unsupported while this module contains sensitive risk text; the package does not mutate the host’s environment.
+Checkpoint 6 introduces one non-secret deployment selector:
+
+```text
+RISK_MANAGEMENT_IDENTIFICATION_SOURCE=demo|ai
+```
+
+Its post-Checkpoint-6 default is `ai`. `demo` is permitted only for explicit staging demonstrations and deterministic tests. The value is read server-side, must be passed through the host Docker/Ansible environment contract, is shown clearly in the page disclosure, and never changes automatically after a provider or model error. Unknown values fail closed as configuration errors rather than selecting demo. Production documentation must not recommend `demo` as a real assessment mode.
+
+Security prerequisite: the existing platform variable `OM_SEARCH_STORE_RAW_TOKENS` must be unset or `false`. Official Module installation/deployment documentation and the implementation validation gate check this condition. Enabling raw-token debug storage is unsupported while this module contains sensitive risk text; the package does not mutate the host’s environment.
 
 When the optional peer is installed and active, AI availability follows existing AI Assistant configuration:
 
@@ -667,7 +696,7 @@ When the optional peer is installed and active, AI availability follows existing
 - runtime/tenant model resolution;
 - existing agent-policy overrides.
 
-No provider, model, or provider-specific configuration is hard-coded. A future configurable scoring model requires a separate spec and migration strategy.
+Ollama Cloud is configured through the AI Assistant's existing OpenAI-compatible provider/model settings. Provider token, URL, and model values are injected only through protected staging/production configuration and are never committed. No provider, model, token, or provider-specific client is hard-coded in the package. A future configurable scoring model requires a separate spec and migration strategy.
 
 ## Cache and Query Indexing
 
@@ -699,7 +728,7 @@ The change is additive and isolated to the Official Modules repository:
 - one new module and database table with constraints/indexes;
 - new API/page routes;
 - new ACL, event, entity, AI-agent, and widget/host IDs;
-- one Official Modules changeset.
+- no changeset, npm publication, release tag, or merge as part of the incremental staging plan.
 
 No existing core contract, auth service, app module list, or create-app template is changed.
 
@@ -707,13 +736,13 @@ No existing core contract, auth service, app module list, or create-app template
 
 1. Attach or initialize the optional Official Modules checkout according to repository documentation.
 2. Scaffold `packages/risk-management/` in that repository with the same build/watch/test conventions as its closest maintained package.
-3. Add the module source under `src/modules/risk_management/`, package root re-exports, migrations, tests, and a changeset.
+3. Add the module source under `src/modules/risk_management/`, package root re-exports, migrations, and tests.
 4. From the host repository, activate for development with `yarn official-modules add risk-management --local`.
 5. Run `yarn install`, then `yarn generate` after module/agent/discovery changes.
 6. Refresh structural configuration caches for test tenants.
 7. Run `yarn db:generate` only as a diff probe and keep only the module-owned migration/snapshot. Run it again and require no remaining diff.
 8. Do not run `yarn db:migrate` without explicit user approval.
-9. Commit and open the implementation PR in `open-mercato/official-modules`. Do not commit a host-repository submodule pointer bump or generated activation churn unless explicitly requested.
+9. Commit and push the unmerged feature branches used by the staging plan. Do not publish, merge, open a release PR, or commit unrelated generated activation churn; any later upstream/release path requires a separate decision.
 
 ### Backward Compatibility Surface Review
 
@@ -725,11 +754,11 @@ No existing core contract, auth service, app module list, or create-app template
 | Function signatures/import paths | New exports only; no moved or changed existing exports. |
 | Event IDs | New frozen `risk_management.risk.*` IDs. |
 | Widget/host IDs | New stable risk DataTable/CrudForm/page IDs. |
-| API routes | New `/api/risk_management/risks`; existing AI dispatcher consumed unchanged. |
+| API routes | New `/api/risk_management/risks` and additive Checkpoint 6 action `/api/risk_management/identify`. |
 | Database | New additive module-owned table/indexes/constraints only. |
 | DI | No new or changed DI contract. |
 | ACL | New frozen `risk_management.risk.*` IDs. |
-| AI | Explicit optional peer integration; new frozen `risk_management.risk_identifier`; existing dispatcher consumed unchanged. |
+| AI | Explicit optional peer integration; new frozen `risk_management.risk_identifier`; standard AI Assistant runtime/model resolution consumed in-process without changing its contracts. |
 | Generated files | Regenerated through supported commands; never hand-edited. |
 
 ## Implementation Plan
@@ -742,8 +771,9 @@ Each phase ends in a working application and includes its tests.
 |---|---|---|---|
 | Checkpoint 2 — previews and navigation | Done | 2026-07-20 | Deployed and verified on staging at pinned host and Official Modules revisions. |
 | Checkpoint 3 — minimal real register | Done | 2026-07-21 | Deployed from pinned unmerged host/Official Module commits after a verified backup. The additive migration, exact revisions, admin CRUD, role/API denial, scoring/filtering/locking, sidebar, preview, and clean runtime logs were verified on staging. |
-| Checkpoint 4 — complete manual register | Not Started | — | Description, financial impact, custom fields, and final privacy/UI coverage remain deferred. |
-| Checkpoints 5–6 — AI identification/add | Not Started | — | No AI runtime work is part of Checkpoint 3. |
+| Checkpoint 4 — complete manual register | Done | 2026-07-21 | Deployed from Official Modules `4c1216e2abc8950ba5395268471820eb8829ee20` and host `92bb50020a1bfdca05a8d3e3e984e9d2921a4d29` after verified backup/restore rehearsal. Migration, existing records, ACL synchronization, routes, and new fields were verified on staging. |
+| Checkpoint 5 — deterministic identification-to-register | Not Started | — | Final six-field form and fixed English demo candidates will prove review/edit/reject/Add without AI or schema changes. |
+| Checkpoint 6 — live AI identification | Not Started | — | Ollama-backed AI will replace only the candidate source; no silent demo fallback. |
 
 ### Phase 1: Official Module, Data, and Manual Register
 
@@ -755,22 +785,31 @@ Each phase ends in a working application and includes its tests.
 
 Working result: an authorized admin can manually create, list/filter, edit, and delete risks without AI configuration.
 
-### Phase 2: Read-only AI Identification
+### Phase 2: Deterministic Identification-to-Register
 
-1. Add `risk_management.risk_identifier` object agent and strict output schema with prompt/policy tests.
-2. Build the identification `CrudForm`, privacy notice, existing object-dispatch call, absent-module/permission/generic-error handling, and at-most-five candidate rendering.
-3. Add local candidate edit/reject and explicit guarded create through the risk API.
-4. Verify registry generation and object-dispatch policy without an AI tool or vendor-specific model.
+1. Build the final identification `CrudForm` with all six fields, requiring only `businessContext` and validating every supplied value.
+2. Define one shared strict candidate schema/source interface and a new versioned fixture containing at most five fixed English domain-demo candidates.
+3. Add the translated demo disclosure, deterministic generation, at-most-five candidate rendering, local edit/reject, and explicit guarded create through the risk API.
+4. Verify identify/manage ACL combinations, single-flight Add behavior, Added/link state, reload persistence, and that no candidate is stored before explicit Add.
 
-Working result: with AI configured, an authorized operator can generate candidates and add selected risks; without AI, the register works and identification fails clearly.
+Working result: an authorized operator can demonstrate the entire two-view workflow with no provider, secret, AI package, AI request, or new database schema.
 
-### Phase 3: Privacy, Integration Coverage, and Release
+### Phase 3: Live AI Candidate Source
+
+1. Add optional AI Assistant peer wiring and the read-only, no-tools, one-step `risk_management.risk_identifier` text agent.
+2. Add `POST /api/risk_management/identify` with input/OpenAPI/ACL validation, standard runtime/model resolution, bounded text collection, raw/fenced JSON extraction, strict schema validation, and at most one repair attempt.
+3. Introduce the explicit `demo|ai` source selector, default it to `ai`, and preserve the Phase 2 review/Edit/Reject/Add UI unchanged. AI errors must never activate demo output.
+4. Pass Ollama-compatible provider/model configuration through Docker and Ansible without committing the token, and add absent-module/permission/provider/malformed-output UX.
+5. Add deterministic tests for raw JSON, fenced JSON, repair success, repeated invalid output, provider failure, ACLs, and absent AI Assistant. Keep live Ollama smoke testing optional and secret-gated.
+
+Working result: the requested AI-assisted two-view MVP works end to end, while manual CRUD and the deterministic staging/test mode remain isolated from provider availability.
+
+### Phase 4: Privacy, Integration Coverage, and Release
 
 1. Verify encrypted/scoped query-index projection behavior and the absence of module global/fulltext/vector/title search.
-2. Add self-contained Playwright tests for manual CRUD, isolation/locking, and AI candidate-to-register flow using a deterministic intercepted response.
-3. Add an optional live-provider smoke subcase gated by existing provider environment metadata; deterministic CI remains secret-free.
-4. Run design-system/client-boundary checks, package tests/build, host generation/typecheck/lint/build, and activation/decoupling integration coverage.
-5. Add an Official Modules changeset and release notes. Do not move this spec to `implemented/` until implementation and verification evidence exists.
+2. Complete self-contained Playwright coverage for manual CRUD, isolation/locking, deterministic candidate-to-register, and intercepted AI route behavior.
+3. Run design-system/client-boundary checks, package tests/build, host generation/typecheck/lint/build, and activation/decoupling integration coverage.
+4. Record the final exact Official Modules/host SHAs and staging verification evidence. Do not publish, merge, create a changeset solely for staging, or move this spec to `implemented/` until implementation and verification evidence exists.
 
 ## File Manifest
 
@@ -786,18 +825,17 @@ Paths below are relative to `open-mercato/official-modules`; in a host checkout 
 | `.../index.ts` | create | Module metadata. |
 | `.../acl.ts`, `.../setup.ts`, `.../translations.ts` | create | Features, default grants, entity metadata translations. |
 | `.../ce.ts`, `.../encryption.ts` | create | Custom entity and encryption policy. |
-| `.../events.ts`, `.../ai-agents.ts` | create | Typed events and object agent. |
+| `.../events.ts`, `.../ai-agents.ts` | create | Typed events and read-only text agent. |
 | `.../data/entities.ts`, `.../data/validators.ts` | create | Entity and strict schemas/enums. |
-| `.../lib/scoring.ts` | create | Shared score/criticality helper. |
+| `.../lib/scoring.ts`, `.../lib/identification/**` | create | Shared score/criticality helper, candidate schema/source boundary, fixed demo fixture, and bounded AI-output parser. |
 | `.../commands/risks.ts`, `.../commands/index.ts` | create | Undoable CRUD commands. |
-| `.../api/openapi.ts`, `.../api/risks/route.ts` | create | CRUD and OpenAPI. |
+| `.../api/openapi.ts`, `.../api/risks/route.ts`, `.../api/identify/route.ts` | create | CRUD, Checkpoint 6 identification action, and OpenAPI. |
 | `.../backend/risk-management/**` | create | Four server route roots and registry-safe metadata. |
 | `.../components/**` | create | Route clients, form fields, candidate cards/dialog. |
 | `.../i18n/{en,pl,de,es}.json` | create | UI translations. |
 | `.../migrations/Migration*.ts`, `.../migrations/.snapshot-open-mercato.json` | create | Additive schema. |
 | `.../__tests__/**`, `.../api/**/__tests__/**` | create | Scoring, validators, commands, API, ACL, query-index privacy, and agent tests. |
 | `.../__integration__/TC-RISK-*.spec.ts` | create | Self-contained integration coverage. |
-| `.changeset/<generated-name>.md` | create | Official package release entry. |
 
 Explicitly absent:
 
@@ -805,6 +843,7 @@ Explicitly absent:
 - `api/owners/route.ts` or an owner-directory service;
 - manual changes to app/create-app module registries;
 - a host repository submodule pointer bump unless separately approved.
+- changesets, package publication, release tags, or branch merges during the incremental staging plan.
 
 ## Testing Strategy
 
@@ -821,8 +860,10 @@ Explicitly absent:
 - entity-index projections remain encrypted/scoped; with raw-token storage disabled, query tokens are hashed/scoped; no custom per-write token projection claims stronger behavior than full rebuilds;
 - no `search.ts`, global search result, fulltext document, vector source, or title-search control is registered;
 - search configuration resolves `storeRawTokens: false` in supported test/deployment gates and module documentation flags `true` as unsupported;
-- agent is object mode, read-only, has no tools/default model/runtime override, uses `loop.maxSteps`, and exposes the strict maximum-five schema;
-- malformed model output is rejected and never converted into fallback/demo candidates;
+- the demo source returns a fresh but deeply equal copy of one versioned English fixture after every valid input, contains at most five schema-valid candidates, performs no network/AI call, and is explicitly labelled;
+- the agent uses `executionMode: 'chat'` for the text runtime, is read-only, has no tools/default model/runtime override, and uses `loop.maxSteps: 1`;
+- the AI action accepts only the identification input contract, uses the frozen agent server-side, bounds collected text, parses raw and fenced JSON, validates the strict maximum-five schema, and permits no more than one repair attempt;
+- repeated malformed model output is rejected with the documented module error and is never converted into fallback/demo candidates;
 - raw AI context/result is absent from risk-package persistence and structured logger calls; shared AI Assistant behavior is verified against the supported peer version rather than reimplemented;
 - package/module ID mapping and operation without AI Assistant are covered.
 
@@ -834,23 +875,25 @@ Explicitly absent:
 - detail distinguishes loading/not-found/error/ready;
 - stale edit/delete surfaces unified conflict UI;
 - identification validates context and serializes stable enum IDs;
-- generation preserves form/results on error and has no fake fallback;
+- demo generation is immediate, fixed, explicitly disclosed, and independent of the supplied context;
+- AI generation preserves form/results on error and has no fake fallback;
 - candidate Edit supports keyboard apply/cancel; Reject is local; Add calls risk create once and links the created record;
 - criticality uses semantic StatusBadge labels, not color alone;
 - all icon buttons have accessible names and page metadata uses string icons.
 
 ### Required Executable Integration Tests
 
-All fixtures are created through APIs, use generated IDs, and are deleted in `finally`/teardown. Tests do not rely on seed/demo data.
+All database fixtures are created through APIs, use generated IDs, and are deleted in `finally`/teardown. Tests do not rely on seeded/demo database rows; `TC-RISK-004` intentionally exercises the module-owned deterministic candidate fixture defined by this spec.
 
 1. `TC-RISK-001.spec.ts` — UI manual create → list/filter → detail/edit → delete, including built-in and installed custom fields.
 2. `TC-RISK-002.spec.ts` — API scoring, strict validation, tenant/org isolation, and stale optimistic-lock update/delete.
 3. `TC-RISK-003.spec.ts` — with `OM_SEARCH_STORE_RAW_TOKENS=false`, query-index CRUD and full-rebuild paths remain tenant/org scoped, stored entity documents retain encryption, token rows contain hashes rather than plaintext, and the entity is absent from global search because it has no `search.ts` registration.
-4. `TC-RISK-004.spec.ts` — identification UI with deterministic interception of `POST /api/ai_assistant/ai/run-object`: generate at most five candidates, edit one, reject one, add one through the real CRUD API, reload, and verify persistence.
+4. `TC-RISK-004.spec.ts` — Checkpoint 5 deterministic identification UI: submit the final context form, receive the fixed disclosed set, edit one, reject one, add one through the real CRUD API, reload, and verify that only the explicitly added risk persisted.
 5. `TC-RISK-005.spec.ts` — ACL: view-only user can read but cannot mutate/identify; manage and AI feature combinations are independently enforced.
 6. `TC-RISK-006.spec.ts` — package activation exposes routes/navigation and CRUD remains usable with AI Assistant disabled.
+7. `TC-RISK-007.spec.ts` — Checkpoint 6 intercepted `POST /api/risk_management/identify`: valid raw/fenced JSON succeeds; malformed-first/valid-repair succeeds once; repeated malformed output, provider error, missing AI Assistant, and missing permission retain inputs/results and never return demo candidates.
 
-The live LLM call is not part of deterministic CI. If included, it is a separately gated smoke case using existing environment metadata and validates schema/availability only.
+The live Ollama call is not part of deterministic CI. If included, it is a separately gated staging smoke case using protected environment metadata and validates schema/availability only.
 
 ### Validation Gate
 
@@ -862,7 +905,6 @@ Before exercising risk fixtures, record that `resolveSearchConfig().storeRawToke
 # In open-mercato/official-modules
 yarn workspace @open-mercato/risk-management test
 yarn workspace @open-mercato/risk-management build
-yarn changeset status
 
 # In the Open Mercato host after local activation
 yarn generate
@@ -882,8 +924,16 @@ Also run the closest Official Modules package validation and root CI-ordered com
 - **Scenario**: Malformed or manipulated model output supplies invalid fields or causes an unintended write.
 - **Severity**: High
 - **Affected area**: Identification and register integrity
-- **Mitigation**: Strict object schema, no tools, no AI mutation, score omitted/recomputed, explicit one-candidate Add through normal CRUD.
+- **Mitigation**: Bounded text collection, raw/fenced JSON extraction, strict Zod schema, at most one repair attempt, no tools, no AI mutation, score omitted/recomputed, and explicit one-candidate Add through normal CRUD.
 - **Residual risk**: A schema-valid candidate can still be substantively poor; operator review remains required.
+
+#### Demo output mistaken for a real assessment
+
+- **Scenario**: A staging/test operator treats the fixed Checkpoint 5 candidates as if they were derived from the submitted company context.
+- **Severity**: High
+- **Affected area**: Product trust and risk decisions
+- **Mitigation**: Prominent translated demo disclosure, fixed newly authored English content, no simulated delay or input-dependent selection, explicit `demo|ai` server configuration after Checkpoint 6, `ai` default, and tests that prevent silent AI-to-demo fallback.
+- **Residual risk**: Screenshots can omit surrounding disclosure; demo mode must not be recommended for production assessment.
 
 #### Sensitive context reaches logs or storage
 
@@ -922,7 +972,7 @@ Also run the closest Official Modules package validation and root CI-ordered com
 - **Scenario**: Standard query-index rebuilding decrypts risk strings in memory and stores hashes that reveal equality/token-pattern metadata even though the entity has no search UI.
 - **Severity**: High
 - **Affected area**: Query indexing and privacy
-- **Mitigation**: Require the platform-default `OM_SEARCH_STORE_RAW_TOKENS=false`, verify it in implementation/release validation, retain tenant/org-scoped hashed token rows and encrypted entity projections, register no `search.ts`/presenter/fulltext/vector/title search, and test CRUD/full-rebuild isolation.
+- **Mitigation**: Require the platform-default `OM_SEARCH_STORE_RAW_TOKENS=false`, verify it in implementation/deployment validation, retain tenant/org-scoped hashed token rows and encrypted entity projections, register no `search.ts`/presenter/fulltext/vector/title search, and test CRUD/full-rebuild isolation.
 - **Residual risk**: Hashed tokens can reveal scoped equality/pattern metadata. A host administrator can globally enable raw-token debug storage, which would store plaintext tokens and is explicitly unsupported for Risk Management. Eliminating tokens entirely needs a platform opt-out/projection contract and is deferred rather than hidden in this Official Module.
 
 #### AI provider unavailable, slow, or costly
@@ -930,15 +980,15 @@ Also run the closest Official Modules package validation and root CI-ordered com
 - **Scenario**: No provider/model is configured, a request times out/fails, or an authorized user repeatedly generates candidates.
 - **Severity**: Medium
 - **Affected area**: Identification and AI spend
-- **Mitigation**: Generic dispatcher-error handling, retained form/results, single in-flight UI request, maximum five candidates and one agent step, ACL restriction, provider billing controls/monitoring.
-- **Residual risk**: The current dispatcher has no guaranteed per-call rate-limit contract; authorized repeated calls can incur cost until platform-level controls are added.
+- **Mitigation**: Module-owned error handling, retained form/results, single in-flight UI request, maximum five candidates, one initial model call plus at most one repair call, ACL restriction, no silent demo fallback, and provider billing controls/monitoring.
+- **Residual risk**: The runtime has no guaranteed Risk Management-specific per-call rate-limit contract; authorized repeated calls or repair attempts can incur cost until platform-level controls are added.
 
 #### Official package activation or version drift
 
 - **Scenario**: The package builds in its repository but activation, generated registries, migration discovery, or AI agent compilation fails in a host app.
 - **Severity**: High
 - **Affected area**: Installability and upgrades
-- **Mitigation**: Official package conventions, local activation test, build-generate-build validation, compiled `ai-agents` verification, changeset, host integration test with AI disabled.
+- **Mitigation**: Official package conventions, local activation test, build-generate-build validation, compiled `ai-agents` verification, exact source SHAs, and host integration test with AI disabled.
 - **Residual risk**: Downstream apps must explicitly install/activate compatible package versions.
 
 #### MVP expands into full GRC
@@ -951,51 +1001,66 @@ Also run the closest Official Modules package validation and root CI-ordered com
 
 ### Operational Detection and Blast Radius
 
-- Structured log namespaces `risk_management.api`, `risk_management.command`, and `risk_management.ai` record request IDs, scoped record IDs, latency, result counts, conflict/validation/provider error codes, and outcomes without content values.
-- Existing HTTP error-rate/latency monitoring detects CRUD and AI-dispatch 5xx spikes. Query-index observability detects projection/token-index lag.
+- Structured log namespaces `risk_management.api`, `risk_management.command`, and `risk_management.ai` record request IDs, scoped record IDs, source, latency, result/retry counts, conflict/validation/provider error codes, and outcomes without content values.
+- Existing HTTP error-rate/latency monitoring detects CRUD and identification-action 5xx spikes. Query-index observability detects projection/token-index lag.
 - Database constraint failures are warning/error signals with tenant/organization IDs but no payload text.
 - CRUD failures are isolated to the Official Module and current scoped request. AI/provider failure affects identification only. There is no auth/core mutation or shared-service blast radius.
 
-## Final Compliance Report — 2026-07-18
+## Final Compliance Report — 2026-07-21
 
 ### Guidance Reviewed
 
 - Root `AGENTS.md`, including module development, Official Modules, CRUD, AI, search, optimistic locking, spec, and testing router entries.
-- `.ai/specs/AGENTS.md`, `.agents/skills/om-spec-writing/SKILL.md`, and the reference spec `2026-06-13-customers-leads-phase-1.md`.
+- `.ai/specs/AGENTS.md`, `.ai/skills/om-spec-writing/SKILL.md`, `.ai/skills/om-create-ai-agent/SKILL.md`, and the reference spec `2026-06-13-customers-leads-phase-1.md`.
 - `packages/core/AGENTS.md`, `packages/core/src/modules/customers/AGENTS.md`, `packages/ui/AGENTS.md`, `packages/search/AGENTS.md`, `packages/ai-assistant/AGENTS.md`, `packages/cli/AGENTS.md`, `.ai/qa/AGENTS.md`, and applicable referenced framework docs.
 - Open Mercato module documentation, including Create First Module, Core Modules, Official Modules, and Official Modules Development.
-- Current route/registry implementations for module API discovery, `ai_assistant` object dispatch, page metadata, encryption, tokens, CRUD commands, and optimistic locking.
+- Current route/registry implementations for module API discovery, the AI Assistant text runtime/model factory, page metadata, encryption, tokens, CRUD commands, and optimistic locking.
 - `riskai-v2.1` domain/UI behavior as a product reference only.
 
 ### Compliance Matrix
 
 | Area | Result | Evidence/decision |
 |---|---|---|
-| Product scope | Pass | One entity, two top-level views, complete CRUD, AI review/add only; wider GRC and ownership excluded. |
+| Product scope | Pass | One entity, two top-level views, complete CRUD, deterministic-first then AI-assisted review/add; wider GRC and ownership excluded. |
 | Placement | Pass | Optional maintained vertical is an Official Module, not core or app-local. |
 | Package boundary | Pass | No core/auth edits or ORM relationship; AI Assistant is an explicit optional peer with tested absent-module behavior. |
-| Naming/discovery | Pass | Package suffix maps to `risk_management`; API route is `/api/risk_management/risks`; `translations.ts` included. |
+| Naming/discovery | Pass | Package suffix maps to `risk_management`; API routes are `/api/risk_management/risks` and additive `/api/risk_management/identify`; `translations.ts` included. |
 | Tenant/organization safety | Pass | All reads/writes/query-index projections are explicitly scoped and tested. |
 | CRUD/commands/events | Pass | Command-backed writes, undo, post-commit side effects, strict schemas, stable IDs. |
 | Data integrity | Pass | `updated_at`/`updatedAt`, CrudForm/guarded mutation headers, shared 409 conflict handling, DB scoring constraints. |
 | Encryption/privacy | Pass | Title, description, amount encrypted; this module does not persist/log AI payloads and documents the shared-runtime/provider trust boundary. |
 | ACL/setup | Pass | Separate view/manage/identify features; admin grants; employee opt-in. |
-| AI contract | Pass | Existing `/api/ai_assistant/ai/run-object`, optional peer/version contract, object/read-only/no-tools agent, `loop.maxSteps`, absent-module UX, no invented rate-limit/provider status. |
+| AI contract | Pass | Module-owned action delegates to the standard AI Assistant text runtime/model resolution; optional peer/version contract, read-only/no-tools/one-step agent, bounded JSON extraction, strict validation, one repair attempt, absent-module UX, and no invented rate-limit/provider status. |
 | UI/design system | Pass | DataTable/CrudForm/shared states, string metadata icon, no raw controls/colors/fetch. |
 | Query index/search privacy | Conditional pass | Encrypted/scoped projection and hashes-only tokens require `OM_SEARCH_STORE_RAW_TOKENS=false` (default); raw-token mode is unsupported and documented; no module global/title/fulltext/vector search. |
-| Migration/release | Pass | Package-owned migration/snapshot/changeset; no local migration application or host pointer change without approval. |
-| Integration coverage | Pass | Every affected API and key UI path has self-contained deterministic coverage, plus activation/AI-disabled coverage. |
+| Migration/release | Pass | Package-owned migration/snapshot; exact unmerged source deployment only, with no changeset/publication/merge and no migration application without approval. |
+| Integration coverage | Pass | Every affected API and key UI path has self-contained deterministic coverage, including fixed demo-to-register, intercepted AI parsing/errors, activation, and AI-disabled behavior. |
 | Backward compatibility | Pass | Additive optional package; existing public contracts are consumed unchanged. |
 
 ### Scope Review Resolution
 
-The mandatory fresh-context review returned **SPLIT**: manual CRUD is independently deployable and AI has separate ACL/runtime availability. The maintainer explicitly chose one specification, so this document records a maintainer-approved exception rather than claiming a KEEP result. Both phases ship in one Official Module, AI creates only transient candidates for the same single risk aggregate, and phase boundaries permit independent implementation/verification. The optional AI Assistant peer/route integration is explicitly documented; there is no second entity, package, or core/auth change hidden in the combined scope.
+Both mandatory fresh-context reviews returned **SPLIT**: manual CRUD is independently deployable, deterministic identification is independently demonstrable, and AI has separate ACL/runtime availability. The maintainer explicitly chose one specification, so this document records a maintainer-approved exception rather than claiming a KEEP result. The revised deterministic Checkpoint 5 strengthens the phase boundary without adding another package or aggregate: it delivers the final context/review/Edit/Reject/Add product path, while Checkpoint 6 swaps only the candidate source. The optional AI Assistant peer/action integration is explicit; there is no second entity or core/auth change hidden in the combined scope.
 
 ### Verdict
 
-Approved for pre-implementation analysis. The implementation must still run the repository’s `om-pre-implement-spec` workflow before coding and must not broaden ownership, core placement, AI persistence, or scoring methodology without a new decision/spec.
+Approved as the governing specification for the remaining checkpoints. Checkpoints 1–4 are already delivered incrementally; Checkpoints 5–6 must follow the deterministic-source and live-AI boundaries above. Do not broaden ownership, core placement, AI persistence, scoring methodology, or production use of demo identification without a new decision/spec.
 
 ## Review Changelog
+
+### 2026-07-21 — Deterministic-first delivery review
+
+- Reordered the final product increments: Checkpoint 5 now delivers the complete context-to-register workflow with a fixed, explicitly disclosed English demo fixture; Checkpoint 6 replaces only that source with Ollama-backed AI.
+- Kept all six context fields while confirming that only `businessContext` is required.
+- Added explicit one-candidate Add behavior in Checkpoint 5, including ACL separation, Added/link state, ambiguous-result guidance, and a self-contained real-CRUD integration path.
+- Replaced the planned object-dispatch dependency with a module-owned additive identification action that delegates to the AI Assistant text runtime, validates bounded raw/fenced JSON, and permits at most one repair attempt.
+- Added the `demo|ai` server selector, `ai` default, staging/test-only demo rule, protected Ollama configuration, and a hard prohibition on silent fallback.
+- Recorded Checkpoint 4 as deployed and verified at its exact Official Modules and host SHAs.
+
+### 2026-07-21 — Fresh adversarial scope review
+
+- Reviewer verdict: **SPLIT**, unchanged from the earlier review, because the manual register and identification adapters remain independently deployable; the maintainer-approved one-spec exception remains explicit.
+- The reviewer identified an ambiguity between browser-local demo generation, a server-selected post-Checkpoint-6 source, and AI permissions.
+- Resolution: Checkpoint 5 remains browser-local with no identification action. After Checkpoint 6, both configured sources use `/api/risk_management/identify`; its declarative metadata always requires `risk_management.risk.identify`, while only the `ai` branch conditionally checks `ai_assistant.view` and loads AI Assistant. This preserves demo-mode operation without AI and removes mixed ownership.
 
 ### 2026-07-18 — Architecture and framework review
 
@@ -1012,6 +1077,14 @@ Approved for pre-implementation analysis. The implementation must still run the 
 - Confirmed that Official Module placement and removal of platform-user ownership are internally consistent and leave no hidden core/auth implementation.
 
 ## Changelog
+
+### 2026-07-21
+
+- Reordered Checkpoints 5 and 6 so deterministic candidate-to-register delivery precedes live AI.
+- Defined the versioned demo candidate contract, disclosure, source boundary, explicit Add behavior, and deterministic integration coverage.
+- Defined `/api/risk_management/identify`, the read-only text agent/parser/repair contract, Ollama environment wiring, and failure behavior with no silent demo fallback.
+- Updated implementation status with the verified Checkpoint 4 deployment and aligned the plan/spec rollback and stop conditions.
+- Aligned execution with the staging plan: exact unmerged source SHAs only, with no changeset, package publication, release tag, or branch merge.
 
 ### 2026-07-18
 

@@ -287,7 +287,7 @@ For every ACL checkpoint:
   or open the page directly;
 - after CRUD exists, verify employee API read/write denial separately;
 - after AI exists, verify `risk_management.risk.identify` and
-  `ai_assistant.view` independently at the dispatcher;
+  `ai_assistant.view` independently at the module-owned identification action;
 - verify a user/session from another tenant cannot access the target tenant's
   records even if it has similarly named grants;
 - record all inserted/changed `RoleAcl` rows.
@@ -386,7 +386,7 @@ Checkpoint 0 has no module commit.
 - [ ] Obtain explicit approval immediately before a migration-bearing deploy.
 - [ ] Verify `OM_SEARCH_STORE_RAW_TOKENS` is unset or `false` before storing
       risk text.
-- [ ] Do not require AI provider secrets before Checkpoint 5.
+- [ ] Do not require AI provider secrets before Checkpoint 6.
 
 ### 4. Deploy with Ansible
 
@@ -464,8 +464,8 @@ harmless or perform emergency destructive ACL edits.
 | 2. Two honest preview pages | Risk Register and Identify pages show final information architecture | ACL rows only; no schema/domain data | Product direction demonstrable; nothing saved or sent |
 | 3. Minimal real register | Complete CRUD for basic scored risks | additive table | First useful manual product |
 | 4. Complete manual register | Full approved fields, custom fields, encryption, conflicts, i18n | additive only | Production-like manual risk management |
-| 5. Read-only AI identification | Real AI proposes transient candidates with review/reject | no AI persistence | AI value demonstrable without writes |
-| 6. Candidate-to-register | Explicit Add persists one reviewed candidate | no new AI table | Requested two-view MVP works |
+| 5. Deterministic identification-to-register | The completed context form always returns the same English demo candidates; review/edit/reject and explicit Add use the real register API | no new schema or AI persistence | Complete two-view workflow demonstrable without provider risk |
+| 6. Live AI identification | Ollama-backed AI replaces only the candidate source; review/edit/reject/Add remain unchanged | no new AI table | Requested AI-assisted two-view MVP works |
 | 7. Staging hardening | Full test/runbook evidence on pinned source branches | no destructive change | Staging MVP complete; publication remains optional |
 
 ## Checkpoint 0 — Exact Unmerged Branch Baseline
@@ -818,15 +818,33 @@ defaults for new optional fields.
 
 ### Tasks
 
-- [ ] Add optional fields and additive migration if needed.
-- [ ] Extend strict API schemas without changing existing semantics.
-- [ ] Complete forms, table, encryption/decryption, and custom fields.
-- [ ] Complete API, component, integration, accessibility, and design-system
+- [x] Add optional fields and additive migration if needed.
+- [x] Extend strict API schemas without changing existing semantics.
+- [x] Complete forms, table, encryption/decryption, and custom fields.
+- [x] Complete API, component, integration, accessibility, and design-system
       coverage.
-- [ ] Verify old basic records still list/edit/delete.
-- [ ] Commit/push both exact SHAs.
-- [ ] Back up and explicitly approve any migration-bearing deployment.
-- [ ] Deploy, verify migration state, sync ACLs, and run the recurring gate.
+- [x] Verify old basic records still list/edit/delete.
+- [x] Commit/push both exact SHAs.
+- [x] Back up and explicitly approve any migration-bearing deployment.
+- [x] Deploy, verify migration state, sync ACLs, and run the recurring gate.
+
+### Execution record — 2026-07-21
+
+- Official Modules branch `feat/risk-management` deployed at
+  `4c1216e2abc8950ba5395268471820eb8829ee20`.
+- Host branch `feat/risk-management-staging` deployed at
+  `92bb50020a1bfdca05a8d3e3e984e9d2921a4d29`; the host commit also bounds
+  production-build concurrency so the 8 GiB staging VPS remains responsive.
+- Backup `/opt/backups/open-mercato-20260721-103449.sql.gz` passed `gzip -t`
+  and a disposable PostgreSQL 17 restore rehearsal before deployment.
+- Ansible completed with 26 successful tasks and no failures. Migration
+  `Migration20260720230622_risk_management` is present in the module ledger;
+  its three nullable columns and financial-pair constraint were verified.
+- All three pre-existing risks remained present. The new container, exact
+  host/submodule SHAs, public backend and register routes, admin/superadmin
+  wildcard grants, ACL synchronization, RBAC purge, and structural-navigation
+  purge were verified after deployment.
+- No AI provider, request, persistence, or schema was introduced.
 
 ### Demo and stop condition
 
@@ -836,83 +854,131 @@ translations, conflicts, custom fields, and an older basic record.
 Safe to stop: staging has a production-like manual Risk Register. AI can remain
 postponed indefinitely.
 
-## Checkpoint 5 — Read-Only AI Identification
+## Checkpoint 5 — Deterministic Identification-to-Register
 
-**Purpose:** Demonstrate AI value without allowing AI to mutate risk data.
+**Purpose:** Prove the complete identification-review-create workflow before
+adding an external provider or AI-output uncertainty.
+
+**Adds:**
+
+- the final six-field identification form, with all fields present and
+  validated while only `businessContext` is required;
+- a small candidate-source adapter whose Checkpoint 5 implementation returns
+  the same versioned English demo candidate set on every valid submission;
+- no simulated delay and no dependence on the supplied context when selecting
+  candidates; the page labels the result clearly as demo identification;
+- at most five transient candidate cards with local Edit and Reject;
+- one explicit **Add to register** action per candidate through the existing
+  guarded risk-create API and normal command/event path;
+- successful cards become Added, disable repeat submission, and link to the
+  created risk;
+- no Add All, background write, AI package, provider secret, AI request, or
+  candidate/session persistence.
+
+### Tasks
+
+- [ ] Implement the final validated context form and candidate-source
+      interface without an AI dependency.
+- [ ] Add a versioned, immutable demo fixture of at most five English
+      candidates; return a fresh copy on every valid submission.
+- [ ] Add the translated demo disclosure, candidate cards, local Edit/Reject,
+      regenerate/reset confirmation, and single-flight UI behavior.
+- [ ] Add guarded one-candidate create, Added/link state, concurrent-click
+      suppression, and the ambiguous-result warning:
+      “Result unknown — refresh the Risk Register before retrying”.
+- [ ] Verify identify and manage permissions independently; an identifier may
+      review candidates but needs manage permission to see/use Add.
+- [ ] Add the self-contained integration path:
+      validate context → generate fixed set → edit → reject → add → reload
+      register; assert no candidate is persisted before explicit Add.
+- [ ] Verify the fixed data is domain demo content, not copied prototype data,
+      and that all interface/disclosure strings remain translated.
+- [ ] Commit/push both SHAs, deploy, and run the recurring gate.
+
+### Demo and stop condition
+
+Enter the complete context, generate the fixed candidates, edit and reject
+locally, explicitly add one, open it from the register, and reload both views to
+show that only the added candidate persisted.
+
+Safe to stop: both requested views work end to end with deterministic demo
+identification and no AI/provider dependency.
+
+### Rollback
+
+Redeploy the Checkpoint 4 host SHA. No provider configuration or database
+rollback is involved.
+
+## Checkpoint 6 — Live AI Identification
+
+**Purpose:** Replace only the deterministic candidate source with real AI while
+preserving the proven review and explicit-create workflow.
 
 **Adds:**
 
 - optional peer integration with `@open-mercato/ai-assistant`;
-- object agent `risk_management.risk_identifier`;
-- no tools, read-only mutation policy, one-step loop, at most five candidates;
-- existing `/api/ai_assistant/ai/run-object` dispatcher;
-- transient candidate display with local Edit and Reject;
-- external-provider disclosure;
-- absent-module, permission, provider, and runtime failure UX;
-- no Add action;
-- no AI input/output/session/candidate persistence in this module.
+- read-only, no-tools agent `risk_management.risk_identifier` with one model
+  step and no default provider/model;
+- a module-owned identification action that uses the standard AI Assistant
+  runtime/model resolution, collects text, extracts JSON, validates the same
+  strict maximum-five candidate schema, and performs at most one repair retry;
+- Ollama-compatible provider wiring through existing provider configuration;
+- external-provider disclosure and absent-module, permission, provider,
+  malformed-output, and runtime failure UX;
+- explicit `RISK_MANAGEMENT_IDENTIFICATION_SOURCE=demo|ai` selection after this
+  checkpoint, defaulting to `ai`; `demo` is permitted for staging/tests only
+  and unknown values fail closed as configuration errors;
+- after this checkpoint both sources use the module-owned action: its
+  declarative metadata requires `risk_management.risk.identify`, and only the
+  `ai` branch additionally checks `ai_assistant.view` before lazily loading the
+  optional AI Assistant runtime;
+- no silent fallback from `ai` to `demo`, no direct provider SDK, no AI tools,
+  and no AI input/output/session/candidate persistence in this module;
+- the Checkpoint 5 review/edit/reject/Add behavior remains unchanged.
 
 ### Tasks
 
-- [ ] Implement and test the optional peer contract and strict object agent.
-- [ ] Connect through `apiCall` with single-flight generation behavior.
-- [ ] Preserve inputs/results on failure and support transient Edit/Reject.
-- [ ] Verify raw AI content does not enter module persistence/logger calls.
-- [ ] Run deterministic tests with an intercepted dispatcher response.
-- [ ] Configure a real provider only through existing settings and approved
-      secrets.
+- [ ] Add and test the optional peer contract and registered read-only agent.
+- [ ] Add the module-owned AI identification route with OpenAPI, declarative
+      identify ACL, conditional wildcard-aware AI Assistant ACL, lazy optional
+      runtime loading, standard model resolution, metadata-only logging,
+      32-KiB output limit, unambiguous raw/fenced JSON extraction, strict Zod
+      validation, and one repair retry.
+- [ ] Add AI source selection without changing the Checkpoint 5 form/cards or
+      guarded Add path; never substitute demo candidates after AI failure.
+- [ ] Add provider/runtime/privacy errors while preserving form inputs and the
+      last valid candidate set.
+- [ ] Add deterministic route/component tests for valid JSON, fenced JSON,
+      malformed first response repaired once, repeated malformed response,
+      permission denial, provider failure, and absent AI Assistant.
+- [ ] Add Docker/Ansible passthrough for provider/model/Ollama variables without
+      committing secrets; configure the real token only in the protected
+      staging environment.
+- [ ] Run an optional live Ollama smoke test after secret configuration; CI
+      stays secret-free and deterministic.
 - [ ] Commit/push both SHAs, deploy, and run the recurring gate.
+
+The model never receives a mutation tool and cannot add a risk. Candidate Add
+remains the operator's normal guarded CRUD action. This checkpoint still does
+not promise create retry idempotency: a create can commit while its response is
+lost, and titles are not unique; a manual retry may create a duplicate.
+Guaranteed retry safety requires a separate durable idempotency contract.
 
 ### Demo and stop condition
 
-Enter context, generate at most five real advisory candidates, edit/reject
-locally, reload to prove nothing entered the register, and show manual CRUD
-still works when AI is unavailable.
+Switch the explicit source from demo to AI, enter context, generate at most five
+real advisory candidates, edit/reject/add through the unchanged UI, open the
+added risk, and show that provider failure never breaks manual CRUD or fabricates
+demo results.
 
-Safe to stop: AI identification is demonstrable and read-only.
+Safe to stop: the requested AI-assisted two-view MVP works end to end without
+wider GRC scope.
 
 ### Rollback
 
-Redeploy Checkpoint 4 host SHA. Do not remove or alter shared AI Assistant
-provider configuration as a Risk Management rollback.
-
-## Checkpoint 6 — Explicit Candidate-to-Register
-
-**Purpose:** Complete the requested two-view MVP.
-
-**Adds:**
-
-- candidate Edit supports final register fields;
-- one explicit **Add to register** action per candidate;
-- Add uses the guarded risk-create API and normal command/event path;
-- successful card links to the new risk;
-- concurrent clicks are suppressed;
-- no automatic retry after an ambiguous result;
-- no Add All or autonomous AI write.
-
-### Tasks
-
-- [ ] Add guarded single-candidate create and single-flight UI state.
-- [ ] Show:
-      “Result unknown — refresh the Risk Register before retrying”
-      after ambiguous network failure.
-- [ ] Add the deterministic integration path:
-      generate → edit → reject → add → reload register.
-- [ ] Validate model output and recompute scoring on the server.
-- [ ] Verify identify and manage permissions independently.
-- [ ] Commit/push both SHAs, deploy, and run the recurring gate.
-
-This checkpoint does not promise retry idempotency. A create can commit while
-its response is lost, and titles are not unique; a manual retry may create a
-duplicate. Guaranteed retry safety requires a separate durable idempotency
-contract.
-
-### Demo and stop condition
-
-Generate candidates, review/edit one, explicitly add it, open it from the
-register, and verify it persists after reload.
-
-Safe to stop: both requested views work end to end without wider GRC scope.
+Redeploy the Checkpoint 5 host SHA. Do not remove or alter shared AI Assistant
+provider configuration as a Risk Management rollback; the prior application
+does not consume it.
 
 ## Checkpoint 7 — Staging Hardening
 
