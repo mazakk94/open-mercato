@@ -1029,3 +1029,19 @@ committing or deploying the new gitlink. Review and commit the resulting
 
 **Applies to**: source-backed Official Module activation, Docker build adapters,
 workspace gitlink updates, and every exact-SHA staging deployment.
+
+## Build scripts must not override container memory limits
+
+**Context**: A production Docker build set a bounded `NODE_OPTIONS` in the
+Dockerfile, but the app workspace's `build` script used `cross-env` to replace
+it with an 8 GiB heap. On an 8 GiB VPS this saturated the host, blocked SSH and
+HTTPS, and left the Compose build detached after the deployment client exited.
+
+**Rule**: Application build launchers must preserve a non-empty caller-provided
+`NODE_OPTIONS` and apply their larger local default only when the variable is
+absent. Before a constrained-host deploy, verify the effective `next build`
+process arguments/environment inside the container rather than trusting the
+Dockerfile declaration alone.
+
+**Applies to**: production Docker builds, CI build containers, Ansible deploys,
+and workspace scripts that launch memory-intensive Node processes.
