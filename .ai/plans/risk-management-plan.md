@@ -877,23 +877,62 @@ adding an external provider or AI-output uncertainty.
 
 ### Tasks
 
-- [ ] Implement the final validated context form and candidate-source
+- [x] Implement the final validated context form and candidate-source
       interface without an AI dependency.
-- [ ] Add a versioned, immutable demo fixture of at most five English
+- [x] Add a versioned, immutable demo fixture of at most five English
       candidates; return a fresh copy on every valid submission.
-- [ ] Add the translated demo disclosure, candidate cards, local Edit/Reject,
+- [x] Add the translated demo disclosure, candidate cards, local Edit/Reject,
       regenerate/reset confirmation, and single-flight UI behavior.
-- [ ] Add guarded one-candidate create, Added/link state, concurrent-click
+- [x] Add guarded one-candidate create, Added/link state, concurrent-click
       suppression, and the ambiguous-result warning:
       “Result unknown — refresh the Risk Register before retrying”.
-- [ ] Verify identify and manage permissions independently; an identifier may
+- [x] Verify identify and manage permissions independently; an identifier may
       review candidates but needs manage permission to see/use Add.
-- [ ] Add the self-contained integration path:
+- [x] Add the self-contained integration path:
       validate context → generate fixed set → edit → reject → add → reload
       register; assert no candidate is persisted before explicit Add.
-- [ ] Verify the fixed data is domain demo content, not copied prototype data,
+- [x] Verify the fixed data is domain demo content, not copied prototype data,
       and that all interface/disclosure strings remain translated.
-- [ ] Commit/push both SHAs, deploy, and run the recurring gate.
+- [x] Commit/push both SHAs, deploy, and run the recurring gate.
+
+### Execution record — 2026-07-22
+
+- Official Modules branch `feat/risk-management` deployed at
+  `e8908a47ab090f882e930983c736ae943aade8c4`.
+- Host branch `feat/risk-management-staging` deployed at
+  `6a17a698fbb2eb81f8219bf4fee8c2dfd2826d83`, pinning that exact module SHA.
+  Infra remained at committed revision
+  `84791d6d0bebc0d5c287f44dd7d2d4672d296061`.
+- The final form, immutable five-candidate fixture, translated disclosure,
+  review/Edit/Reject, guarded Add, duplicate-click suppression, Added/link
+  state, and unknown-result guidance were implemented with no AI request,
+  provider secret, new endpoint, or schema change.
+- The focused module gate passed: 7 Jest suites / 50 tests, package typecheck
+  and build, `yarn generate`, root typecheck/lint/build-packages, design-system
+  scan, and a clean Node 24 production builder image. Root validation used
+  `Runner: local`; lint reported only 12 pre-existing warnings.
+- The dedicated `TC-RISK-004` path passed locally and again against
+  `https://openmercato.online/`. Staging evidence confirms the top-sidebar
+  Risk AI group, deterministic five-candidate generation across different
+  contexts, local edit/reject, exactly one guarded create despite a duplicate
+  click, Added/open-risk state, persisted data, and cleanup of the temporary
+  risk. No identification endpoint or AI mutation request was made.
+- The broader local Risk suite was 8/9: the only failure was the existing
+  Checkpoint 4 `TC-RISK-CRUD-001` dynamic-custom-field assertion
+  (`customValues` was null). It is outside the Checkpoint 5 source delta and is
+  retained as a follow-up rather than hidden as a Checkpoint 5 regression.
+- Ansible completed with 26 successful tasks, no failures, and verified both
+  exact SHAs before the image build. Migrations ran idempotently, default ACLs
+  were synchronized, and RBAC/navigation caches were purged.
+- Post-deployment checks confirmed a current healthy app container, admin and
+  superadmin `risk_management.*` grants, no restrictive raw search-token
+  setting, successful public/login/backend routing, no remaining QA record,
+  and no app/Caddy errors after the container-replacement window.
+- The first build attempt exposed that the app package script overwrote the
+  Docker heap cap and temporarily saturated the VPS. Host commit
+  `6a17a698fbb2eb81f8219bf4fee8c2dfd2826d83` fixes the root cause by preserving
+  caller-provided `NODE_OPTIONS`; a clean 4 GiB builder run and the successful
+  staging deployment verified the correction.
 
 ### Demo and stop condition
 

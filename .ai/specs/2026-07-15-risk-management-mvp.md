@@ -772,7 +772,7 @@ Each phase ends in a working application and includes its tests.
 | Checkpoint 2 — previews and navigation | Done | 2026-07-20 | Deployed and verified on staging at pinned host and Official Modules revisions. |
 | Checkpoint 3 — minimal real register | Done | 2026-07-21 | Deployed from pinned unmerged host/Official Module commits after a verified backup. The additive migration, exact revisions, admin CRUD, role/API denial, scoring/filtering/locking, sidebar, preview, and clean runtime logs were verified on staging. |
 | Checkpoint 4 — complete manual register | Done | 2026-07-21 | Deployed from Official Modules `4c1216e2abc8950ba5395268471820eb8829ee20` and host `92bb50020a1bfdca05a8d3e3e984e9d2921a4d29` after verified backup/restore rehearsal. Migration, existing records, ACL synchronization, routes, and new fields were verified on staging. |
-| Checkpoint 5 — deterministic identification-to-register | Not Started | — | Final six-field form and fixed English demo candidates will prove review/edit/reject/Add without AI or schema changes. |
+| Checkpoint 5 — deterministic identification-to-register | Done | 2026-07-22 | Deployed from Official Modules `e8908a47ab090f882e930983c736ae943aade8c4` and host `6a17a698fbb2eb81f8219bf4fee8c2dfd2826d83`. The six-field deterministic review/edit/reject/Add workflow, permissions, single-flight create, cleanup, and no-AI/no-schema boundary were verified on staging. |
 | Checkpoint 6 — live AI identification | Not Started | — | Ollama-backed AI will replace only the candidate source; no silent demo fallback. |
 
 ### Phase 1: Official Module, Data, and Manual Register
@@ -1077,6 +1077,17 @@ Approved as the governing specification for the remaining checkpoints. Checkpoin
 - Confirmed that Official Module placement and removal of platform-user ownership are internally consistent and leave no hidden core/auth implementation.
 
 ## Changelog
+
+### 2026-07-22
+
+- Recorded Checkpoint 5 as implemented, pushed, and deployed from exact
+  unmerged host and Official Modules revisions.
+- Verified the deterministic five-candidate workflow end to end on staging,
+  including review/edit/reject, one explicit guarded Add, persisted/open-risk
+  state, cleanup, admin sidebar/ACL access, and the absence of AI requests or
+  schema changes.
+- Recorded the production-build memory correction that preserves the
+  container-provided Node heap cap and the clean post-restart health window.
 
 ### 2026-07-21
 
