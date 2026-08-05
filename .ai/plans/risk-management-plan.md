@@ -986,31 +986,31 @@ preserving the proven review and explicit-create workflow.
 - [x] Move the existing identification client to `apiCall` while preserving
       form values, reviewed candidates, edit/reject/Add state, and the
       prominent demo disclosure.
-- [ ] Add deterministic route/component/integration coverage, build and push
+- [x] Add deterministic route/component/integration coverage, build and push
       focused Official Modules and host commits, deploy exact SHAs with
       `RISK_MANAGEMENT_IDENTIFICATION_SOURCE=demo`, and verify both Risk AI
       views plus CRUD before proceeding.
 
 #### Increment 6B — Direct Ollama Cloud source
 
-- [ ] Verify the existing AI Assistant `ollama` provider against the protected
+- [x] Verify the existing AI Assistant `ollama` provider against the protected
       staging configuration at `https://ollama.com/v1`. Add a minimal shared
       adapter only if this real compatibility smoke fails; do not add a direct
       provider SDK or module-local Ollama client.
-- [ ] Add and test the optional peer contract and registered read-only agent.
-- [ ] Complete the module-owned AI identification route with conditional
+- [x] Add and test the optional peer contract and registered read-only agent.
+- [x] Complete the module-owned AI identification route with conditional
       identify ACL, conditional wildcard-aware AI Assistant ACL, lazy optional
       runtime loading, standard model resolution, metadata-only logging,
       32-KiB output limit, unambiguous raw/fenced JSON extraction, strict Zod
       validation, and one repair retry.
-- [ ] Add AI source selection without changing the Checkpoint 5 form/cards or
+- [x] Add AI source selection without changing the Checkpoint 5 form/cards or
       guarded Add path; never substitute demo candidates after AI failure.
-- [ ] Add provider/runtime/privacy errors while preserving form inputs and the
+- [x] Add provider/runtime/privacy errors while preserving form inputs and the
       last valid candidate set.
-- [ ] Add deterministic route/component tests for valid JSON, fenced JSON,
+- [x] Add deterministic route/component tests for valid JSON, fenced JSON,
       malformed first response repaired once, repeated malformed response,
       permission denial, provider failure, and absent AI Assistant.
-- [ ] Add Docker/Ansible passthrough for provider/model/Ollama variables without
+- [x] Add Docker/Ansible passthrough for provider/model/Ollama variables without
       committing secrets; configure the real token only in the protected
       staging environment.
 - [ ] Run the protected live Ollama schema/availability smoke; CI stays
@@ -1097,6 +1097,22 @@ None of these actions is required to demonstrate or complete the staging MVP.
 - merge to Open Mercato `develop` or Official Modules `main`;
 - Dokploy deployment;
 - destructive migration cleanup.
+
+### Checkpoint 6A — 2026-08-05
+
+- Infra commit: `b44ef5ebb8b694aa03b4d97fc9bfb003e64133cb` (local only; private-submodule exact-SHA bundle hardening plus corrected separation of application runtime env from Compose interpolation).
+- Host branch and commit: `feat/risk-management-staging` at `73ed502985a546aa164d30aab4a0e6305b000ac2`.
+- Official Modules repository, branch, and commit: `mazakk94/official-modules`, `feat/risk-management`, `773c5aa19f921348a6c9f7db1317703ce67af263`.
+- Server host HEAD: `73ed502985a546aa164d30aab4a0e6305b000ac2`.
+- Server submodule HEAD: `773c5aa19f921348a6c9f7db1317703ce67af263`.
+- Database backup/migration: no schema change; production startup and explicit migration task completed successfully; preserved PostgreSQL volume verified through login and CRUD.
+- Validation runner and commands: `Runner: local`; the 6A Risk Management gate passed 8/8 Jest suites and 56/56 tests plus package typecheck/build, root generate/typecheck/lint, Compose config, Ansible syntax check, and a production Docker image build. Local OpenAPI generation used its supported static fallback because the workstation Node 25 runtime could not load `isolated-vm`.
+- Existing-flow smoke result: public redirect resolves to HTTP 200; admin login works; temporary risk create/read with score/criticality, optimistic-lock delete, and cleanup passed.
+- Checkpoint demo result: authenticated identification returned `source=demo` with five schema-valid candidates; unauthenticated identification returned 401; exact revisions and bundle cleanup verified.
+- Evidence link: execution transcript plus the maintainer-provided Risk AI staging screenshot in this work session.
+- Observation window: more than 15 minutes after the corrected app recreation; repeated identification remained healthy and recent app logs contained no fatal/authentication failures.
+- Rollback host SHA/branch and command: Checkpoint 5 host `6a17a698fbb2eb81f8219bf4fee8c2dfd2826d83`; redeploy that exact host revision and its recorded Official Modules gitlink with the same Ansible playbook.
+- Decision: continue to 6B. Direct protected Ollama Cloud `/v1/chat/completions` returned HTTP 200 with the expected OpenAI-compatible response shape, so no adapter is needed.
 
 ## Progress Record Template
 
