@@ -777,7 +777,7 @@ Each phase ends in a working application and includes its tests.
 | Checkpoint 4 — complete manual register | Done | 2026-07-21 | Deployed from Official Modules `4c1216e2abc8950ba5395268471820eb8829ee20` and host `92bb50020a1bfdca05a8d3e3e984e9d2921a4d29` after verified backup/restore rehearsal. Migration, existing records, ACL synchronization, routes, and new fields were verified on staging. |
 | Checkpoint 5 — deterministic identification-to-register | Done | 2026-07-22 | Deployed from Official Modules `e8908a47ab090f882e930983c736ae943aade8c4` and host `6a17a698fbb2eb81f8219bf4fee8c2dfd2826d83`. The six-field deterministic review/edit/reject/Add workflow, permissions, single-flight create, cleanup, and no-AI/no-schema boundary were verified on staging. |
 | Checkpoint 6A — server-owned deterministic source | Done | 2026-08-05 | Deployed from Official Modules `773c5aa19f921348a6c9f7db1317703ce67af263` and host `73ed502985a546aa164d30aab4a0e6305b000ac2`; final API boundary, ACL, deterministic output, CRUD, exact revisions, and observation gate passed. |
-| Checkpoint 6B — live AI identification | In Progress | 2026-08-05 | Protected direct Ollama Cloud `/v1/chat/completions` compatibility passed; implementing the optional read-only agent and validated source switch with no adapter and no silent demo fallback. |
+| Checkpoint 6B — live AI identification | Done | 2026-08-06 | Deployed from Official Modules `4bcdc0e30d2733b8419b34fca8740ae561d05e3c` and host `ba7c7c2f210c74b15e4e3f8158af4ba43f83ec75`; direct Ollama generation, all-six-field input, strict output validation, reviewed Edit/Add/open/delete, register CRUD/custom fields, ACLs, exact revisions, and observation gate passed. |
 
 ### Phase 1: Official Module, Data, and Manual Register
 
@@ -1068,6 +1068,7 @@ Approved as the governing specification for the remaining checkpoints. Checkpoin
 - Required an existing-provider compatibility smoke before any AI Assistant adapter work. No adapter or provider-specific client will be added unless that smoke demonstrates an actual incompatibility.
 - Recorded Checkpoint 6A as deployed and verified at exact unmerged revisions after its deterministic endpoint, admin CRUD cleanup, unauthenticated denial, and 15-minute observation gate passed.
 - Confirmed the protected Ollama Cloud OpenAI-compatible chat-completions smoke returned HTTP 200 with the expected response shape; 6B therefore reuses the existing `ollama` provider and adds no adapter.
+- Recorded Checkpoint 6B as deployed and verified at exact unmerged revisions. The final module action returned five schema-valid AI candidates from all six context inputs, preserved its read-only/no-tools boundary, denied unauthenticated and employee callers, and completed the browser review/Edit/Add/open/delete flow without leaving QA data behind.
 
 ### 2026-07-21 — Fresh adversarial scope review
 

@@ -1013,9 +1013,9 @@ preserving the proven review and explicit-create workflow.
 - [x] Add Docker/Ansible passthrough for provider/model/Ollama variables without
       committing secrets; configure the real token only in the protected
       staging environment.
-- [ ] Run the protected live Ollama schema/availability smoke; CI stays
+- [x] Run the protected live Ollama schema/availability smoke; CI stays
       secret-free and deterministic.
-- [ ] Commit/push both SHAs, deploy exact revisions with
+- [x] Commit/push both SHAs, deploy exact revisions with
       `RISK_MANAGEMENT_IDENTIFICATION_SOURCE=ai`, verify live generation,
       reviewed Add, register CRUD, failure behavior, revision provenance, and
       the recurring observation gate.
@@ -1113,6 +1113,22 @@ None of these actions is required to demonstrate or complete the staging MVP.
 - Observation window: more than 15 minutes after the corrected app recreation; repeated identification remained healthy and recent app logs contained no fatal/authentication failures.
 - Rollback host SHA/branch and command: Checkpoint 5 host `6a17a698fbb2eb81f8219bf4fee8c2dfd2826d83`; redeploy that exact host revision and its recorded Official Modules gitlink with the same Ansible playbook.
 - Decision: continue to 6B. Direct protected Ollama Cloud `/v1/chat/completions` returned HTTP 200 with the expected OpenAI-compatible response shape, so no adapter is needed.
+
+### Checkpoint 6B — 2026-08-06
+
+- Infra commit: `7081c1443ed7d3339bb29bad34c6fb70de4f3d64` (local only; exact private-submodule bundle deployment, preserved runtime environment, and non-recursive host fetch hardening).
+- Host branch and deployed integration commit: `feat/risk-management-staging` at `ba7c7c2f210c74b15e4e3f8158af4ba43f83ec75`.
+- Official Modules repository, branch, and commit: `mazakk94/official-modules`, `feat/risk-management`, `4bcdc0e30d2733b8419b34fca8740ae561d05e3c`.
+- Server host HEAD: `ba7c7c2f210c74b15e4e3f8158af4ba43f83ec75`.
+- Server submodule HEAD: `4bcdc0e30d2733b8419b34fca8740ae561d05e3c`.
+- Database backup/migration: no Checkpoint 6 schema change; the production migration task completed successfully against the preserved PostgreSQL volume.
+- Validation runner and commands: `Runner: local`; Risk Management passed 9/9 Jest suites and 66/66 tests plus package typecheck/build. Root `yarn generate`, 25-package typecheck, and lint passed; lint reported only 12 pre-existing warnings. The production Docker build, Ansible syntax check, migration, ACL synchronization, RBAC purge, and navigation-cache purge passed.
+- Existing-flow smoke result: targeted staging Playwright passed 8/8 executed tests for admin navigation/direct access, employee denial, AI failure-state retention, UI CRUD, API scoring/filtering/optimistic locking, and custom-field readback; the external superadmin case was explicitly skipped because no protected superadmin password was supplied. All temporary risks and custom-field definitions were cleaned up.
+- Checkpoint demo result: direct Ollama Cloud compatibility and the module action both returned HTTP 200. The final action accepted all six context fields and returned five schema-valid `source=ai` candidates; unauthenticated access returned 401 and employee access returned 403. Through the live UI, an admin generated five candidates, edited one, explicitly added it, opened the persisted risk, verified the edited title, and deleted the QA record.
+- Evidence link: this work session's Ansible transcript, targeted Playwright output, protected API schema smoke, and browser-driven end-to-end staging walkthrough.
+- Observation window: more than 15 minutes after app start at `2026-08-05T22:56:44Z`; repeated public/API checks remained healthy and application logs contained zero fatal or Risk AI error lines.
+- Rollback host SHA/branch and command: Checkpoint 6A host `73ed502985a546aa164d30aab4a0e6305b000ac2` with Official Modules `773c5aa19f921348a6c9f7db1317703ce67af263`; redeploy those exact revisions with the same Ansible playbook and preserved environment.
+- Decision: stop safely at the completed AI-assisted two-view MVP or continue later with separately scoped staging hardening; no merge, release, or publication is required.
 
 ## Progress Record Template
 
