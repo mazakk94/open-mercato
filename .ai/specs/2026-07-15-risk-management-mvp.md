@@ -88,6 +88,9 @@ Checkpoint 6 keeps that UI and write path unchanged and replaces only the source
 | Fixed 5×5 model | Matches the prototype’s useful baseline and keeps the first contract deterministic; methodology selection is contextual, not computational. |
 | Server-computed `risk_score`; response-derived `criticality` | Supports database sorting while preventing score/label drift and model/client tampering. |
 | Text-mode agent with no tools plus strict parser | Ollama Cloud is targeted through its OpenAI-compatible configuration without assuming strict provider-side structured output. The module extracts bounded JSON, validates it with Zod, permits one repair attempt, and never gives the agent a mutation tool. |
+| Direct Ollama Cloud through the existing provider first | Checkpoint 6 targets `https://ollama.com/v1` with the protected `OLLAMA_API_KEY` and module-scoped provider/model overrides. A new AI Assistant adapter is allowed only if a real compatibility smoke proves the existing `ollama` provider cannot call that endpoint. |
+| Two deployable Checkpoint 6 increments | 6A moves the deterministic fixture behind the final module-owned API and deploys it with `source=demo`; 6B adds the optional agent/runtime path and switches staging to `source=ai`. Each increment must pass its own existing-flow and new-flow gate before continuing. |
+| Full identification context is sent in AI mode | All six validated form fields are serialized as untrusted prompt data. The UI disclosure tells operators that submitted content goes to the configured external provider and should not include unnecessary personal data. |
 | AI runs are ephemeral | Meets the “start small” direction and avoids a prompt/audit/session data model. |
 | Financial amount stored as encrypted decimal text | Preserves commercial confidentiality and exact decimal representation; amount sorting/range filtering is deferred. |
 | No global/free-text search in MVP | Category/criticality filters meet the first register need. The module does not expose sensitive risk content through a search presenter, fulltext index, or embeddings, and it does not require a new core token-projection contract. |
@@ -773,7 +776,8 @@ Each phase ends in a working application and includes its tests.
 | Checkpoint 3 — minimal real register | Done | 2026-07-21 | Deployed from pinned unmerged host/Official Module commits after a verified backup. The additive migration, exact revisions, admin CRUD, role/API denial, scoring/filtering/locking, sidebar, preview, and clean runtime logs were verified on staging. |
 | Checkpoint 4 — complete manual register | Done | 2026-07-21 | Deployed from Official Modules `4c1216e2abc8950ba5395268471820eb8829ee20` and host `92bb50020a1bfdca05a8d3e3e984e9d2921a4d29` after verified backup/restore rehearsal. Migration, existing records, ACL synchronization, routes, and new fields were verified on staging. |
 | Checkpoint 5 — deterministic identification-to-register | Done | 2026-07-22 | Deployed from Official Modules `e8908a47ab090f882e930983c736ae943aade8c4` and host `6a17a698fbb2eb81f8219bf4fee8c2dfd2826d83`. The six-field deterministic review/edit/reject/Add workflow, permissions, single-flight create, cleanup, and no-AI/no-schema boundary were verified on staging. |
-| Checkpoint 6 — live AI identification | Not Started | — | Ollama-backed AI will replace only the candidate source; no silent demo fallback. |
+| Checkpoint 6A — server-owned deterministic source | In Progress | 2026-08-05 | Add and deploy the final identification API/UI boundary with `source=demo`; no AI call yet. |
+| Checkpoint 6B — live AI identification | Not Started | — | Verify direct Ollama Cloud `/v1`, then replace only the candidate source; no silent demo fallback. |
 
 ### Phase 1: Official Module, Data, and Manual Register
 
@@ -1055,6 +1059,13 @@ Approved as the governing specification for the remaining checkpoints. Checkpoin
 - Replaced the planned object-dispatch dependency with a module-owned additive identification action that delegates to the AI Assistant text runtime, validates bounded raw/fenced JSON, and permits at most one repair attempt.
 - Added the `demo|ai` server selector, `ai` default, staging/test-only demo rule, protected Ollama configuration, and a hard prohibition on silent fallback.
 - Recorded Checkpoint 4 as deployed and verified at its exact Official Modules and host SHAs.
+
+### 2026-08-05 — Checkpoint 6 execution review
+
+- Confirmed direct Ollama Cloud only (`https://ollama.com/v1`) with the protected staging token and module-scoped `ollama` provider/model configuration.
+- Confirmed that all six validated identification inputs may be sent to the provider, with the existing external-provider/privacy disclosure required in AI mode.
+- Split execution into two separately committed, deployed, and verified increments: 6A routes deterministic generation through the final module endpoint; 6B adds the optional AI agent/runtime path and switches staging to AI.
+- Required an existing-provider compatibility smoke before any AI Assistant adapter work. No adapter or provider-specific client will be added unless that smoke demonstrates an actual incompatibility.
 
 ### 2026-07-21 — Fresh adversarial scope review
 

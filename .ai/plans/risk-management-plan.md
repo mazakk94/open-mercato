@@ -465,7 +465,8 @@ harmless or perform emergency destructive ACL edits.
 | 3. Minimal real register | Complete CRUD for basic scored risks | additive table | First useful manual product |
 | 4. Complete manual register | Full approved fields, custom fields, encryption, conflicts, i18n | additive only | Production-like manual risk management |
 | 5. Deterministic identification-to-register | The completed context form always returns the same English demo candidates; review/edit/reject and explicit Add use the real register API | no new schema or AI persistence | Complete two-view workflow demonstrable without provider risk |
-| 6. Live AI identification | Ollama-backed AI replaces only the candidate source; review/edit/reject/Add remain unchanged | no new AI table | Requested AI-assisted two-view MVP works |
+| 6A. Server-owned deterministic source | The existing fixed candidates are returned by the final module API; review/edit/reject/Add remain unchanged | no schema change | Final network/API boundary proven without provider risk |
+| 6B. Live AI identification | Direct Ollama Cloud replaces only the candidate source; review/edit/reject/Add remain unchanged | no new AI table | Requested AI-assisted two-view MVP works |
 | 7. Staging hardening | Full test/runbook evidence on pinned source branches | no destructive change | Staging MVP complete; publication remains optional |
 
 ## Checkpoint 0 — Exact Unmerged Branch Baseline
@@ -977,8 +978,27 @@ preserving the proven review and explicit-create workflow.
 
 ### Tasks
 
+#### Increment 6A — Final API boundary, deterministic source
+
+- [x] Add `POST /api/risk_management/identify` with server validation,
+      OpenAPI, declarative identify ACL, the explicit fail-closed source
+      selector, and the versioned demo response.
+- [x] Move the existing identification client to `apiCall` while preserving
+      form values, reviewed candidates, edit/reject/Add state, and the
+      prominent demo disclosure.
+- [ ] Add deterministic route/component/integration coverage, build and push
+      focused Official Modules and host commits, deploy exact SHAs with
+      `RISK_MANAGEMENT_IDENTIFICATION_SOURCE=demo`, and verify both Risk AI
+      views plus CRUD before proceeding.
+
+#### Increment 6B — Direct Ollama Cloud source
+
+- [ ] Verify the existing AI Assistant `ollama` provider against the protected
+      staging configuration at `https://ollama.com/v1`. Add a minimal shared
+      adapter only if this real compatibility smoke fails; do not add a direct
+      provider SDK or module-local Ollama client.
 - [ ] Add and test the optional peer contract and registered read-only agent.
-- [ ] Add the module-owned AI identification route with OpenAPI, declarative
+- [ ] Complete the module-owned AI identification route with conditional
       identify ACL, conditional wildcard-aware AI Assistant ACL, lazy optional
       runtime loading, standard model resolution, metadata-only logging,
       32-KiB output limit, unambiguous raw/fenced JSON extraction, strict Zod
@@ -993,9 +1013,12 @@ preserving the proven review and explicit-create workflow.
 - [ ] Add Docker/Ansible passthrough for provider/model/Ollama variables without
       committing secrets; configure the real token only in the protected
       staging environment.
-- [ ] Run an optional live Ollama smoke test after secret configuration; CI
-      stays secret-free and deterministic.
-- [ ] Commit/push both SHAs, deploy, and run the recurring gate.
+- [ ] Run the protected live Ollama schema/availability smoke; CI stays
+      secret-free and deterministic.
+- [ ] Commit/push both SHAs, deploy exact revisions with
+      `RISK_MANAGEMENT_IDENTIFICATION_SOURCE=ai`, verify live generation,
+      reviewed Add, register CRUD, failure behavior, revision provenance, and
+      the recurring observation gate.
 
 The model never receives a mutation tool and cannot add a risk. Candidate Add
 remains the operator's normal guarded CRUD action. This checkpoint still does
