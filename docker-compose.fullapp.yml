@@ -168,6 +168,7 @@ services:
       ENABLE_CRUD_API_CACHE: ${ENABLE_CRUD_API_CACHE:-true}
       OM_AI_PROVIDER: ${OM_AI_PROVIDER:-openai}
       OM_AI_MODEL: ${OM_AI_MODEL:-gpt-5-mini}
+      RISK_MANAGEMENT_IDENTIFICATION_SOURCE: ${RISK_MANAGEMENT_IDENTIFICATION_SOURCE:-ai}
       OPENCODE_PROVIDER: ${OPENCODE_PROVIDER:-}
       OPENCODE_MODEL: ${OPENCODE_MODEL:-}
       # Point OpenCode clients at the sibling opencode service (the code default
