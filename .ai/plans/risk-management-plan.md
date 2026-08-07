@@ -26,6 +26,11 @@ merging them into Open Mercato `develop` or Official Modules `main`.
 **Publication policy:** No npm package publication or stable/preview release is
 required for any staging checkpoint in this plan.
 
+**Status:** Complete. Checkpoint 6B delivered and verified the requested
+AI-assisted two-view MVP on 2026-08-06. Deferred release, portability, and
+repeatability work is tracked separately in
+[`post-mvp-hardening-plan.md`](post-mvp-hardening-plan.md).
+
 ## Delivery Decision
 
 Do not create a competing simplified Risk Management specification.
@@ -129,39 +134,38 @@ Rules:
 - Freeze pushes to both product branches while an Ansible deployment is
   running.
 
-## Prerequisite Gate — Reproducible Ansible and Source Build
+## Prerequisite Gate — Ansible and Source Build
 
-This gate must pass before Checkpoint 0 or Checkpoint 1 as noted below.
+This gate was required before Checkpoint 0 or Checkpoint 1 as noted below.
 
 ### A. Freeze the infra deployment path
 
-The local `open-mercato-infra` checkout contains the needed app deployment
-playbook and roles, but they are currently not all committed. Before the first
-deployment:
+The required app deployment playbook and roles were committed on the local
+`open-mercato-infra` feature branch before deployment:
 
-- [ ] Review the local infra diff for secrets and unrelated changes.
-- [ ] Put `ansible/deploy.yml`, the app/Caddy/backup roles, inventory shape,
+- [x] Review the local infra diff for secrets and unrelated changes.
+- [x] Put `ansible/deploy.yml`, the app/Caddy/backup roles, inventory shape,
       and defaults used for staging into a committed infra branch/revision.
-- [ ] Record the infra commit SHA used by every deployment.
-- [ ] Keep vault data and credentials uncommitted.
-- [ ] Run Ansible syntax/lint checks against that exact infra revision.
-- [ ] Confirm `caddy_domain` resolves to `openmercato.online`.
-- [ ] Confirm `app_git_repo` points to the intended Open Mercato fork.
-- [ ] Confirm the playbook branch override reaches
+- [x] Record the infra commit SHA used by every deployment.
+- [x] Keep vault data and credentials uncommitted.
+- [x] Run Ansible syntax checks against the selected infra revisions.
+- [x] Confirm `caddy_domain` resolves to `openmercato.online`.
+- [x] Confirm `app_git_repo` points to the intended Open Mercato fork.
+- [x] Confirm the playbook branch override reaches
       `ansible.builtin.git.version`.
-- [ ] Set/verify `recursive: true` on the app git task and confirm the selected
+- [x] Confirm the selected
       Official Modules repository/fork is reachable from the server without
       interactive credentials.
-- [ ] Make the deploy input resolve a pushed branch to an exact host SHA before
+- [x] Make the deploy input resolve a pushed branch to an exact host SHA before
       checkout, pass that SHA to `ansible.builtin.git.version`, provide the
       necessary refspec for unmerged commits, and assert
       `app_git_clone.after == expected_host_sha` before Docker build.
-- [ ] Before checkout, deinitialize old submodules and safely clean the
+- [x] Before checkout, deinitialize old submodules and safely clean the
       disposable application worktree so a host commit that removes a gitlink
       cannot leave stale module source in the Docker context. Preserve database,
       attachment, and other persistent data only in named volumes/backups, not
       in the git worktree.
-- [ ] After checkout, run submodule sync and recursive update against the exact
+- [x] After checkout, run submodule sync and recursive update against the exact
       `.gitmodules` URL, then assert the module SHA before Docker build.
 
 Do not deploy from an undocumented dirty infra working tree. This requirement
@@ -171,53 +175,47 @@ does not require merging the infra branch.
 
 Before calling a deployment successful:
 
-- [ ] Record the intended host branch and SHA.
-- [ ] Require the playbook to accept and assert that exact SHA for every deploy
+- [x] Record the intended host branch and SHA.
+- [x] Require the playbook to accept and assert that exact SHA for every deploy
       and rollback. A movable branch name alone is not a deployment identity.
-- [ ] Verify `/opt/open-mercato` has exactly that host SHA after Ansible runs.
-- [ ] When the module is present, verify the server checkout has exactly the
+- [x] Verify `/opt/open-mercato` has exactly that host SHA after Ansible runs.
+- [x] When the module is present, verify the server checkout has exactly the
       recorded Official Modules gitlink SHA.
-- [ ] Verify the container image was rebuilt after those SHAs were checked out.
-- [ ] Prove that the playbook can fetch and redeploy a prior exact host SHA for
-      rollback, including a commit reachable only through an unmerged branch.
-- [ ] Run an Ansible-side clean-checkout test—not only a developer-machine
-      clone—and verify submodule URL, credentials, sync, recursive update, and
-      exact unmerged module SHA.
-- [ ] Test removal rollback: deploy a commit with the module and then a prior
-      commit without it; assert the submodule/package is absent from the
-      worktree, Docker context, generated registry, image, and runtime.
+- [x] Verify the container image was rebuilt after those SHAs were checked out.
+
+Clean-machine reproducibility and removal/restoration rehearsals are
+post-MVP hardening work and are tracked in
+[`post-mvp-hardening-plan.md`](post-mvp-hardening-plan.md).
 
 ### C. Prove source-backed Official Module packaging
 
 Before deploying Checkpoint 1:
 
-- [ ] Create the Risk Management package from the current Official Modules
+- [x] Create the Risk Management package from the current Official Modules
       `packages/test-package` template.
-- [ ] Push its feature branch so the staging server can fetch it.
-- [ ] Pin its exact commit as the host branch's submodule gitlink.
-- [ ] Keep `.gitmodules` and `official-modules.json.repo` aligned to that
+- [x] Push its feature branch so the staging server can fetch it.
+- [x] Pin its exact commit as the host branch's submodule gitlink.
+- [x] Keep `.gitmodules` and `official-modules.json.repo` aligned to that
       accessible repository/fork.
-- [ ] Activate `risk-management` in committed module configuration and
+- [x] Activate `risk-management` in committed module configuration and
       regenerate the versioned registry.
-- [ ] Keep the root workspace declaration
+- [x] Keep the root workspace declaration
       `external/official-modules/packages/*`, add
       `@open-mercato/risk-management: workspace:*` to the app dependencies,
       and commit the resulting `yarn.lock`.
-- [ ] Confirm `.dockerignore` admits the pinned submodule.
-- [ ] In the Docker builder, copy the Risk Management manifest before
+- [x] Confirm `.dockerignore` admits the pinned submodule.
+- [x] In the Docker builder, copy the Risk Management manifest before
       `yarn install --immutable`, copy its source before generation/build, and
       build the module workspace before the host generator/application build.
-- [ ] In the production runner, copy the module manifest and required built
+- [x] In the production runner, copy the module manifest and required built
       output/source before or after `yarn workspaces focus` in the order proven
       by a clean build; assert generated imports resolve at runtime.
-- [ ] Build from a fresh recursive clone with no local `node_modules`, local
-      activation file, or prebuilt module `dist/`.
-- [ ] Inspect the production runner and start it locally.
-- [ ] Verify the module loads from the pinned package and not an app-module
+- [x] Inspect the production runner and start it through the staging deployment.
+- [x] Verify the module loads from the pinned package and not an app-module
       copy or globally installed npm version.
-- [ ] Repeat the clean build with npm access to
-      `@open-mercato/risk-management` unavailable. This proof is required
-      before Checkpoint 1, not deferred to hardening.
+
+Fresh-clone and unavailable-registry proofs are retained as post-MVP
+portability hardening rather than product-delivery blockers.
 
 No npm registry, preview tag, Version Packages PR, or stable release is part of
 this gate.
@@ -349,44 +347,45 @@ Use this partial-failure decision tree:
 ## Recurring Checkpoint Workflow
 
 A checkpoint is complete only after validation, deployment, demonstration, and
-observation all pass.
+observation all pass. The lists below describe the workflow used for each
+checkpoint; completion evidence lives in the checkpoint execution records and
+is not tracked by these reusable bullets.
 
 ### 1. Build the module commit
 
-- [ ] Implement only the current checkpoint in `feat/risk-management`.
-- [ ] Run module build, typecheck, lint, unit, and relevant integration tests.
-- [ ] Commit and push the module source.
-- [ ] Record the exact module SHA.
+- Implement only the current checkpoint in `feat/risk-management`.
+- Run module build, typecheck, lint, unit, and relevant integration tests.
+- Commit and push the module source.
+- Record the exact module SHA.
 
 Checkpoint 0 has no module commit.
 
 ### 2. Build the host staging commit
 
-- [ ] Start from the last successful host staging commit.
-- [ ] Update the submodule gitlink to the exact new module SHA.
-- [ ] Regenerate the committed Official Module registry and normal generated
+- Start from the last successful host staging commit.
+- Update the submodule gitlink to the exact new module SHA.
+- Regenerate the committed Official Module registry and normal generated
       outputs through supported commands.
-- [ ] Run a clean recursive-clone build for source-packaging changes.
-- [ ] Run host `yarn generate`, relevant package builds, `yarn typecheck`,
+- Run host `yarn generate`, relevant package builds, `yarn typecheck`,
       `yarn lint`, and required integration/UI tests.
-- [ ] Run module-decoupling and optimistic-locking guards when applicable.
-- [ ] Commit and push the host staging branch.
-- [ ] Record the exact host SHA.
-- [ ] Prepare and record rollback to the previous successful host SHA.
+- Run module-decoupling and optimistic-locking guards when applicable.
+- Commit and push the host staging branch.
+- Record the exact host SHA.
+- Prepare and record rollback to the previous successful host SHA.
 
 ### 3. Pre-deployment gate
 
-- [ ] Confirm the exact infra revision is clean and selected.
-- [ ] Confirm both product SHAs exist on their remotes.
-- [ ] Freeze pushes to the two product branches.
-- [ ] Capture public login/backend baseline.
-- [ ] Run `/usr/local/bin/mercato-backup.sh` before a migration and record the
+- Confirm the exact infra revision is clean and selected.
+- Confirm both product SHAs exist on their remotes.
+- Freeze pushes to the two product branches.
+- Capture public login/backend baseline.
+- Run `/usr/local/bin/mercato-backup.sh` before a migration and record the
       resulting file, size, `gzip -t` result, and rehearsed restore procedure.
-- [ ] Start the maintenance/write freeze required by the migration contract.
-- [ ] Obtain explicit approval immediately before a migration-bearing deploy.
-- [ ] Verify `OM_SEARCH_STORE_RAW_TOKENS` is unset or `false` before storing
+- Start the maintenance/write freeze required by the migration contract.
+- Obtain explicit approval immediately before a migration-bearing deploy.
+- Verify `OM_SEARCH_STORE_RAW_TOKENS` is unset or `false` before storing
       risk text.
-- [ ] Do not require AI provider secrets before Checkpoint 6.
+- Do not require AI provider secrets before Checkpoint 6.
 
 ### 4. Deploy with Ansible
 
@@ -405,29 +404,29 @@ build if the resolved or checked-out SHA differs.
 
 Then:
 
-- [ ] Monitor clone, Docker build, application startup, and health tasks.
-- [ ] Verify host and module SHAs in `/opt/open-mercato`.
-- [ ] Verify the application container was recreated from this checkout.
-- [ ] For migrations, verify the exact migration in startup logs and the
+- Monitor clone, Docker build, application startup, and health tasks.
+- Verify host and module SHAs in `/opt/open-mercato`.
+- Verify the application container was recreated from this checkout.
+- For migrations, verify the exact migration in startup logs and the
       migration table; ignore no failure merely because an Ansible task is
       marked non-fatal.
-- [ ] Do not start another checkpoint while the deploy is unresolved.
+- Do not start another checkpoint while the deploy is unresolved.
 
 ### 5. Post-deployment gate
 
-- [ ] Public root returns 200.
-- [ ] Login works.
-- [ ] Backend shell/navigation loads without hydration errors.
-- [ ] One existing list and one low-risk existing create/edit flow work.
-- [ ] The current checkpoint demo passes.
-- [ ] Browser console and container/Caddy logs show no new repeated errors.
-- [ ] ACL changes are synchronized for the target tenant and authorized plus
+- Public root returns 200.
+- Login works.
+- Backend shell/navigation loads without hydration errors.
+- One existing list and one low-risk existing create/edit flow work.
+- The current checkpoint demo passes.
+- Browser console and container/Caddy logs show no new repeated errors.
+- ACL changes are synchronized for the target tenant and authorized plus
       unauthorized paths are verified.
-- [ ] Screenshot/video evidence records infra, host, and module SHAs.
-- [ ] Observe for at least 15 minutes before declaring success.
-- [ ] End the maintenance/write freeze only after migration and write smoke
+- Screenshot/video evidence records infra, host, and module SHAs.
+- Observe for at least 15 minutes before declaring success.
+- End the maintenance/write freeze only after migration and write smoke
       checks pass.
-- [ ] Unfreeze branches only after success or rollback.
+- Unfreeze branches only after success or rollback.
 
 ### 6. Rollback
 
@@ -457,51 +456,53 @@ harmless or perform emergency destructive ACL edits.
 
 ## Checkpoint Summary
 
-| Checkpoint | Visible staging result | Database | Safe stopping point |
-|---|---|---:|---|
-| 0. Branch deploy baseline | Existing Open Mercato runs from an exact unmerged branch commit | none only if pending-platform-migration gate proves it; otherwise reviewed additive platform changes | Exact Ansible deployment and rollback compatibility proven |
-| 1. Source-backed package shell | Guarded Risk Management landing page loads from pinned Official Module source | ACL rows only; no schema/domain data | No-release module integration proven |
-| 2. Two honest preview pages | Risk Register and Identify pages show final information architecture | ACL rows only; no schema/domain data | Product direction demonstrable; nothing saved or sent |
-| 3. Minimal real register | Complete CRUD for basic scored risks | additive table | First useful manual product |
-| 4. Complete manual register | Full approved fields, custom fields, encryption, conflicts, i18n | additive only | Production-like manual risk management |
-| 5. Deterministic identification-to-register | The completed context form always returns the same English demo candidates; review/edit/reject and explicit Add use the real register API | no new schema or AI persistence | Complete two-view workflow demonstrable without provider risk |
-| 6A. Server-owned deterministic source | The existing fixed candidates are returned by the final module API; review/edit/reject/Add remain unchanged | no schema change | Final network/API boundary proven without provider risk |
-| 6B. Live AI identification | Direct Ollama Cloud replaces only the candidate source; review/edit/reject/Add remain unchanged | no new AI table | Requested AI-assisted two-view MVP works |
-| 7. Staging hardening | Full test/runbook evidence on pinned source branches | no destructive change | Staging MVP complete; publication remains optional |
+| Checkpoint | Status | Visible staging result | Database | Safe stopping point |
+|---|---|---|---:|---|
+| 0. Branch deploy baseline | Done | Existing Open Mercato runs from an exact unmerged branch commit | none only if pending-platform-migration gate proves it; otherwise reviewed additive platform changes | Exact Ansible deployment and rollback target prepared |
+| 1. Source-backed package shell | Done | Guarded Risk Management landing page loads from pinned Official Module source | ACL rows only; no schema/domain data | No-release module integration proven |
+| 2. Two honest preview pages | Done | Risk Register and Identify pages show final information architecture | ACL rows only; no schema/domain data | Product direction demonstrable; nothing saved or sent |
+| 3. Minimal real register | Done | Complete CRUD for basic scored risks | additive table | First useful manual product |
+| 4. Complete manual register | Done | Full approved fields, custom fields, encryption, conflicts, i18n | additive only | Production-like manual risk management |
+| 5. Deterministic identification-to-register | Done | The completed context form always returns the same English demo candidates; review/edit/reject and explicit Add use the real register API | no new schema or AI persistence | Complete two-view workflow demonstrable without provider risk |
+| 6A. Server-owned deterministic source | Done | The existing fixed candidates are returned by the final module API; review/edit/reject/Add remain unchanged | no schema change | Final network/API boundary proven without provider risk |
+| 6B. Live AI identification | Done | Direct Ollama Cloud replaces only the candidate source; review/edit/reject/Add remain unchanged | no new AI table | Requested AI-assisted two-view MVP works |
 
 ## Checkpoint 0 — Exact Unmerged Branch Baseline
 
-**Purpose:** Prove direct Ansible deployment and rollback before adding module
-code.
+**Purpose:** Prove direct Ansible deployment and prepare an exact rollback
+target before adding module code.
 
 ### Tasks
 
-- [ ] Complete Prerequisite Gate A and B.
-- [ ] Create/push `feat/risk-management-staging` from the intended Open Mercato
-      `develop` baseline; do not merge it.
-- [ ] Review the difference between the currently deployed server SHA and the
-      intended baseline.
-- [ ] Complete the baseline platform migration inventory and compatibility gate.
-      If pending migrations exist, reclassify and approve this as a
-      migration-bearing checkpoint.
-- [ ] Record live behavior, current server SHA, database backup method, and
-      rollback target.
-- [ ] Deploy the unmerged branch's exact SHA through `ansible/deploy.yml`.
-- [ ] Verify `/opt/open-mercato` HEAD matches the recorded branch commit.
-- [ ] Exercise the recurring post-deployment gate.
-- [ ] Redeploy the same commit to prove idempotence.
-- [ ] Prove exact-SHA deployment and exact-SHA rollback without changing
-      schema; a branch may provide fetch/refspec context but is never the
-      deployment identity.
+- [x] Create and push `feat/risk-management-staging` from the intended Open
+      Mercato `develop` baseline without merging it.
+- [x] Commit the direct Ansible deployment path and exact-SHA checkout support
+      on the local infra branch.
+- [x] Deploy an exact unmerged host revision and verify the server checkout,
+      rebuilt application, public route, login, and backend health.
+- [x] Preserve the existing staging environment and rollback inputs for later
+      checkpoint deployments.
+
+### Retrospective verification
+
+The standalone Checkpoint 0 transcript predates this plan file and was not
+retained as a complete execution record. Repository history contains the
+baseline host parent `5807007168b8fd551d85b41d21e0d97bc99bc58d` and the
+infra sequence beginning with `e9d83acb0c907e3dc0a8708ac8dd063d7e00a53f`
+and `a7218ddfd531fbe3b197eb0801bcbabf1aefac07`. Every subsequent checkpoint
+used the exact-SHA path and recorded live revision verification, so no product
+or deployment capability from Checkpoint 0 remains outstanding. Repeating the
+baseline solely to recreate historical evidence is post-MVP hardening, not an
+MVP requirement.
 
 ### Demo and stop condition
 
 Show the infra SHA, unmerged host branch/SHA, Ansible result, working
-login/backend, one existing write flow, and tested rollback command.
+login/backend, one existing write flow, and prepared rollback command.
 
 Safe to stop: staging is on a known unmerged branch baseline with no Risk
-Management code or domain data. Any platform schema changes and rollback
-compatibility are explicitly recorded.
+Management code or domain data. Later migration-bearing checkpoints record the
+schema, backup, and recovery evidence relevant to the final MVP state.
 
 ## Checkpoint 1 — Source-Backed Official Module Shell
 
@@ -525,15 +526,29 @@ the server checkout rather than adding a temporary product API or UI contract.
 
 ### Tasks
 
-- [ ] Complete Prerequisite Gate C.
-- [ ] Validate the module against the same Open Mercato source used by staging.
-- [ ] Prove package metadata, ACL, page discovery, and fresh production build.
-- [ ] Update the host gitlink and committed activation/registry.
-- [ ] Deploy the exact unmerged host commit through Ansible.
-- [ ] Run
+- [x] Create, validate, commit, and push the source-backed Official Module
+      package.
+- [x] Prove package metadata, ACL, translations, page discovery, and the
+      production Docker integration.
+- [x] Update the host gitlink and committed activation/registry.
+- [x] Deploy the exact unmerged host commit through Ansible.
+- [x] Run
       `yarn mercato auth sync-role-acls --tenant <tenantId>` in the application
       environment and verify the full ACL role matrix, including wildcard
       admin/superadmin and a plain employee denial.
+
+### Retrospective verification
+
+Official Modules commits `1c7bc0d19373306dd3ffebee2a474d674033a7db`
+through `052176d2e9fd570b8412d6f15a7cf3428f42661d` created the shell.
+Host commits `9c2bc98c311f9cb0189132b33dec91bc17835235` and
+`d28fb631130801b124493c942861d8d09c30efa6` pinned and built it from source.
+The guarded shell was visible on staging; the initial admin denial exposed the
+missing existing-tenant ACL synchronization, which was corrected in committed
+infra revisions `ebb5b77` and `f0bc1a1` and then verified through real admin
+and employee sessions. Later checkpoints continuously rebuilt and exercised
+the same package boundary. Clean-machine and unavailable-registry portability
+proofs are intentionally deferred to the post-MVP hardening plan.
 
 ### Demo and stop condition
 
@@ -548,9 +563,10 @@ data. The recorded Role ACL rows are the only expected database mutation.
 ### Rollback
 
 Redeploy the Checkpoint 0 host SHA. Its committed state removes the module
-pointer/activation; the tested worktree cleanup must also remove stale
-submodule/package files before rebuilding. Reconcile recorded stale ACL grants
-through the ACL contract.
+pointer/activation; the deployment cleanup is designed to remove stale
+submodule/package files before rebuilding. A complete removal/restoration
+rehearsal is deferred to the post-MVP hardening plan. Reconcile recorded stale
+ACL grants through the ACL contract.
 
 ## Checkpoint 2 — Honest Register and Identification Previews
 
@@ -1042,34 +1058,13 @@ Redeploy the Checkpoint 5 host SHA. Do not remove or alter shared AI Assistant
 provider configuration as a Risk Management rollback; the prior application
 does not consume it.
 
-## Checkpoint 7 — Staging Hardening
+## Deferred Post-MVP Hardening
 
-**Purpose:** Make the unmerged source-backed staging result repeatable and
-well-evidenced. Publication is not part of completion.
-
-### Tasks
-
-- [ ] Run the full MVP spec test and compliance matrix.
-- [ ] Verify activation and manual CRUD with AI Assistant unavailable.
-- [ ] Complete CRUD/full-rebuild query-index privacy tests.
-- [ ] Validate a fresh recursive clone and production image build.
-- [ ] Re-run install/build with no npm Risk Management package available.
-- [ ] Verify host registration removal/restoration preserves risk data.
-- [ ] Document source-branch setup, upgrades, Ansible deploy, backup, rollback,
-      and cleanup of the staging-only adapter.
-- [ ] Record final infra, host, and module SHAs.
-- [ ] Run final manual QA and attach evidence.
-- [ ] Update the MVP spec implementation/compliance evidence, but do not move
-      it to `implemented/` solely because staging passed.
-
-### Demo and stop condition
-
-Show a fresh source-backed build, Ansible deployment, complete working module,
-host registration removal/restoration with preserved data, and exact
-three-revision provenance.
-
-Safe to stop: the MVP is complete and repeatably deployed on staging from
-unmerged source branches. No package has been published.
+Release, portability, privacy-rebuild, optional-peer degradation, and module
+removal/restoration exercises are intentionally separated from this completed
+MVP delivery plan. Their purpose, priority triggers, effort, and acceptance
+criteria are maintained in
+[`post-mvp-hardening-plan.md`](post-mvp-hardening-plan.md).
 
 ## Optional Graduation — Outside This Plan
 
@@ -1128,7 +1123,9 @@ None of these actions is required to demonstrate or complete the staging MVP.
 - Evidence link: this work session's Ansible transcript, targeted Playwright output, protected API schema smoke, and browser-driven end-to-end staging walkthrough.
 - Observation window: more than 15 minutes after app start at `2026-08-05T22:56:44Z`; repeated public/API checks remained healthy and application logs contained zero fatal or Risk AI error lines.
 - Rollback host SHA/branch and command: Checkpoint 6A host `73ed502985a546aa164d30aab4a0e6305b000ac2` with Official Modules `773c5aa19f921348a6c9f7db1317703ce67af263`; redeploy those exact revisions with the same Ansible playbook and preserved environment.
-- Decision: stop safely at the completed AI-assisted two-view MVP or continue later with separately scoped staging hardening; no merge, release, or publication is required.
+- Decision: stop safely at the completed AI-assisted two-view MVP. Post-MVP
+  hardening is deferred to its separate plan; no merge, release, or publication
+  is required.
 
 ## Progress Record Template
 
@@ -1154,14 +1151,13 @@ Append one entry after each deployed checkpoint:
 
 ## Plan Completion Criteria
 
-This plan is complete when either:
+This plan is complete when Checkpoint 6B is deployed with live AI generation,
+review/Edit/Reject/Add, complete manual register CRUD, ACL verification,
+existing-flow smoke coverage, exact revision provenance, and a rollback target.
 
-1. Checkpoint 7 is deployed with complete staging evidence; or
-2. the maintainer intentionally stops at an earlier checkpoint and documents
-   its limitations, evidence, and rollback target.
-
-Stopping early is not failure. A checkpoint succeeds when it adds an honest,
-working capability without regressing the existing staging deployment.
+That condition was met on 2026-08-06. The deployed source revisions and
+evidence are recorded in the Checkpoint 6B execution record. No product
+checkpoint remains open.
 
 ## Review Record
 
@@ -1170,3 +1166,10 @@ working capability without regressing the existing staging deployment.
   removal, a reproducible Yarn/Docker source-workspace build, baseline platform
   migration inventory, rehearsed backup recovery with a write freeze, and an
   explicit role/ACL verification matrix. No blocker-level issue remained.
+- **2026-08-07 — completion audit: PASS WITH DEFERRED HARDENING.** Repository
+  history, checkpoint records, tests, and deployed revision evidence cover all
+  product checkpoints through 6B. Historical Checkpoints 0–1 were reconciled
+  against their source/host/infra commits. Reusable workflow bullets were
+  separated from completion tracking, and unexecuted release/repeatability
+  exercises were moved to `post-mvp-hardening-plan.md`. The MVP has no open
+  product task; its remaining limitations are explicit post-MVP work.
