@@ -44,6 +44,7 @@
     "@open-mercato/gateway-stripe": "workspace:*",
     "@open-mercato/onboarding": "workspace:*",
     "@open-mercato/queue": "workspace:*",
+    "@open-mercato/risk-management": "workspace:*",
     "@open-mercato/scheduler": "workspace:*",
     "@open-mercato/search": "workspace:*",
     "@open-mercato/shared": "workspace:*",
