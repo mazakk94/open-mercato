@@ -23,8 +23,9 @@ window. The work below closes the remaining release and portability edges.
 ## Starting Point
 
 - Deployed host revision: `ba7c7c2f210c74b15e4e3f8158af4ba43f83ec75`.
-- Current host feature-branch head: `30ed2e82ec17cbd22013a742cb3d3b7aa9dfd50c`
-  (documentation-only changes after the deployed revision).
+- Pre-closeout host feature-branch head:
+  `30ed2e82ec17cbd22013a742cb3d3b7aa9dfd50c` (documentation-only changes
+  after the deployed revision).
 - Official Modules revision: `4bcdc0e30d2733b8419b34fca8740ae561d05e3c`.
 - Local infrastructure revision used for Checkpoint 6B:
   `7081c1443ed7d3339bb29bad34c6fb70de4f3d64`.
