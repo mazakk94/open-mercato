@@ -158,7 +158,16 @@ export const enabledModules: ModuleEntry[] = [
 // Official modules activated via official-modules.json / official-modules.local.json
 // (managed by `yarn official-modules`; backed by the external/official-modules submodule).
 for (const entry of officialModuleEntries) {
-  if (!enabledModules.some((existing) => existing.id === entry.id)) enabledModules.push(entry)
+  if (enabledModules.some((existing) => existing.id === entry.id)) continue
+  enabledModules.push(entry.id === 'risk_management'
+    ? {
+        ...entry,
+        overrides: {
+          ...entry.overrides,
+          nav: { groupOrder: ['risk_management.nav.group'] },
+        },
+      }
+    : entry)
 }
 
 if (enabledModules.some((entry) => entry.id === 'example')) {
