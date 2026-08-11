@@ -81,7 +81,6 @@ export default async function BackendLayout({
   const initialCollapsed = collapsedCookie === '1'
   const demoModeEnabled = parseBooleanWithDefault(process.env.DEMO_MODE, true)
   const hideBackendFooter = parseBooleanWithDefault(process.env.OM_HIDE_BACKEND_FOOTER, false)
-  const deployEnv = process.env.DEPLOY_ENV
   const grantedFeatures = Array.isArray(auth?.features)
     ? auth.features.filter((feature): feature is string => typeof feature === 'string')
     : []
@@ -89,10 +88,7 @@ export default async function BackendLayout({
     grantedFeatures,
     unrestricted: auth?.isSuperAdmin === true,
   })
-  const baseProductName = translate('appShell.productName', 'Open Mercato')
-  const productName = deployEnv && deployEnv !== 'local'
-    ? `${baseProductName} (${deployEnv.charAt(0).toUpperCase() + deployEnv.slice(1)})`
-    : baseProductName
+  const productName = translate('appShell.productName', 'Open Mercato')
 
   const injectionContext = {
     path,
@@ -105,6 +101,7 @@ export default async function BackendLayout({
     <I18nProvider locale={locale} dict={dict}>
       <AppShell
         productName={productName}
+        logo={{ src: '/risk-ai-logo.png', alt: productName }}
         email={auth?.email}
         canManageUpgradeActions={canManageUpgradeActions}
         groups={[]}
