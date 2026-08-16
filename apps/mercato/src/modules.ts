@@ -104,7 +104,22 @@ export const enabledModules: ModuleEntry[] = [
   { id: 'integrations', from: '@open-mercato/core' },
   { id: 'data_sync', from: '@open-mercato/core' },
   { id: 'sync_excel', from: '@open-mercato/core' },
-  { id: 'messages', from: '@open-mercato/core' },
+  // Core keeps the inbox auth-only so any participant can read a message sent to
+  // them. This deployment gates it on `messages.view` instead: the board role holds
+  // only `risk_management.risk.view`, so the nav entry and the page both drop for it
+  // while admin/employee (granted the feature by Migration20260227120000) keep both.
+  {
+    id: 'messages',
+    from: '@open-mercato/core',
+    overrides: {
+      routes: {
+        pages: {
+          '/backend/messages': { metadata: { requireFeatures: ['messages.view'] } },
+          '/backend/messages/[id]': { metadata: { requireFeatures: ['messages.view'] } },
+        },
+      },
+    },
+  },
   // Communication channels hub (SPEC-045d) — bridges external chat/email channels
   // (Slack, WhatsApp, Email) to the unified Messages inbox. Provider packages
   // (channel-slack, channel-whatsapp, future email providers) register adapters here.

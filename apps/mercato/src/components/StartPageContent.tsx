@@ -174,7 +174,7 @@ export function StartPageContent({ showStartPage: initialShowStartPage, showOnbo
               t('startPage.roles.superAdmin.feature4', 'System-wide configuration'),
               t('startPage.roles.superAdmin.feature5', 'Access to all modules and features')
             ]}
-            loginUrl="/login?role=superadmin"
+            loginUrl="/login"
             disabled={superAdminDisabled}
             disabledCtaLabel={t('startPage.roles.superAdmin.disabledCta', 'Superadmin login disabled')}
             disabledMessage={
@@ -205,7 +205,7 @@ export function StartPageContent({ showStartPage: initialShowStartPage, showOnbo
               t('startPage.roles.admin.feature4', 'Access to admin modules'),
               t('startPage.roles.admin.feature5', 'Report and analytics access')
             ]}
-            loginUrl="/login?role=admin"
+            loginUrl="/login"
             variant="secondary"
           />
           
@@ -220,7 +220,7 @@ export function StartPageContent({ showStartPage: initialShowStartPage, showOnbo
               t('startPage.roles.employee.feature4', 'View personal dashboard'),
               t('startPage.roles.employee.feature5', 'Submit reports and updates')
             ]}
-            loginUrl="/login?role=employee"
+            loginUrl="/login"
             variant="outline"
           />
         </div>
