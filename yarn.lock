@@ -7747,7 +7747,7 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@open-mercato/core@workspace:*, @open-mercato/core@workspace:packages/core":
+"@open-mercato/core@npm:0.6.7, @open-mercato/core@workspace:*, @open-mercato/core@workspace:packages/core":
   version: 0.0.0-use.local
   resolution: "@open-mercato/core@workspace:packages/core"
   dependencies:
@@ -7924,6 +7924,7 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "@open-mercato/risk-management@workspace:external/official-modules/packages/risk-management"
   dependencies:
+    "@open-mercato/core": "npm:0.6.7"
     "@open-mercato/shared": "npm:0.6.7"
     "@open-mercato/ui": "npm:0.6.7"
     "@types/jest": "npm:^30.0.0"
@@ -7938,6 +7939,7 @@ __metadata:
     "@mikro-orm/core": ^7.0.14
     "@mikro-orm/decorators": ^7.0.14
     "@open-mercato/ai-assistant": ">=0.6.3 <0.7.0"
+    "@open-mercato/core": ">=0.6.3 <0.7.0"
     "@open-mercato/shared": ">=0.6.3 <0.7.0"
     "@open-mercato/ui": ">=0.6.3 <0.7.0"
     react: ^19.0.0
